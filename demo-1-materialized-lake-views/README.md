@@ -13,7 +13,16 @@ silver MLV. The target is a schema-enabled Lakehouse on an approved active
 capacity. Cross-workspace access, runtime and MLV feature eligibility must be
 verified before deployment, and permissions require approval.
 
-Use the shared version 1 CSV header:
+Use The shared manifest uses top-level `contract_version: 1` and contains
+`run_id`, `config`, `destinations`, and `batches`. Demo 1 checks manifest
+version and batch classification in its focused validation helper:
+`measured_batches` includes only `batch_class: measured`; `bootstrap` and
+`negative-test` batches are excluded from coordinated-run row and total
+acceptance checks. Each batch carries `batch_class` (`measured`, `bootstrap`,
+or `negative-test`) in addition to the producer's batch ID, checksum, row
+count, exact minor-unit totals, timestamps, and destination delivery records.
+
+The shared version 1 CSV header:
 `SalesLineID,BatchID,SaleTimestamp,CustomerID,ProductID,Date,Quantity,UnitPriceMinorUnits,SalesAmountMinorUnits`.
 The source publishes UTF-8 header CSV, UTC timestamps and ISO dates; each
 immutable file is staged and closed before delivery. No bootstrap file is part

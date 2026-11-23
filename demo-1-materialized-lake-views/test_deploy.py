@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from manifest_validation import measured_batches, validate_manifest
+
 
 SCRIPT = Path(__file__).with_name("deploy.py")
 
@@ -45,6 +47,34 @@ class ContractTest(unittest.TestCase):
                 code, result = self.invoke(mode, config)
                 self.assertNotEqual(code, 0)
                 self.assertEqual(result["status"], "fail")
+
+    def test_manifest_contract_and_batch_class_filtering(self):
+        base_batch = {
+            "batch_id": "run-1-001", "batch_number": 1, "filename": "sales.csv",
+            "sha256": "abc", "row_count": 1, "sales_amount_minor_units": 123,
+            "grouped_totals": {}, "generated_at_utc": "2026-01-01T00:00:00Z",
+            "deliveries": {},
+        }
+        manifest = {
+            "contract_version": 1, "run_id": "run-1", "config": {},
+            "destinations": [],
+            "batches": [
+                {**base_batch, "batch_class": "measured"},
+                {**base_batch, "batch_id": "boot", "batch_class": "bootstrap"},
+                {**base_batch, "batch_id": "bad", "batch_class": "negative-test"},
+            ],
+        }
+        self.assertEqual(validate_manifest(manifest), [])
+        self.assertEqual([b["batch_class"] for b in measured_batches(manifest)], ["measured"])
+
+    def test_manifest_requires_supported_version_and_class(self):
+        manifest = {
+            "contract_version": 2, "run_id": "run-1", "config": {},
+            "destinations": [], "batches": [{"batch_class": "unclassified"}],
+        }
+        diagnostics = validate_manifest(manifest)
+        self.assertTrue(any("contract_version" in item for item in diagnostics))
+        self.assertTrue(any("batch_class" in item for item in diagnostics))
 
 
 if __name__ == "__main__":

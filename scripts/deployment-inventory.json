@@ -181,7 +181,9 @@
       "bootstrap_batch_id": "demo2bootstrap_80b398bcea53_0001",
       "bootstrap_row_count": 5,
       "bootstrap_sales_amount_minor_units": 526232,
-      "note": "Owner reports schema, mapping, policy and shortcut readback and a separately classified bootstrap submitted to KQL. KQL verification filters by BatchID and measured shortcut verification excludes bootstrap; Delta visibility and replay remain unverified."
+      "bootstrap_replay_status": "Skipped_IngestByTagAlreadyExists",
+      "negative_test_batch_id": "demo2negative_5f7d11269579_0001",
+      "note": "Owner reports schema, mapping, policy and shortcut readback. A controlled replay of the separately classified bootstrap was skipped; KQL still returned 5 unique rows and 526232 minor units. The adapter rejected a separately classified malformed batch, which has zero KQL rows. Measured verification excludes bootstrap and negative-test data; shortcut join and measured delivery remain unverified."
     }
   ],
   "cross_workspace_grants": [],

@@ -148,6 +148,12 @@
   ],
   "reported_observations": [
     {
+      "track": "demo-3",
+      "source": "Demo 3 owner",
+      "intended_landing_uri": "abfss://744223de-ceab-4c4f-82ba-f811bcb5c7d7@onelake.dfs.fabric.microsoft.com/02fd5f73-32d5-4295-bfb5-c5436e9c3b62/Files/incoming/sales/",
+      "note": "The setup notebook failed. Folder creation, event mapping and the Copy pipeline are not verified; this intended URI is not proof of readiness."
+    },
+    {
       "track": "demo-1",
       "source": "Demo 1 owner Spark readback",
       "landing_uri": "abfss://14080576-9158-4326-8014-427c8009ce12@onelake.dfs.fabric.microsoft.com/aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659/Files/incoming/sales/",

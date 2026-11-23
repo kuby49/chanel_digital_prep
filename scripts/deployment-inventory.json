@@ -152,7 +152,7 @@
       "source": "Demo 1 owner Spark readback",
       "landing_uri": "abfss://14080576-9158-4326-8014-427c8009ce12@onelake.dfs.fabric.microsoft.com/aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659/Files/incoming/sales/",
       "dimension_counts": {"DimDate": 365, "DimProduct": 20, "DimCustomer": 100},
-      "note": "Owner reports unique non-null dimension keys; date range is unverified. Empty-folder fixed-schema bronze creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA. A 111-byte header-only bootstrap enabled bronze and silver creation; an on-demand full-lineage refresh completed with zero rows and intact schemas in both. A five-minute managed schedule was read back, but its first run and disabling and measured ingestion remain unverified."
+      "note": "Owner reports unique non-null dimension keys; date range is unverified. Empty-folder fixed-schema bronze creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA. A 111-byte header-only bootstrap enabled both views; on-demand and five-minute scheduled lineage runs completed with zero rows and intact schemas. Test schedule 48a5a66c-e53a-43e7-89dd-f4a37458edbd was disabled and read back disabled. Header file remains; one-row fallback/delete/full-refresh was not needed or performed. Per-view refresh modes and measured ingestion remain unverified."
     },
     {
       "track": "shared",

@@ -127,26 +127,30 @@ def _atomic_json(path, value):
             os.unlink(name)
 
 
-def initialize_run(root, config, destinations):
-    """Create or validate a run manifest; callers must serialize access."""
+def new_manifest(config, destinations):
     config.validate()
     if not destinations or len(set(destinations)) != len(destinations) or any(
         name not in ("demo-1", "demo-2", "demo-3") for name in destinations
     ):
         raise ValueError("select distinct demo destinations")
+    return {"contract_version": 1, "run_id": config.run_id, "config": asdict(config),
+            "destinations": sorted(destinations), "batches": {}}
+
+
+def initialize_run(root, config, destinations):
+    """Create or validate a run manifest; callers must serialize access."""
+    expected = new_manifest(config, destinations)
     root = Path(root) / config.run_id
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "manifest.json"
-    expected_config = asdict(config)
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest["config"] != expected_config or manifest["destinations"] != sorted(destinations):
+        if manifest["config"] != expected["config"] or manifest["destinations"] != expected["destinations"]:
             raise ValueError("existing run configuration or destinations differ; use a new run ID")
     else:
         if any(path.name != ".producer.lock" for path in root.iterdir()):
             raise RuntimeError("run contains untracked files; manual recovery required")
-        manifest = {"contract_version": 1, "run_id": config.run_id, "config": expected_config,
-                    "destinations": sorted(destinations), "batches": {}}
+        manifest = expected
         _atomic_json(manifest_path, manifest)
     return root, manifest
 

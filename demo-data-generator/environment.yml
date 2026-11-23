@@ -1,0 +1,6 @@
+name: chanel-producer
+dependencies:
+  - pip:
+      - azure-identity==1.27.0
+      - azure-kusto-data==6.0.4
+      - azure-kusto-ingest==6.0.4

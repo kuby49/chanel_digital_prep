@@ -1,0 +1,122 @@
+{
+  "contract_version": 1,
+  "environment": "MCAP",
+  "prefix": "chanel",
+  "capacity": {
+    "name": "fabricadbmirror",
+    "id": "de12195c-40d2-4bee-af60-f0d6dedfbb0f",
+    "region": "West US 3"
+  },
+  "producer_identity": {
+    "type": "User",
+    "object_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
+    "runtime_verified": true
+  },
+  "workspace": {
+    "name": "chanel-demo-data-generator",
+    "id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+    "description": "Owned by kuby49/chanel_digital_prep; deployment=chanel; component=producer; contract=v1",
+    "ownership": "Created for this deployment; description identifies the repository, component and contract version.",
+    "capacity_assignment": "Completed"
+  },
+  "staging_lakehouse": {
+    "name": "producer_staging",
+    "id": "fca649c9-0297-4997-8e2d-8ac5338aaa1a",
+    "description": "Owned by kuby49/chanel_digital_prep; component=producer; contract=v1",
+    "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+    "ownership": "Created in the owned producer workspace."
+  },
+  "notebook": {
+    "name": "producer_notebook",
+    "id": "d8546394-042a-479c-b7e7-ff3c833404dc",
+    "description": "Owned by kuby49/chanel_digital_prep; component=producer; contract=v1",
+    "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+    "ownership": "Created in the owned producer workspace.",
+    "runtime_verified": true
+  },
+  "environment_item": {
+    "name": "producer_environment",
+    "id": "b19f13bd-327c-44fb-a16e-86b7f04f4712",
+    "description": "Owned by kuby49/chanel_digital_prep shared producer contract v1; isolated SDK environment.",
+    "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+    "ownership": "Created in the owned producer workspace.",
+    "published": true,
+    "published_version": "38460081-8eaf-4e97-8271-d8ea1740ba59",
+    "published_and_runtime_verified": true,
+    "runtime_verification_scope": "No-sales preflight only; does not establish deployment readiness or cadence."
+  },
+  "pipeline": {
+    "name": "producer_wrapper",
+    "id": "f5a6ab28-dca4-462a-98f1-baf05d8b909d",
+    "description": "Owned by kuby49/chanel_digital_prep; component=producer; contract=v1",
+    "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+    "ownership": "Created in the owned producer workspace.",
+    "runtime_verified": true
+  },
+  "preflight": {
+    "job_id": "e9af1fde-bb35-4a91-82ce-7ef6e009aed1",
+    "probe_id": "probe-a1473bb546cb4d40aae02ffaa2780918",
+    "status": "completed",
+    "pipeline_parameter_binding_verified": true,
+    "is_for_pipeline": true,
+    "storage_principal_oid": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
+    "tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527"
+  },
+  "identity_and_access_probe": {
+    "job_id": "89698907-dace-4108-ad0a-cf9e52d5e995",
+    "probe_id": "probe-4f43e95cd2be4fa0aba68023c0861af7",
+    "status": "completed",
+    "kusto_principal_oid": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
+    "kusto_tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527",
+    "default_runtime_kusto_sdk_available": false,
+    "demo_3_sentinel_readback_verified": true,
+    "demo_3_sentinel_and_directory_deleted": true
+  },
+  "conditional_storage_probe": {
+    "concurrent_create_statuses": [201, 409],
+    "duplicate_create_rejected": true,
+    "stale_update_rejected": true,
+    "conditional_update_readback_verified": true,
+    "stale_delete_rejected": true,
+    "sentinel_deleted": true,
+    "client_sentinel_verified_and_deleted": true
+  },
+  "sdk_runtime_probe": {
+    "job_id": "c16cb269-3b96-472b-ade7-9c60c0cdfeb6",
+    "probe_id": "probe-0fc3d9b0cbcd4a16b00cd2a61714f0c9",
+    "status": "failed",
+    "kusto_sdk_imports_verified": true,
+    "eventhouse_adapter_import_verified": true,
+    "eventhouse_sdk_query_verified": true,
+    "producer_bundle_imports_verified": true,
+    "conditional_create_and_update_verified": true,
+    "conditional_storage_cleanup_reported_error": true,
+    "probe_sentinel_absent_on_readback": true
+  },
+  "storage_cleanup_diagnostic": {
+    "job_id": "ef96936a-5572-49b6-a374-778a0ed09e78",
+    "probe_id": "probe-912072e91f8c4995b61ff233d3e084e8",
+    "status": "failed",
+    "diagnostic": "OneLake returned HTTP 200 for conditional DELETE; the prior client only accepted HTTP 202."
+  },
+  "runtime_preflight": {
+    "job_id": "66c111f0-228c-4c12-83f6-e22ffc2e6868",
+    "probe_id": "probe-23e3bceda292459384495e23c26e6129",
+    "status": "completed",
+    "environment_version": "38460081-8eaf-4e97-8271-d8ea1740ba59",
+    "eventhouse_adapter_revision": "dcbb1f3851656e6b34c7726fb4f6bcc963b66192",
+    "runtime_principal_verified": true,
+    "sdk_and_adapter_imports_verified": true,
+    "authenticated_kusto_query_verified": true,
+    "conditional_create_update_delete_verified": true,
+    "duplicate_and_stale_conditions_rejected": true,
+    "sentinel_absent_on_independent_readback": true,
+    "scope": "No sales data generated or delivered."
+  },
+  "monitor_sentinel": {
+    "path": "Files/preflight/producer-monitor-heartbeat-v1.txt",
+    "sha256": "aea6faa895eae3072bb28cfacf732a93cfd9968fc8d2c6d2675f415278d6fd55",
+    "ownership": "Created in the owned producer staging Lakehouse; content is verified, not storage-locked."
+  },
+  "ready": false
+}

@@ -1,4 +1,5 @@
 import csv
+import base64
 import hashlib
 import io
 import json
@@ -8,12 +9,15 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
 from generator import HEADER, RunConfig, batch_bytes, dimensions, stage_batch
 from delivery import begin_submission, record_submission, record_verification
 from fabric_files import materialize_staged
+from fabric_assets import notebook_definition, pipeline_definition
 from runner import Submission, run_batches
 
 
@@ -141,9 +145,202 @@ class GeneratorTests(unittest.TestCase):
         pipeline = json.loads((directory / "pipeline-content.json").read_text(encoding="utf-8"))
         for cell in notebook["cells"]:
             compile("".join(cell["source"]), "notebook", "exec")
-        self.assertEqual(set(pipeline["properties"]["parameters"]), {"run_config_json", "selected_demos_json"})
+        self.assertEqual(set(pipeline["properties"]["parameters"]),
+                         {"operation", "probe_id", "run_config_json", "selected_demos_json"})
         self.assertEqual(set(pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]),
-                         {"run_config_json", "selected_demos_json"})
+                         {"operation", "probe_id", "run_config_json", "selected_demos_json"})
+
+    def test_deployment_assets_bind_actual_workspace_and_lakehouse(self):
+        workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        lakehouse = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        notebook_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        environment_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        definition = notebook_definition(workspace, lakehouse, "producer_staging", environment_id)
+        notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+        for field in ("dependencies", "trident"):
+            binding = notebook["metadata"][field]["lakehouse"]
+            self.assertEqual(binding["default_lakehouse"], lakehouse)
+            self.assertEqual(binding["default_lakehouse_workspace_id"], workspace)
+        self.assertEqual(notebook["metadata"]["dependencies"]["environment"],
+                         {"environmentId": environment_id, "workspaceId": workspace})
+        bundle_source = "".join(notebook["cells"][1]["source"])
+        self.assertIn("fabric_ledger.py", bundle_source)
+        compile(bundle_source, "producer-bundle", "exec")
+        pipeline = json.loads(base64.b64decode(pipeline_definition(workspace, notebook_id)["parts"][0]["payload"]))
+        activity = pipeline["properties"]["activities"][0]
+        self.assertEqual(activity["typeProperties"]["notebookId"], notebook_id)
+        self.assertEqual(activity["typeProperties"]["workspaceId"], workspace)
+        with self.assertRaises(ValueError):
+            pipeline_definition("not-an-id", notebook_id)
+
+    def test_preflight_probe_persists_identity_without_the_token(self):
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        claims = {"oid": "test-object", "tid": "test-tenant"}
+        token = "header." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".signature"
+        files = {}
+
+        class FakeFs:
+            def exists(self, path):
+                return path in files
+
+            def mkdirs(self, path):
+                files[path] = None
+                return True
+
+            def put(self, path, value, overwrite):
+                self.assert_not_overwrite = not overwrite
+                files[path] = value
+                return True
+
+            def head(self, path, max_bytes):
+                return files[path][:max_bytes]
+
+        utils = SimpleNamespace(
+            runtime=SimpleNamespace(context={"isForPipeline": True, "currentWorkspaceId": "workspace",
+                                             "defaultLakehouseId": "lakehouse"}),
+            credentials=SimpleNamespace(getToken=lambda audience: token),
+            fs=FakeFs(),
+        )
+        scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
+                 "notebookutils": utils, "operation": "preflight", "probe_id": "probe-1",
+                 "run_config_json": '{"probe_marker":"unique"}', "selected_demos_json": "[]"}
+        exec("".join(notebook["cells"][1]["source"]), scope)
+        stored = files["Files/preflight/probe-1.json"]
+        self.assertNotIn(token, stored)
+        evidence = json.loads(stored)
+        self.assertEqual(evidence["storage_principal_oid"], "test-object")
+        self.assertEqual(evidence["parameter_marker"], "unique")
+        self.assertTrue(evidence["is_for_pipeline"])
+        with self.assertRaises(RuntimeError):
+            exec("".join(notebook["cells"][1]["source"]), scope)
+        scope.update(probe_id="probe-missing-sdk", run_config_json='{"probe_kusto":true}')
+        actual_import = __import__
+
+        def missing_kusto(name, *args, **kwargs):
+            if name.startswith("azure.kusto"):
+                raise ImportError("SDK unavailable")
+            return actual_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=missing_kusto):
+            with self.assertRaisesRegex(RuntimeError, "Kusto SDK imports"):
+                exec("".join(notebook["cells"][1]["source"]), scope)
+        evidence = json.loads(files["Files/preflight/probe-missing-sdk.json"])
+        self.assertFalse(evidence["kusto_sdk_available"])
+        self.assertEqual(evidence["kusto_principal_oid"], "test-object")
+
+    def test_preflight_exercises_conditional_storage_and_removes_sentinel(self):
+        from test_fabric_ledger import MemoryStore
+
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        claims = {"oid": "test-object", "tid": "test-tenant"}
+        token = "header." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".signature"
+        files = {}
+
+        class FakeFs:
+            def exists(self, path):
+                return path in files
+
+            def mkdirs(self, path):
+                files[path] = None
+                return True
+
+            def put(self, path, value, overwrite):
+                files[path] = value
+                return True
+
+            def head(self, path, max_bytes):
+                return files[path][:max_bytes]
+
+        utils = SimpleNamespace(
+            runtime=SimpleNamespace(context={"isForPipeline": True, "currentWorkspaceId": "workspace",
+                                             "defaultLakehouseId": "lakehouse"}),
+            credentials=SimpleNamespace(getToken=lambda audience: token), fs=FakeFs(),
+        )
+        scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
+                 "notebookutils": utils, "operation": "preflight", "probe_id": "storage-probe",
+                 "run_config_json": '{"probe_storage":true}', "selected_demos_json": "[]"}
+        store = MemoryStore()
+        with patch("fabric_storage.OneLakeStore", return_value=store):
+            exec("".join(notebook["cells"][1]["source"]), scope)
+        evidence = json.loads(files["Files/preflight/storage-probe.json"])["conditional_storage_probe"]
+        self.assertTrue(all(evidence[key] for key in ("duplicate_create_rejected", "stale_update_rejected",
+                                                      "update_readback_verified", "stale_delete_rejected",
+                                                      "deleted")))
+        self.assertEqual(store.files, {})
+
+        class UnguardedDeleteStore(MemoryStore):
+            def delete(self, path, etag):
+                del self.files[path]
+
+        scope.update(probe_id="unguarded-delete")
+        with patch("fabric_storage.OneLakeStore", return_value=UnguardedDeleteStore()):
+            with self.assertRaisesRegex(RuntimeError, "Conditional storage probe"):
+                exec("".join(notebook["cells"][1]["source"]), scope)
+        evidence = json.loads(files["Files/preflight/unguarded-delete.json"])["conditional_storage_probe"]
+        self.assertEqual(evidence["step"], "stale-delete")
+        self.assertFalse(evidence.get("stale_delete_rejected", False))
+        self.assertFalse(evidence["deleted"])
+
+    def test_preflight_verifies_and_cleans_only_unique_destination_sentinel(self):
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        claims = {"oid": "test-object", "tid": "test-tenant"}
+        token = "header." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".signature"
+        workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        lakehouse = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        probe_dir = f"abfss://{workspace}@onelake.dfs.fabric.microsoft.com/{lakehouse}/Files/_preflight/producer-access/probe-2"
+        files = {"untouched": "existing"}
+
+        class FakeFs:
+            def exists(self, path):
+                return path in files
+
+            def mkdirs(self, path):
+                files[path] = None
+                return True
+
+            def put(self, path, value, overwrite):
+                if path in files and not overwrite:
+                    return False
+                files[path] = value
+                return True
+
+            def head(self, path, max_bytes):
+                return files[path][:max_bytes]
+
+            def rm(self, path, recurse):
+                if recurse:
+                    raise AssertionError("probe cleanup must not recurse")
+                del files[path]
+                return True
+
+        utils = SimpleNamespace(
+            runtime=SimpleNamespace(context={"isForPipeline": True, "currentWorkspaceId": "workspace",
+                                             "defaultLakehouseId": "lakehouse"}),
+            credentials=SimpleNamespace(getToken=lambda audience: token),
+            fs=FakeFs(),
+        )
+        config = {"probe_marker": "unique",
+                  "destination_access_probe": {"workspace_id": workspace, "lakehouse_id": lakehouse}}
+        scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
+                 "notebookutils": utils, "operation": "preflight", "probe_id": "probe-2",
+                 "run_config_json": json.dumps(config), "selected_demos_json": "[]"}
+        exec("".join(notebook["cells"][1]["source"]), scope)
+        evidence = json.loads(files["Files/preflight/probe-2.json"])
+        self.assertNotIn(token, json.dumps(evidence))
+        access = evidence["destination_access_probe"]
+        self.assertEqual(access["path"], probe_dir + "/identity-probe.txt")
+        self.assertTrue(all(access[key] for key in ("readback_verified", "sentinel_deleted", "directory_deleted")))
+        self.assertNotIn(probe_dir, files)
+        self.assertEqual(files["untouched"], "existing")
+
+        files.pop("Files/preflight/probe-2.json")
+        files[probe_dir] = None
+        files[probe_dir + "/identity-probe.txt"] = "existing sentinel"
+        with self.assertRaisesRegex(RuntimeError, "Destination access probe"):
+            exec("".join(notebook["cells"][1]["source"]), scope)
+        self.assertEqual(files[probe_dir + "/identity-probe.txt"], "existing sentinel")
+        evidence = json.loads(files["Files/preflight/probe-2.json"])
+        self.assertFalse(evidence["destination_access_probe"]["readback_verified"])
 
     def test_runner_spaces_batches_and_isolates_failures_on_resume(self):
         class FakeClock:

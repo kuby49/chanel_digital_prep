@@ -43,6 +43,16 @@ class Verification:
     diagnostic: str | None = None
 
 
+@dataclass(frozen=True)
+class IngestionOutcome:
+    status: str
+    timestamp_utc: str
+    source_id: str | None = None
+    service_operation_id: str | None = None
+    error_code: str | None = None
+    diagnostic: str | None = None
+
+
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -219,6 +229,51 @@ class EventhouseAdapter:
                 source_id,
                 f"Submission outcome is uncertain ({type(exc).__name__}); reconcile before retrying",
             )
+
+    def ingestion_status(self, source_id):
+        """Peek terminal status without deleting shared queue messages."""
+        try:
+            source_id = str(uuid.UUID(source_id))
+        except (ValueError, TypeError, AttributeError):
+            return IngestionOutcome("unknown", _now(), diagnostic="Invalid ingestion source ID")
+        try:
+            from azure.core.exceptions import AzureError
+            from azure.kusto.data.exceptions import KustoError
+            from azure.kusto.ingest.status import KustoIngestStatusQueues
+        except ImportError:
+            return IngestionOutcome(
+                "unknown", _now(), source_id, diagnostic="The Kusto ingestion SDK is not installed"
+            )
+
+        try:
+            queues = KustoIngestStatusQueues(self.ingest_client)
+            matches = []
+            for status, queue in (("failed", queues.failure), ("succeeded", queues.success)):
+                for message in queue.peek(32):
+                    if str(message.IngestionSourceId).lower() == source_id:
+                        matches.append((status, message))
+        except (AzureError, KustoError, OSError, TimeoutError, ValueError, ZeroDivisionError) as exc:
+            return IngestionOutcome(
+                "unknown", _now(), source_id,
+                diagnostic=f"Ingestion status lookup failed ({type(exc).__name__})",
+            )
+        if not matches:
+            return IngestionOutcome(
+                "pending", _now(), source_id,
+                diagnostic="No terminal status is visible; reconcile before retrying",
+            )
+        statuses = {status for status, _ in matches}
+        if len(statuses) != 1:
+            return IngestionOutcome(
+                "unknown", _now(), source_id, diagnostic="Conflicting ingestion statuses",
+            )
+        status, message = matches[0]
+        operation = getattr(message, "OperationId", None)
+        operation = str(operation) if operation is not None else None
+        error_code = getattr(message, "ErrorCode", None)
+        if not isinstance(error_code, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", error_code):
+            error_code = None
+        return IngestionOutcome(status, _now(), source_id, operation, error_code)
 
     def verify(self, batch_id, sha256, row_count, sales_amount_minor_units, operation_id=None):
         try:

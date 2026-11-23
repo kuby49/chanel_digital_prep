@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from eventhouse_core import (
     CSV_HEADER,
@@ -132,6 +133,44 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(result.status, "unknown")
         self.assertTrue(result.operation_id)
         self.assertNotIn("do not expose this", result.diagnostic)
+
+    def test_ingestion_status_peeks_for_the_matching_terminal_source(self):
+        source_id = "11111111-1111-4111-8111-111111111111"
+        other_id = "22222222-2222-4222-8222-222222222222"
+        success = types.SimpleNamespace(
+            IngestionSourceId=source_id, OperationId="service-operation",
+        )
+        failure = types.SimpleNamespace(
+            IngestionSourceId=other_id, OperationId="other", ErrorCode="Forbidden",
+        )
+
+        class FakeQueue:
+            def __init__(self, messages):
+                self.messages = messages
+                self.requests = []
+
+            def peek(self, count):
+                self.requests.append(count)
+                return self.messages
+
+        successes, failures = FakeQueue([success]), FakeQueue([failure])
+        queues = types.SimpleNamespace(success=successes, failure=failures)
+        with patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues):
+            outcome = self.adapter.ingestion_status(source_id)
+            self.assertEqual(outcome.status, "succeeded")
+            self.assertEqual(outcome.service_operation_id, "service-operation")
+            self.assertEqual(self.adapter.ingestion_status(other_id).error_code, "Forbidden")
+            self.assertEqual(
+                self.adapter.ingestion_status("33333333-3333-4333-8333-333333333333").status,
+                "pending",
+            )
+            failures.messages = [types.SimpleNamespace(
+                IngestionSourceId=source_id, OperationId="other", ErrorCode="private secret",
+            )]
+            self.assertEqual(self.adapter.ingestion_status(source_id).status, "unknown")
+        self.assertEqual(successes.requests, [32, 32, 32, 32])
+        self.assertEqual(failures.requests, [32, 32, 32, 32])
+        self.assertEqual(self.adapter.ingestion_status("invalid").status, "unknown")
 
     def test_reconciliation_requires_exact_count_total_and_unique_keys(self):
         digest = hashlib.sha256(csv_bytes([sample_row()])).hexdigest()

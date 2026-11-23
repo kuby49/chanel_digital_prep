@@ -233,6 +233,9 @@ class GeneratorTests(unittest.TestCase):
                 self.assertEqual(set(data), {"contract_version", "track", "mode", "status", "ready", "diagnostics"})
                 self.assertEqual(data["status"], status)
                 self.assertFalse(data["ready"])
+                if mode != "dry-run":
+                    self.assertTrue(any("no cross-workspace destination permissions" in item
+                                        for item in data["diagnostics"]))
 
     def test_run_data_requires_a_safe_bounded_configuration(self):
         script = Path(__file__).with_name("deploy.py")

@@ -68,4 +68,12 @@ event type, and fully readable contents must be demonstrated in the tenant
 before Demo 3 is ready. Do not treat these local primitives as a working Fabric
 producer.
 
+Preflight has not granted any destination access or created connections.
+Producer workspace and notebook execution, pipeline parameter binding, and
+Eventhouse least-privilege ingestion roles are unverified. Those are deployment
+blockers, not implicit authorization. The preflight identity evidence does not
+establish that a workspace/notebook POST or job run succeeds; use the approved
+identity only after explicit access decisions and complete a bounded non-data
+deployment/readback before measured execution.
+
 Run focused tests with `python -m unittest discover -s demo-data-generator -p "test_*.py"`.

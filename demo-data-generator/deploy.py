@@ -61,9 +61,12 @@ def main(argv=None):
         if args.mode == "dry-run":
             result.update(status="pass", diagnostics=["Plan only; no resources were changed."])
         else:
-            result["diagnostics"].append(
-                "Blocked: Fabric producer deployment, destination delivery, and fresh readiness verification are not implemented or verified."
-            )
+            result["diagnostics"].extend([
+                "Blocked: producer workspace, staging Lakehouse, notebook and wrapper pipeline have not been deployed or verified.",
+                "Blocked: workspace creation, notebook execution and pipeline parameter binding have not been verified in the target tenant.",
+                "Blocked: no cross-workspace destination permissions or connections are approved; do not grant them automatically.",
+                "Blocked: OneLake staging persistence, file-event finalization and destination delivery are not runtime-verified.",
+            ])
     except (ValueError, OverflowError, OSError) as exc:
         result.update(status="fail", diagnostics=[str(exc)])
     result_path = Path(args.result)

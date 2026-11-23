@@ -188,6 +188,32 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "blocked")
         self.assertEqual(events[-1]["mode"], "stop-monitor")
 
+    def test_missing_start_evidence_attempts_stop(self):
+        self.config["behavior"] = {"demo-2:start-monitor": {"omit_evidence": True}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertNotIn("run-data", summary["phases"])
+
+    def test_missing_status_result_attempts_stop(self):
+        self.config["behavior"] = {"demo-2:monitor-status": {"omit_result": True}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertNotIn("run-data", summary["phases"])
+
+    def test_expired_or_naive_monitor_deadlines_fail_closed(self):
+        for deadline in ("2000-01-01T00:00:00Z", "2100-01-01T00:00:00"):
+            with self.subTest(deadline=deadline):
+                self.config["behavior"] = {"demo-2:start-monitor": {"evidence": {"deadline_utc": deadline}}}
+                code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")
+                self.assertEqual(events[-1]["mode"], "stop-monitor")
+                self.assertNotIn("run-data", summary["phases"])
+
     def test_uncertain_producer_failure_does_not_claim_monitor_or_producer_stopped(self):
         self.config["behavior"] = {"shared:run-data": {"status": "fail", "ready": False}}
         code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")

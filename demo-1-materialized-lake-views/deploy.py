@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+from definition_plan import effective_verification_timeout_seconds
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -31,6 +33,10 @@ def main():
             config = json.load(file)
         if not isinstance(config, dict) or config.get("contract_version") != 1:
             raise ValueError("config must be an object with contract_version 1")
+        verification_timeout = effective_verification_timeout_seconds(config)
+        result["diagnostics"].append(
+            f"Per-batch verification timeout: {verification_timeout} seconds."
+        )
         if not args.prefix:
             raise ValueError("prefix must not be empty")
         if args.mode == "cleanup" and not args.yes:
@@ -43,12 +49,12 @@ def main():
             )
         else:
             result["diagnostics"].append(
-                "Demo 1 is not implemented or deployed: a supported fixed-schema "
-                "empty-folder OneLake_Files definition and runtime verification are required."
+                "Demo 1 remains blocked: empty-folder Bronze MLV creation failed with "
+                "MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA."
             )
             if args.mode == "cleanup":
                 result["diagnostics"].append(
-                    "Cleanup is unavailable until resource ownership can be verified."
+                    "Cleanup is unavailable because resource-scoped cleanup is not implemented."
                 )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         result["status"] = "fail"

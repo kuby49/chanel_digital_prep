@@ -142,7 +142,7 @@
       "source": "Demo 1 owner Spark readback",
       "landing_uri": "abfss://14080576-9158-4326-8014-427c8009ce12@onelake.dfs.fabric.microsoft.com/aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659/Files/incoming/sales/",
       "dimension_counts": {"DimDate": 365, "DimProduct": 20, "DimCustomer": 100},
-      "note": "Owner reports unique non-null dimension keys and an empty landing folder; date range is unverified. Empty-folder fixed-schema bronze MLV creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA; no bronze, silver or schedule created."
+      "note": "Owner reports unique non-null dimension keys; date range is unverified. Empty-folder fixed-schema bronze creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA. A subsequent 111-byte header-only bootstrap enabled bronze and silver definition creation; bronze readback reports fixed schema, append-only refresh and zero rows. Silver readback, managed refresh and end-to-end readiness remain unverified."
     },
     {
       "track": "shared",

@@ -100,6 +100,28 @@
       "evidence": "Fabric item GET returned matching type and workspace ID"
     }
   ],
+  "observed_existing_roles": [
+    {
+      "track": "demo-3",
+      "scope": "workspace:744223de-ceab-4c4f-82ba-f811bcb5c7d7",
+      "principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
+      "role": "Admin",
+      "verified_utc": "2026-11-23T22:08:57Z",
+      "note": "Existing role readback; not a new grant. Producer notebook runtime identity is not yet verified."
+    }
+  ],
+  "reported_observations": [
+    {
+      "track": "demo-2",
+      "source": "Demo 2 owner readback",
+      "database_id": "9b3fd360-a689-4163-91d6-3981882cd6c8",
+      "table": "FactSales",
+      "csv_mapping": "SalesCsvV1",
+      "onelake_availability": "enabled",
+      "target_latency_minutes": 5,
+      "note": "Owner reports schema, mapping and policy readback; data delivery and OneLake visibility remain unverified."
+    }
+  ],
   "cross_workspace_grants": [],
   "note": "Point-in-time readback, not a complete or authoritative inventory; refresh before any mutation or cleanup."
 }

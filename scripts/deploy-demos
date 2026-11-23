@@ -140,7 +140,9 @@ def monitor_config(config):
     if location is not None and (not isinstance(location, str) or location.rstrip("/") != root):
         raise ValueError("shared.run_state_location must match the derived producer runs root")
     demo = config.get("demo-2") or {}
-    verification_timeout = demo.get("verification_timeout_seconds", config["execution"].get("verification_timeout_seconds"))
+    verification_timeout = demo.get("verification_timeout_seconds")
+    if verification_timeout is None:
+        verification_timeout = config["execution"].get("verification_timeout_seconds")
     if type(verification_timeout) is not int or verification_timeout < 1:
         raise ValueError("Demo 2 verification timeout must be a positive integer")
     duration = (2 * config["execution"]["track_timeout_seconds"]

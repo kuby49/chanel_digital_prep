@@ -238,6 +238,14 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(events, [])
 
+    def test_monitor_uses_default_timeout_when_demo_override_is_null(self):
+        self.config["demo-2"] = {"verification_timeout_seconds": None}
+        _, duration = deploy.monitor_config(self.config)
+        self.assertEqual(duration, 45)
+        self.config["demo-2"]["verification_timeout_seconds"] = 30
+        _, duration = deploy.monitor_config(self.config)
+        self.assertEqual(duration, 60)
+
     def test_partial_cleanup_excludes_shared(self):
         code, _, events = self.run_cli("demo-2", "--cleanup", "--yes")
         self.assertEqual(code, 0)

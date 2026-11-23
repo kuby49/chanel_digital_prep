@@ -64,7 +64,7 @@ class EntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config.json"
-            config.write_text('{"contract_version":1}', encoding="utf-8")
+            config.write_text('{"contract_version":1,"demo-3":{}}', encoding="utf-8")
             for mode in ("dry-run", "validate-only", "deploy", "cleanup"):
                 result = root / f"{mode}.json"
                 cmd = [sys.executable, str(ROOT / "deploy.py"), "--mode", mode,
@@ -83,7 +83,7 @@ class EntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config.json"
-            config.write_text('{"contract_version":1}', encoding="utf-8")
+            config.write_text('{"contract_version":1,"demo-3":{}}', encoding="utf-8")
             result = root / "result.json"
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "deploy.py"), "--mode", "cleanup",

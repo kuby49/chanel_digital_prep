@@ -32,6 +32,8 @@ def main(argv=None):
             config = json.load(file)
         if not isinstance(config, dict) or config.get("contract_version") != 1:
             raise ValueError("configuration contract_version must be 1")
+        if not isinstance(config.get("demo-3"), dict):
+            raise ValueError("configuration must contain a demo-3 object")
         if args.mode == "cleanup" and not args.yes:
             raise ValueError("cleanup requires --yes; no resources were removed")
         if args.mode == "dry-run":

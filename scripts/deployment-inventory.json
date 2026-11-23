@@ -42,6 +42,42 @@
       "workspace_id": "744223de-ceab-4c4f-82ba-f811bcb5c7d7",
       "verified_utc": "2026-11-23T21:59:39Z",
       "evidence": "Fabric Lakehouse GET returned matching name, workspace ID and default schema dbo"
+    },
+    {
+      "track": "demo-2",
+      "type": "workspace",
+      "name": "chanel-demo2-eventhouse",
+      "id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f",
+      "owner_marker": "owner session 798514f1-6b55-4ed3-b021-4856eb491c19",
+      "verified_utc": "2026-11-23T22:03:30Z",
+      "evidence": "Fabric workspace GET returned matching name, owner marker and capacity ID"
+    },
+    {
+      "track": "demo-2",
+      "type": "eventhouse",
+      "name": "SalesEventhouse",
+      "id": "5c681ae1-b071-4ebe-be1b-80dfeba9b495",
+      "workspace_id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f",
+      "verified_utc": "2026-11-23T22:03:30Z",
+      "evidence": "Fabric item GET returned matching type and workspace ID"
+    },
+    {
+      "track": "demo-2",
+      "type": "kql-database",
+      "name": "SalesEventhouse",
+      "id": "9b3fd360-a689-4163-91d6-3981882cd6c8",
+      "workspace_id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f",
+      "verified_utc": "2026-11-23T22:03:30Z",
+      "evidence": "Fabric item GET returned matching type and workspace ID"
+    },
+    {
+      "track": "demo-2",
+      "type": "lakehouse",
+      "name": "SalesLakehouse",
+      "id": "04113b0b-8698-4a61-a69d-ad862e96b6e6",
+      "workspace_id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f",
+      "verified_utc": "2026-11-23T22:03:30Z",
+      "evidence": "Fabric item GET returned matching type and workspace ID"
     }
   ],
   "cross_workspace_grants": [],

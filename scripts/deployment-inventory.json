@@ -125,7 +125,7 @@
       "principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
       "role": "Admin",
       "verified_utc": "2026-11-23T22:08:57Z",
-      "note": "Existing role readback; not a new grant. Producer reports the no-sales probe used this storage-token principal; destination access remains unverified."
+      "note": "Existing role readback; not a new grant. Producer reports a no-sales sentinel write/read/delete under this storage-token principal outside the incoming folder; event behavior and incoming-folder delivery remain unverified."
     },
     {
       "track": "demo-2",
@@ -133,7 +133,7 @@
       "principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
       "role": "Admin",
       "verified_utc": "2026-11-23T22:11:11Z",
-      "note": "Existing workspace role readback; does not prove KQL ingestion or query permissions. Producer reports this storage-token principal; Kusto identity remains unverified."
+      "note": "Existing workspace role readback; does not prove KQL ingestion or query permissions. Producer reports matching storage and Kusto token claims for this principal."
     }
   ],
   "reported_observations": [
@@ -149,7 +149,7 @@
       "source": "Producer owner no-sales pipeline probe",
       "storage_token_principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
       "tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527",
-      "note": "Owner reports completed probe, staging Lakehouse binding and executionData.parameters marker match; this does not establish Kusto identity or destination access."
+      "note": "Owner reports completed no-sales probe: storage and Kusto token claims match this principal; staging Lakehouse binding and executionData.parameters marker match; a Demo 3 preflight sentinel was written, read byte-for-byte and deleted outside the incoming folder. Default runtime lacked azure.kusto; real KQL ingestion and measured delivery remain unverified."
     },
     {
       "track": "demo-2",

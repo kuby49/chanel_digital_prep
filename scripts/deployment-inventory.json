@@ -107,10 +107,25 @@
       "principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
       "role": "Admin",
       "verified_utc": "2026-11-23T22:08:57Z",
-      "note": "Existing role readback; not a new grant. Producer notebook runtime identity is not yet verified."
+      "note": "Existing role readback; not a new grant. Producer reports the no-sales probe used this storage-token principal; destination access remains unverified."
+    },
+    {
+      "track": "demo-2",
+      "scope": "workspace:aab2ed7b-fd2f-4696-84b3-b34ef931681f",
+      "principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
+      "role": "Admin",
+      "verified_utc": "2026-11-23T22:11:11Z",
+      "note": "Existing workspace role readback; does not prove KQL ingestion or query permissions. Producer reports this storage-token principal; Kusto identity remains unverified."
     }
   ],
   "reported_observations": [
+    {
+      "track": "shared",
+      "source": "Producer owner no-sales pipeline probe",
+      "storage_token_principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
+      "tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527",
+      "note": "Owner reports completed probe, staging Lakehouse binding and executionData.parameters marker match; this does not establish Kusto identity or destination access."
+    },
     {
       "track": "demo-2",
       "source": "Demo 2 owner readback",

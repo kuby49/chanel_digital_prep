@@ -14,6 +14,9 @@ totals. The batch timestamp is derived from the logical sale date, not the
 delivery time. The same run ID, configuration and batch number give the same
 bytes; quantities and prices use SHA-256 rather than runtime-specific random
 number generation. Use a new run ID for intentionally new data.
+Every manifest has `contract_version: 1` and each batch records `batch_class`
+(`measured`, `bootstrap`, or `negative-test`); a run has one fixed batch class.
+Classification alone does not generate malformed data for a negative test.
 
 `stage_batch(root, config, batch_number, destinations)` stores immutable CSVs
 and a v1 JSON manifest under `root/<run_id>`. It verifies existing files and

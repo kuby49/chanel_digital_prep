@@ -38,6 +38,7 @@ class GeneratorTests(unittest.TestCase):
             rows = list(csv.DictReader(io.StringIO(payload.decode())))
             self.assertEqual(tuple(rows[0]), HEADER)
             self.assertEqual(len(rows), 12)
+            self.assertEqual(meta["batch_class"], "measured")
             self.assertEqual(sum(int(r["SalesAmountMinorUnits"]) for r in rows), meta["sales_amount_minor_units"])
             self.assertEqual(sum(meta["amount_by_date"].values()), meta["sales_amount_minor_units"])
             self.assertEqual(sum(meta["amount_by_product_category"].values()), meta["sales_amount_minor_units"])
@@ -59,6 +60,9 @@ class GeneratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             config = RunConfig("abc", rows_per_file=2)
             entry = stage_batch(root, config, 1, ["demo-1", "demo-3"])
+            manifest = json.loads((Path(root) / "abc" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["contract_version"], 1)
+            self.assertEqual(manifest["batches"]["1"]["batch_class"], "measured")
             self.assertEqual(entry, stage_batch(root, config, 1, ["demo-3", "demo-1"]))
             with self.assertRaises(ValueError):
                 stage_batch(root, RunConfig("abc", rows_per_file=3), 1, ["demo-1", "demo-3"])
@@ -68,11 +72,14 @@ class GeneratorTests(unittest.TestCase):
                 stage_batch(root, config, 1, ["demo-1", "demo-3"])
 
     def test_invalid_inputs_are_rejected(self):
-        for config in (RunConfig("../bad"), RunConfig("x", rows_per_file=0), RunConfig("x", seed=True)):
+        for config in (RunConfig("../bad"), RunConfig("x", rows_per_file=0), RunConfig("x", seed=True),
+                       RunConfig("x", batch_class="invalid")):
             with self.assertRaises(ValueError):
                 batch_bytes(config, 1)
         with self.assertRaises(ValueError):
             batch_bytes(RunConfig("ok"), 0)
+        self.assertEqual(batch_bytes(RunConfig("test", batch_class="bootstrap"), 1)[1]["batch_class"], "bootstrap")
+        self.assertEqual(batch_bytes(RunConfig("test", batch_class="negative-test"), 1)[1]["batch_class"], "negative-test")
 
     def test_deploy_contract_never_claims_unimplemented_readiness(self):
         script = Path(__file__).with_name("deploy.py")

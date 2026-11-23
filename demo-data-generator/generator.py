@@ -21,6 +21,7 @@ HEADER = (
 @dataclass(frozen=True)
 class RunConfig:
     run_id: str
+    batch_class: str = "measured"
     start_date: str = "2024-01-01"
     seed: int = 42
     date_count: int = 365
@@ -33,6 +34,8 @@ class RunConfig:
     def validate(self):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", self.run_id):
             raise ValueError("run_id must contain only letters, digits, underscores or hyphens")
+        if self.batch_class not in ("measured", "bootstrap", "negative-test"):
+            raise ValueError("batch_class must be measured, bootstrap or negative-test")
         date.fromisoformat(self.start_date)
         if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
                for value in (self.date_count, self.products, self.customers,
@@ -102,7 +105,7 @@ def batch_bytes(config, batch_number):
                             (by_region, regions[(customer - 1) % len(regions)])):
             groups[key] = groups.get(key, 0) + amount
     payload = output.getvalue().encode("utf-8")
-    return payload, {"batch_id": batch_id, "batch_number": batch_number,
+    return payload, {"batch_id": batch_id, "batch_number": batch_number, "batch_class": config.batch_class,
                      "filename": f"sales_{batch_id}.csv", "sha256": hashlib.sha256(payload).hexdigest(),
                      "row_count": config.rows_per_file, "sales_amount_minor_units": total,
                      "amount_by_date": by_date, "amount_by_product_category": by_category,

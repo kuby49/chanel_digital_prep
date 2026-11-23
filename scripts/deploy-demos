@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Coordinate independent demo deployment entry points without starting data implicitly."""
+
+import argparse
+import concurrent.futures
+import datetime
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+TRACKS = {
+    "demo-1": ROOT / "demo-1-materialized-lake-views" / "deploy.py",
+    "demo-2": ROOT / "demo-2-eventhouse" / "deploy.py",
+    "demo-3": ROOT / "demo-3-onelake-events-copy" / "deploy.py",
+    "shared": ROOT / "demo-data-generator" / "deploy.py",
+}
+STATUSES = {"pass", "fail", "blocked"}
+
+
+def parse_selector(value):
+    if value == "all":
+        return list(TRACKS)[:3]
+    parts = value.split(",")
+    if not parts or any(part not in TRACKS or part == "shared" for part in parts):
+        raise argparse.ArgumentTypeError("select all or comma-separated demo-1,demo-2,demo-3")
+    if len(set(parts)) != len(parts):
+        raise argparse.ArgumentTypeError("a demo may only be selected once")
+    return parts
+
+
+def load_config(path):
+    with path.open(encoding="utf-8") as file:
+        config = json.load(file)
+    if not isinstance(config, dict) or type(config.get("contract_version")) is not int or config["contract_version"] != 1:
+        raise ValueError("configuration contract_version must be 1")
+    if not isinstance(config.get("execution"), dict):
+        raise ValueError("configuration execution must be an object")
+    return config
+
+
+def result(track, mode, status, message):
+    return {"contract_version": 1, "track": track, "mode": mode,
+            "status": status, "ready": False, "diagnostics": [message]}
+
+
+def validate_run_data(config):
+    data = config.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("data must be an object")
+    if not isinstance(data.get("run_id"), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", data["run_id"]):
+        raise ValueError("data.run_id must be a nonempty safe logical run identifier")
+    for key in ("file_count", "rows_per_file", "max_duration_seconds"):
+        if type(data.get(key)) is not int or data[key] < 1:
+            raise ValueError(f"data.{key} must be a positive integer")
+    if type(data.get("interval_seconds")) is not int or data["interval_seconds"] < 0:
+        raise ValueError("data.interval_seconds must be a nonnegative integer")
+    if data["max_duration_seconds"] <= (data["file_count"] - 1) * data["interval_seconds"]:
+        raise ValueError("data.max_duration_seconds must exceed the time of the last scheduled batch")
+
+
+def invoke(track, mode, config_path, prefix, state_dir, timeout, selected, yes=False):
+    script = TRACKS[track]
+    result_path = state_dir / f"{track}-{mode}.json"
+    log_path = state_dir / f"{track}-{mode}.log"
+    if not script.is_file():
+        return result(track, mode, "blocked", f"Missing entry point: {script}")
+    args = [sys.executable, str(script), "--mode", mode, "--config", str(config_path),
+            "--prefix", prefix, "--state-dir", str(state_dir), "--result", str(result_path)]
+    if yes:
+        args.append("--yes")
+    if mode == "run-data":
+        args += ["--selected-demos", ",".join(selected)]
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            completed = subprocess.run(args, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                       timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return result(track, mode, "fail", f"Entry point timed out after {timeout} seconds; inspect {log_path}")
+    except OSError as error:
+        return result(track, mode, "fail", f"Could not launch entry point: {error}")
+    try:
+        with result_path.open(encoding="utf-8") as file:
+            data = json.load(file)
+        if not isinstance(data, dict):
+            raise ValueError("result must be an object")
+        if (type(data.get("contract_version")) is not int or data["contract_version"] != 1
+                or data.get("track") != track or data.get("mode") != mode
+                or not isinstance(data.get("status"), str) or data["status"] not in STATUSES
+                or type(data.get("ready")) is not bool
+                or not isinstance(data.get("diagnostics"), list)
+                or not all(isinstance(item, str) for item in data["diagnostics"])):
+            raise ValueError("invalid result contract")
+        if data["status"] != "pass" and (data["ready"] or not data["diagnostics"]):
+            raise ValueError("failed/blocked result must be not ready and explain why")
+        if (completed.returncode == 0) != (data["status"] == "pass"):
+            raise ValueError(f"exit code {completed.returncode} disagrees with status")
+        if mode in {"deploy", "validate-only"} and data["status"] == "pass" and not data["ready"]:
+            return result(track, mode, "blocked", "Entry point reported pass but did not verify readiness")
+        return data
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return result(track, mode, "fail", f"Invalid or missing result ({error}); inspect {log_path}")
+
+
+def run_phase(tracks, mode, config_path, prefix, state_dir, timeout, selected, concurrency, yes):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {track: executor.submit(invoke, track, mode, config_path, prefix,
+                                          state_dir, timeout, selected, yes)
+                   for track in tracks}
+        return {track: future.result() for track, future in futures.items()}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("selector", type=parse_selector, help="all or comma-separated demo selectors")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    for mode in ("dry-run", "validate-only", "deploy", "cleanup"):
+        modes.add_argument("--" + mode, action="store_const", const=mode, dest="mode")
+    parser.add_argument("--config", type=Path, default=ROOT / "config.example.json")
+    parser.add_argument("--prefix", help="override configuration deployment prefix")
+    parser.add_argument("--state-dir", type=Path, default=ROOT / ".deployment-state")
+    parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--yes", action="store_true", help="confirm cleanup")
+    parser.add_argument("--run-data", action="store_true", help="start a bounded producer after fresh readiness checks")
+    args = parser.parse_args(argv)
+    if args.mode == "cleanup" and not args.yes:
+        parser.error("--cleanup requires --yes")
+    if args.run_data and args.mode != "deploy":
+        parser.error("--run-data requires --deploy")
+    try:
+        config_path = args.config.resolve(strict=True)
+        config = load_config(config_path)
+        prefix = args.prefix or config.get("prefix")
+        if not isinstance(prefix, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", prefix):
+            raise ValueError("prefix must contain only lowercase letters, digits and hyphens, beginning with a letter or digit")
+        execution = config["execution"]
+        concurrency = args.concurrency if args.concurrency is not None else execution.get("max_concurrency")
+        timeout = execution.get("track_timeout_seconds")
+        if type(concurrency) is not int or not 1 <= concurrency <= 4:
+            raise ValueError("concurrency must be an integer from 1 to 4")
+        if type(timeout) is not int or timeout < 1:
+            raise ValueError("track_timeout_seconds must be a positive integer")
+        if args.run_data:
+            validate_run_data(config)
+        state_root = args.state_dir.resolve()
+        state_root.mkdir(parents=True, exist_ok=True)
+        state_dir = Path(tempfile.mkdtemp(prefix="run-", dir=state_root))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        return 2
+    tracks = args.selector + (["shared"] if args.mode != "cleanup" or len(args.selector) == 3 else [])
+    phases = {args.mode: run_phase(tracks, args.mode, config_path, prefix, state_dir,
+                                   timeout, args.selector, concurrency, args.yes)}
+    if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
+        phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix, state_dir,
+                                             timeout, args.selector, concurrency, False)
+        if all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values()):
+            phases["run-data"] = {"shared": invoke("shared", "run-data", config_path, prefix,
+                                                    state_dir, timeout, args.selector)}
+    summary = {"contract_version": 1, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               "selected_demos": args.selector, "prefix": prefix, "phases": phases}
+    (state_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    print(f"State directory: {state_dir}", file=sys.stderr)
+    success = all(item["status"] == "pass" for phase in phases.values() for item in phase.values())
+    if args.run_data and "run-data" not in phases:
+        print("Producer not started: deployment or fresh readiness checks did not pass.", file=sys.stderr)
+        success = False
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

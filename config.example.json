@@ -1,0 +1,83 @@
+{
+  "contract_version": 1,
+  "environment": "MCAP",
+  "tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527",
+  "subscription_id": null,
+  "capacity": {"name": "fabricadbmirror", "id": null},
+  "prefix": "chanel",
+  "authentication": {"method": "signed-in-identity", "secret_references": []},
+  "execution": {
+    "max_concurrency": 4,
+    "track_timeout_seconds": 1800,
+    "verification_timeout_seconds": 900,
+    "poll_interval_seconds": 15
+  },
+  "data": {
+    "run_id": null,
+    "seed": 42,
+    "start_date": "2026-01-01",
+    "date_count": 365,
+    "product_count": 20,
+    "customer_count": 100,
+    "rows_per_file": 1000,
+    "file_count": 10,
+    "interval_seconds": 60,
+    "max_duration_seconds": 1800,
+    "currency": "EUR"
+  },
+  "demo-1": {
+    "workspace_name": "{prefix}-demo1-mlv",
+    "workspace_id": null,
+    "lakehouse_name": null,
+    "lakehouse_id": null,
+    "landing_uri": null,
+    "bronze_schema": "bronze",
+    "silver_schema": "silver",
+    "bronze_view": null,
+    "silver_view": null,
+    "csv_options": {"header": true, "delimiter": ",", "encoding": "UTF-8"},
+    "refresh_interval_minutes": 5,
+    "refresh_end_utc": null
+  },
+  "demo-2": {
+    "workspace_name": "{prefix}-demo2-eventhouse",
+    "workspace_id": null,
+    "lakehouse_name": null,
+    "lakehouse_id": null,
+    "eventhouse_id": null,
+    "kql_database_id": null,
+    "ingestion_endpoint": null,
+    "sales_table": null,
+    "csv_mapping": null,
+    "delivery_method": null,
+    "onelake_table_path": null,
+    "shortcut_name": null,
+    "target_latency_minutes": 5
+  },
+  "demo-3": {
+    "workspace_name": "{prefix}-demo3-copy-events",
+    "workspace_id": null,
+    "lakehouse_name": null,
+    "lakehouse_id": null,
+    "landing_uri": null,
+    "pipeline_id": null,
+    "connection_ids": [],
+    "event_source": null,
+    "event_filter": null,
+    "activator_rule_id": null,
+    "event_parameter_mapping": null,
+    "destination_table": null,
+    "retry_limit": 3,
+    "idempotency_strategy": null
+  },
+  "shared": {
+    "workspace_name": "{prefix}-demo-data-generator",
+    "workspace_id": null,
+    "staging_lakehouse_id": null,
+    "producer_notebook_id": null,
+    "wrapper_pipeline_id": null,
+    "destination_connection_ids": [],
+    "identity_id": null,
+    "run_state_location": null
+  }
+}

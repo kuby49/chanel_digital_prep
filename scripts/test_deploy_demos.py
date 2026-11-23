@@ -17,7 +17,7 @@ deploy = importlib.util.module_from_spec(spec)
 loader.exec_module(deploy)
 
 FAKE_TRACK = """
-import argparse, json, pathlib, sys
+import argparse, datetime, json, pathlib, sys
 p = argparse.ArgumentParser()
 for option in ('mode', 'config', 'prefix', 'state-dir', 'result'):
     p.add_argument('--' + option, required=True)
@@ -32,8 +32,24 @@ with pathlib.Path(config['audit']).open('a') as f:
 if behavior.get('omit_result'):
     sys.exit(0)
 status = behavior.get('status', 'pass')
+monitor_path = pathlib.Path(a.state_dir) / 'demo-2-monitor.json'
+if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status') and status == 'pass':
+    if a.mode == 'start-monitor':
+        shared = config['shared']
+        root = ('https://onelake.blob.fabric.microsoft.com/' + shared['workspace_id'] + '/' +
+                shared['staging_lakehouse_id'] + '/Files/producer/runs/' + config['data']['run_id'])
+        evidence = {'contract_version': 1, 'run_id': config['data']['run_id'], 'job_id': 'job-1',
+                    'manifest_uri': root + '/manifest.json', 'state': 'submitted',
+                    'deadline_utc': (datetime.datetime.now(datetime.timezone.utc) +
+                                     datetime.timedelta(seconds=10)).isoformat()}
+    else:
+        evidence = json.loads(monitor_path.read_text())
+        evidence['state'] = 'running'
+    evidence.update(behavior.get('evidence', {}))
+    if not behavior.get('omit_evidence'):
+        monitor_path.write_text(json.dumps(evidence))
 result = {'contract_version': 1, 'track': track, 'mode': a.mode, 'status': status,
-          'ready': behavior.get('ready', a.mode in ('deploy', 'validate-only')),
+          'ready': behavior.get('ready', a.mode in ('deploy', 'validate-only', 'monitor-status')),
           'diagnostics': [] if status == 'pass' else ['not ready']}
 pathlib.Path(a.result).write_text(json.dumps(result))
 sys.exit(0 if status == 'pass' else 1)
@@ -55,9 +71,13 @@ class OrchestrationTests(unittest.TestCase):
         self.audit = self.root / "audit.jsonl"
         self.config = {
             "contract_version": 1, "prefix": "chanel", "audit": str(self.audit),
-            "execution": {"max_concurrency": 4, "track_timeout_seconds": 10},
+            "execution": {"max_concurrency": 4, "track_timeout_seconds": 10,
+                          "verification_timeout_seconds": 15},
             "data": {"run_id": "run-1", "file_count": 2, "rows_per_file": 2,
                      "interval_seconds": 1, "max_duration_seconds": 10, "currency": "USD"},
+            "shared": {"workspace_id": "11111111-1111-4111-8111-111111111111",
+                       "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222",
+                       "run_state_location": None},
         }
 
     def run_cli(self, *args):
@@ -120,6 +140,66 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual([event["mode"] for event in events][-1], "run-data")
         self.assertEqual(events[-1]["selected"], "demo-1,demo-3")
         self.assertEqual(summary["phases"]["run-data"]["shared"]["status"], "pass")
+
+    def test_demo2_monitor_is_ready_before_selected_producer_starts(self):
+        code, summary, events = self.run_cli("demo-2,demo-3", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        modes = [event["mode"] for event in events]
+        self.assertEqual(modes[-3:], ["start-monitor", "monitor-status", "run-data"])
+        self.assertTrue(all(mode == "validate-only" for mode in modes[3:-3]))
+        self.assertEqual(events[-1]["selected"], "demo-2,demo-3")
+        self.assertEqual(events[-2]["selected"], "demo-2,demo-3")
+        self.assertTrue(summary["phases"]["monitor-status"]["demo-2"]["ready"])
+
+    def test_failed_monitor_start_attempts_stop_and_blocks_producer(self):
+        self.config["behavior"] = {"demo-2:start-monitor": {"status": "blocked", "ready": False}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual([event["mode"] for event in events][-2:], ["start-monitor", "stop-monitor"])
+        self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "blocked")
+        self.assertNotIn("run-data", summary["phases"])
+
+    def test_failed_monitor_stop_is_not_hidden(self):
+        self.config["behavior"] = {
+            "demo-2:start-monitor": {"status": "blocked", "ready": False},
+            "demo-2:stop-monitor": {"status": "fail", "ready": False},
+        }
+        code, summary, _ = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["stop-monitor"]["demo-2"]["status"], "fail")
+
+    def test_wrong_monitor_evidence_blocks_producer_and_attempts_stop(self):
+        for evidence in ({"run_id": "another-run"}, {"job_id": "different-job"},
+                         {"manifest_uri": "https://example.invalid/manifest.json"},
+                         {"deadline_utc": "2100-01-01T00:00:00Z"},
+                         {"state": "not-running"}):
+            with self.subTest(evidence=evidence):
+                self.config["behavior"] = {"demo-2:monitor-status": {"evidence": evidence}}
+                code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
+                self.assertNotIn("run-data", summary["phases"])
+                self.assertEqual(events[-1]["mode"], "stop-monitor")
+
+    def test_monitor_must_report_fresh_readiness(self):
+        self.config["behavior"] = {"demo-2:monitor-status": {"ready": False}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "blocked")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+
+    def test_uncertain_producer_failure_does_not_claim_monitor_or_producer_stopped(self):
+        self.config["behavior"] = {"shared:run-data": {"status": "fail", "ready": False}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(events[-1]["mode"], "run-data")
+        self.assertNotIn("stop-monitor", summary["phases"])
+
+    def test_demo2_manifest_config_mismatch_blocks_before_deploy(self):
+        self.config["shared"]["run_state_location"] = "https://example.invalid/other-root"
+        code, _, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 2)
+        self.assertEqual(events, [])
 
     def test_partial_cleanup_excludes_shared(self):
         code, _, events = self.run_cli("demo-2", "--cleanup", "--yes")

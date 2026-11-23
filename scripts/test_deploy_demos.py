@@ -126,6 +126,12 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(events, [])
 
+    def test_invalid_per_demo_timeout_prevents_any_invocation(self):
+        self.config["demo-1"] = {"verification_timeout_seconds": 0}
+        code, _, events = self.run_cli("demo-1", "--deploy")
+        self.assertEqual(code, 2)
+        self.assertEqual(events, [])
+
     def test_missing_entrypoint_is_blocked(self):
         deploy.TRACKS["demo-1"] = self.root / "missing.py"
         code, summary, events = self.run_cli("demo-1", "--dry-run")

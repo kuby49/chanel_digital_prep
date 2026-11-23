@@ -37,7 +37,8 @@
     "silver_view": null,
     "csv_options": {"header": true, "delimiter": ",", "encoding": "UTF-8"},
     "refresh_interval_minutes": 5,
-    "refresh_end_utc": null
+    "refresh_end_utc": null,
+    "verification_timeout_seconds": 900
   },
   "demo-2": {
     "workspace_name": "{prefix}-demo2-eventhouse",
@@ -52,7 +53,8 @@
     "delivery_method": null,
     "onelake_table_path": null,
     "shortcut_name": null,
-    "target_latency_minutes": 5
+    "target_latency_minutes": 5,
+    "verification_timeout_seconds": 900
   },
   "demo-3": {
     "workspace_name": "{prefix}-demo3-copy-events",
@@ -68,7 +70,8 @@
     "event_parameter_mapping": null,
     "destination_table": null,
     "retry_limit": 3,
-    "idempotency_strategy": null
+    "idempotency_strategy": null,
+    "verification_timeout_seconds": 900
   },
   "shared": {
     "workspace_name": "{prefix}-demo-data-generator",

@@ -1,0 +1,49 @@
+{
+  "contract_version": 1,
+  "environment": "MCAP",
+  "prefix": "chanel",
+  "capacity": {
+    "name": "fabricadbmirror",
+    "id": "de12195c-40d2-4bee-af60-f0d6dedfbb0f"
+  },
+  "resources": [
+    {
+      "track": "shared",
+      "type": "workspace",
+      "name": "chanel-demo-data-generator",
+      "id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+      "owner_marker": "deployment=chanel; component=producer; contract=v1",
+      "verified_utc": "2026-11-23T21:58:28Z",
+      "evidence": "Fabric workspace GET returned matching name, owner marker and capacity ID"
+    },
+    {
+      "track": "demo-3",
+      "type": "workspace",
+      "name": "chanel-demo3-copy-events",
+      "id": "744223de-ceab-4c4f-82ba-f811bcb5c7d7",
+      "owner_marker": "chanel-demo3-a9bbae81-c4f6-4d80-97af-1302af68f910",
+      "verified_utc": "2026-11-23T21:58:28Z",
+      "evidence": "Fabric workspace GET returned matching name, owner marker and capacity ID"
+    },
+    {
+      "track": "shared",
+      "type": "lakehouse",
+      "name": "producer_staging",
+      "id": "fca649c9-0297-4997-8e2d-8ac5338aaa1a",
+      "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+      "verified_utc": "2026-11-23T21:59:39Z",
+      "evidence": "Fabric Lakehouse GET returned matching name and workspace ID"
+    },
+    {
+      "track": "demo-3",
+      "type": "lakehouse",
+      "name": "ChanelDemo3Lakehouse",
+      "id": "02fd5f73-32d5-4295-bfb5-c5436e9c3b62",
+      "workspace_id": "744223de-ceab-4c4f-82ba-f811bcb5c7d7",
+      "verified_utc": "2026-11-23T21:59:39Z",
+      "evidence": "Fabric Lakehouse GET returned matching name, workspace ID and default schema dbo"
+    }
+  ],
+  "cross_workspace_grants": [],
+  "note": "Point-in-time readback, not a complete or authoritative inventory; refresh before any mutation or cleanup."
+}

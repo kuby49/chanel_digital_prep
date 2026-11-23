@@ -34,6 +34,8 @@ python scripts\deploy-demos demo-1 --cleanup --yes --config C:\path\to\config.js
 
 Each invocation creates a separate directory under `.deployment-state` (override with `--state-dir`) with per-track logs, result JSON and an aggregate `summary.json`. A missing entry point, invalid response, timeout, failure or blocked track makes the command fail without masking the other selected results. A timeout does not prove that work already submitted to a remote service has stopped; inspect its job state before retrying.
 
+The sanitized [deployment inventory](scripts/deployment-inventory.json) is a point-in-time record of independently verified demo-owned resources and known shared grants, not an authoritative live registry. Refresh ownership and scope before making changes or cleaning up.
+
 The producer is never started unless `--deploy --run-data` is explicitly supplied. This first deploys all selected destinations and the shared producer, then invokes fresh `validate-only` checks for every selected track. It starts the shared producer only if all report `pass` and `ready: true`; missing, awaiting-approval or unverified capabilities must report blocked. A nonempty stable `data.run_id`, bounded file count, batch size and sufficient positive maximum duration are required. The producer owns enforcing its runtime deadline, persisting progress and terminating its Fabric job; orchestration cannot establish that the job finished merely from submission. After a run, verify job/session completion and pause demo-owned schedules and rules, leaving the capacity running at its final size.
 
 ## Version 1 integration contract

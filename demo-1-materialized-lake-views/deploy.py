@@ -49,8 +49,10 @@ def main():
             )
         else:
             result["diagnostics"].append(
-                "Demo 1 remains blocked: empty-folder Bronze MLV creation failed with "
-                "MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA."
+                "Demo 1 readiness remains blocked: header-only bootstrap MLV definitions "
+                "exist in an isolated test environment, but automated deployment, "
+                "configured-environment schedule and runtime validation, and measured-data "
+                "verification are not implemented."
             )
             if args.mode == "cleanup":
                 result["diagnostics"].append(

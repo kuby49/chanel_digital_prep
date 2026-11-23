@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from definition_plan import (
+    bootstrap_csv_bytes,
     build_refresh_schedule_request,
     effective_verification_timeout_seconds,
     render_bronze_sql,
@@ -70,6 +71,9 @@ class ContractTest(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertEqual(result["status"], "blocked")
                 self.assertFalse(result["ready"])
+                self.assertTrue(any("header-only bootstrap" in item for item in result["diagnostics"]))
+                self.assertFalse(any("empty-folder Bronze MLV creation failed" in item
+                                     for item in result["diagnostics"]))
 
     def test_cleanup_requires_confirmation_and_contract_must_match(self):
         for mode, config in (("cleanup", {"contract_version": 1, "prefix": "chanel"}),
@@ -105,6 +109,13 @@ class ContractTest(unittest.TestCase):
             with self.subTest(config=config):
                 with self.assertRaisesRegex(ValueError, "positive integer"):
                     effective_verification_timeout_seconds(config)
+
+    def test_bootstrap_csv_is_exactly_the_header_and_no_data(self):
+        self.assertEqual(
+            bootstrap_csv_bytes(),
+            b"SalesLineID,BatchID,SaleTimestamp,CustomerID,ProductID,Date,"
+            b"Quantity,UnitPriceMinorUnits,SalesAmountMinorUnits\n",
+        )
 
     def test_manifest_contract_and_batch_class_filtering(self):
         manifest = json.loads(MANIFEST_FIXTURE.read_text(encoding="utf-8"))
@@ -162,6 +173,8 @@ class ContractTest(unittest.TestCase):
         self.assertIn("'columnNameOfCorruptRecord' = '_corrupt_record'", bronze)
         self.assertIn(r"'escape' = '\\'", bronze)
         self.assertIn(r"'nullValue' = '\\N'", bronze)
+        config["demo-1"]["csv_options"] = {"quote": "'"}
+        self.assertIn(r"'quote' = '\''", render_bronze_sql(config, "chanel"))
         self.assertIn("`chanel-demo1-mlv`.`demo1`.`silver`.`sales_joined`", silver)
         self.assertIn("`chanel-demo1-mlv`.`demo1`.`silver`.`DimCustomer`", silver)
         self.assertIn("corrupt_record IS NULL", silver)

@@ -1,11 +1,12 @@
 # Demo 1: file-backed materialized lake views
 
-**Status: blocked, not deployed.** Live validation created the isolated
+**Status: measured readiness blocked.** Live validation created the isolated
 `chanel-demo1-mlv` workspace on the MCAP F8 capacity, a schema-enabled
 `ChanelDemo1Lakehouse`, Bronze/Silver schemas, and static dimensions. Spark
 readback confirmed 365 unique non-null date keys, 20 product keys, and 100
-customer keys. The empty-folder Bronze MLV was not created; no Silver MLV,
-schedule, producer run, or sales data exists.
+customer keys. A separate header-only bootstrap CSV enabled creation of the
+Bronze and Silver MLVs; both initially read back zero rows. The executable
+deployment and measured-run verification remain unimplemented.
 
 ## Architecture and prerequisites
 
@@ -40,7 +41,7 @@ The source publishes UTF-8 header CSV, UTC timestamps and ISO dates; each
 immutable file is staged and closed before delivery. No bootstrap file is part
 of the measured run.
 
-## Blocking gap and proposed definitions
+## Header-only bootstrap and definitions
 
 [Microsoft's file-ingestion SQL reference](https://learn.microsoft.com/en-us/fabric/data-engineering/materialized-lake-views/create-materialized-lake-view)
 documents `USING OneLake_Files`, CSV options, `schema_mode=FIXED`,
@@ -53,14 +54,29 @@ projection, `inferSchema=false`, and `schema_mode=FIXED`. Fabric returned
 `MLV_INGEST_SCHEMA_INFERENCE_FAILED` with nested
 `UNABLE_TO_INFER_SCHEMA` (“Unable to infer schema for CSV. It must be specified
 manually”). The documented syntax has no source-schema declaration option.
-Do not populate the folder with a seed file, invent an unsupported option, or
-substitute notebook/Copy ingestion. The MLV, Silver definition, and managed
-schedule cannot be validated until Microsoft documents or enables a supported
-no-seed schema declaration; the deployment remains blocked.
+
+The user authorized a separate header-only bootstrap CSV. Before creating the
+Bronze view, write an immutable UTF-8 `bootstrap_header_only_v1.csv` in the
+landing folder, containing the exact v1 header above followed by a newline
+and no data rows. `definition_plan.bootstrap_csv_bytes()` returns those exact
+bytes. Keep it separate from measured producer batches; it contributes zero
+facts and must not enter measured batch counts, totals, or latency. In the
+isolated test, the 111-byte file's SHA-256 was
+`3b8ae33e220d6bf1cc3e5fc025d1fdf28df41d731495a022a9e013b38d5e1549`.
+With the file present, the Bronze and Silver definitions were created and
+read back with zero rows. Both an on-demand full-lineage refresh and a
+scheduled full-lineage refresh completed; after each, both views still
+contained zero rows and retained their schemas. Bronze columns were strings,
+including corrupt-row and source-path fields; Silver applied the candidate
+casts to integer, timestamp, date and decimal fields. The one-row fallback
+was not needed.
+Leave the bootstrap in place: deleting it and refreshing from a truly empty
+folder has not been tested.
 
 `silver-candidate.sql` illustrates a fully qualified, SQL MLV using casts,
-exact monetary values, and left joins with failure constraints. It is not
-validated against Fabric and is **not deployed**. Before use, verify that
+exact monetary values, and left joins with failure constraints. Its definition
+and empty schema were validated in the isolated Fabric Lakehouse. Before
+measured use, verify that
 malformed CSV rows cannot be silently discarded, all constraints evaluate as
 intended (including nulls), source schema and timestamp timezone are correct,
 and dimensions have unique/non-null keys and non-null descriptive fields.
@@ -80,10 +96,12 @@ execute plus read/write scopes, and a minimum effective five-minute cadence.
 The lineage permits one active schedule. The local
 `definition_plan.build_refresh_schedule_request` builds its bounded Cron
 payload and rejects an end time earlier than last delivery + one full interval
-+ processing margin. Because the Bronze MLV does not exist, no schedule was
-created and tenant-specific schedule readback remains untested. After the
-blocker is resolved, inspect existing schedules before creating one and read
-back actual cadence, lineage scope, and bounds.
++ processing margin. The isolated Lakehouse initially had no schedule; a
+bounded five-minute schedule was created, read back, and produced one
+successful scheduled run. It was disabled and the disabled state read back.
+The history reported lineage-level success, not per-view refresh mode.
+Inspect existing schedules before creating one and read back actual cadence,
+lineage scope, and bounds.
 Check refresh history and actual mode; append-only input alone does not
 establish incremental execution. A refresh overlapping a preceding run may be
 skipped. Pause the demo-owned schedule after the bounded run. Event-triggered
@@ -116,13 +134,13 @@ template and render a file-backed Bronze MLV definition and fully qualified
 Silver MLV candidate. The effective per-batch verification timeout is the
 positive integer in `demo-1.verification_timeout_seconds`, falling back to
 `execution.verification_timeout_seconds`, then 900 seconds. Invalid values
-fail closed. The Silver definition is not executed or validated by Fabric.
+fail closed. The Silver definition has been created and its schema read back
+in the isolated Lakehouse but has not been tested with measured facts.
 The Bronze definition sets `FIXED` and `APPEND_ONLY`, explicit CSV v1 options,
 corrupt-row capture, and file traceability; it does not invent a
 source-schema declaration. Dry-run is local-only; other entry-point modes
-remain blocked and do not perform cloud operations. The approved live test
-created isolated schemas and dimensions, but Bronze MLV creation failed with
-the schema-inference error above.
+remain blocked and do not perform cloud operations. The bootstrap test was
+performed separately, not by this entry point.
 
 No presenter walkthrough can be executed until the blocker is resolved and
 artifacts are deployed. Once available, use Lakehouse lineage and refresh

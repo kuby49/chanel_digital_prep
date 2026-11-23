@@ -42,6 +42,11 @@ REQUIRED_CSV_OPTIONS = {
 DEFAULT_VERIFICATION_TIMEOUT_SECONDS = 900
 
 
+def bootstrap_csv_bytes():
+    """Return the UTF-8 header-only bootstrap file, with no measured rows."""
+    return (",".join(SALES_COLUMNS) + "\n").encode("utf-8")
+
+
 def effective_verification_timeout_seconds(config):
     """Resolve the Demo 1 per-batch timeout, defaulting to the shared 900 seconds."""
     if not isinstance(config, dict):
@@ -79,7 +84,7 @@ def _identifier(value):
 
 
 def _literal(value):
-    return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 def _qualified(workspace, lakehouse, schema, name):

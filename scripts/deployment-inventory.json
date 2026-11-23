@@ -165,7 +165,7 @@
       "source": "Producer owner no-sales pipeline probe",
       "storage_token_principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
       "tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527",
-      "note": "Owner reports completed no-sales probe: storage and Kusto token claims match this principal; staging Lakehouse binding and executionData.parameters marker match; a Demo 3 preflight sentinel was written, read byte-for-byte and deleted outside the incoming folder. Default runtime lacked azure.kusto; real KQL ingestion and measured delivery remain unverified."
+      "note": "Owner reports completed no-sales probe: storage and Kusto token claims match this principal; staging Lakehouse binding and executionData.parameters marker match; a Demo 3 preflight sentinel was written, read byte-for-byte and deleted outside the incoming folder. Owner subsequently reports that Fabric item readback exposes defaultIdentity for the staging Lakehouse but returns null for the producer Notebook and Pipeline. The earlier probe is not fresh per-run identity or permission proof, so producer validation remains blocked. Default runtime lacked azure.kusto; real KQL ingestion and measured delivery remain unverified."
     },
     {
       "track": "demo-2",

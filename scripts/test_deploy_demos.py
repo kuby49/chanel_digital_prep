@@ -5,7 +5,9 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("deploy-demos")
@@ -74,6 +76,28 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(set(summary["phases"]["deploy"]), {"demo-1", "demo-3", "shared"})
         self.assertEqual({event["mode"] for event in events}, {"deploy"})
+
+    def test_parallel_tracks_obey_concurrency_bound(self):
+        guard = threading.Lock()
+        barrier = threading.Barrier(2)
+        active = 0
+        peak = 0
+
+        def fake_invoke(track, mode, *args):
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            barrier.wait(timeout=5)
+            with guard:
+                active -= 1
+            return deploy.result(track, mode, "blocked", "test")
+
+        with mock.patch.object(deploy, "invoke", side_effect=fake_invoke):
+            outcomes = deploy.run_phase(list(deploy.TRACKS), "dry-run", self.root / "config",
+                                        "chanel", self.root, 10, ["demo-1"], 2, False)
+        self.assertEqual(len(outcomes), 4)
+        self.assertEqual(peak, 2)
 
     def test_failure_does_not_mask_independent_track(self):
         self.config["behavior"] = {"demo-1:deploy": {"status": "blocked", "ready": False}}

@@ -45,6 +45,16 @@
       "evidence": "Fabric item GET returned matching type, owner marker and workspace ID; definition and runtime remain unverified"
     },
     {
+      "track": "shared",
+      "type": "pipeline",
+      "name": "producer_wrapper",
+      "id": "f5a6ab28-dca4-462a-98f1-baf05d8b909d",
+      "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+      "owner_marker": "component=producer; contract=v1",
+      "verified_utc": "2026-11-23T22:08:02Z",
+      "evidence": "Fabric item GET returned matching type, owner marker and workspace ID; definition and runtime remain unverified"
+    },
+    {
       "track": "demo-3",
       "type": "lakehouse",
       "name": "ChanelDemo3Lakehouse",

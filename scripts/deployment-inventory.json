@@ -35,6 +35,16 @@
       "evidence": "Fabric Lakehouse GET returned matching name and workspace ID"
     },
     {
+      "track": "shared",
+      "type": "notebook",
+      "name": "producer_notebook",
+      "id": "d8546394-042a-479c-b7e7-ff3c833404dc",
+      "workspace_id": "48593f2f-d3ac-474b-ba96-08282d6f69df",
+      "owner_marker": "component=producer; contract=v1",
+      "verified_utc": "2026-11-23T22:05:47Z",
+      "evidence": "Fabric item GET returned matching type, owner marker and workspace ID; definition and runtime remain unverified"
+    },
+    {
       "track": "demo-3",
       "type": "lakehouse",
       "name": "ChanelDemo3Lakehouse",

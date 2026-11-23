@@ -18,7 +18,9 @@ from eventhouse_core import (
     shortcut_payload,
 )
 from ingestion import EventhouseAdapter
-from lakehouse_validation import VerificationError, measured_batches
+from lakehouse_validation import (
+    NotVisible, VerificationError, measured_batches, verify_batch_with_timeout, verify_run_keys,
+)
 
 
 WORKSPACE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -282,10 +284,18 @@ class ManifestTests(unittest.TestCase):
     def test_rejects_inconsistent_groups_or_duplicate_batch_ids(self):
         invalid = self.batch()
         invalid["amount_by_date"] = {"2026-01-01": 245}
-        for batches in ({"1": invalid}, {"1": self.batch(), "2": self.batch()}):
+        for batches in (
+            {"1": invalid},
+            {"1": self.batch(), "2": self.batch()},
+            {"1": self.batch(), "2": self.batch(batch_class="bootstrap")},
+        ):
             with self.subTest(batches=batches):
                 with self.assertRaises(VerificationError):
                     measured_batches({"contract_version": 1, "batches": batches})
+
+    def test_run_key_verification_rejects_non_measured_batches(self):
+        with self.assertRaises(VerificationError):
+            verify_run_keys(None, [self.batch(batch_class="bootstrap")], "Lakehouse", "Facts")
 
     def test_shared_generator_csv_and_manifest_contract(self):
         default = Path(__file__).resolve().parent.parent / "demo-data-generator" / "generator.py"
@@ -314,6 +324,60 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(client.calls[0][0], payload)
         self.assertEqual(measured_batches({"contract_version": 1, "batches": {"1": batch}}),
                          [batch])
+
+
+class VerificationTimeoutTests(unittest.TestCase):
+    def test_incomplete_batch_stops_at_exact_deadline(self):
+        now = [0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        spark = types.SimpleNamespace(
+            catalog=types.SimpleNamespace(tableExists=lambda _: True)
+        )
+        with patch("lakehouse_validation.verify_lakehouse_batch", side_effect=NotVisible("pending")):
+            with self.assertRaises(TimeoutError):
+                verify_batch_with_timeout(
+                    spark, {}, "Lakehouse", "Facts", None, 10, 4,
+                    clock=lambda: now[0], sleep=sleep,
+                )
+        self.assertEqual(sleeps, [4, 4, 2])
+        self.assertEqual(now[0], 10)
+
+    def test_completion_after_deadline_is_not_a_pass(self):
+        now = [0]
+        spark = types.SimpleNamespace(
+            catalog=types.SimpleNamespace(tableExists=lambda _: True)
+        )
+
+        def late_verification(*_):
+            now[0] = 11
+            return {"row_count": 1}
+
+        with patch("lakehouse_validation.verify_lakehouse_batch", side_effect=late_verification):
+            with self.assertRaises(TimeoutError):
+                verify_batch_with_timeout(
+                    spark, {}, "Lakehouse", "Facts", None, 10, 4,
+                    clock=lambda: now[0], sleep=lambda _: None,
+                )
+        now[0] = 0
+
+        def at_deadline(*_):
+            now[0] = 10
+            return {"row_count": 1}
+
+        with patch("lakehouse_validation.verify_lakehouse_batch", side_effect=at_deadline):
+            result = verify_batch_with_timeout(
+                spark, {}, "Lakehouse", "Facts", None, 10, 4,
+                clock=lambda: now[0], sleep=lambda _: None,
+            )
+        self.assertEqual(result["row_count"], 1)
+        for value in (0, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(VerificationError):
+                verify_batch_with_timeout(spark, {}, "Lakehouse", "Facts", None, value, 4)
 
 
 if __name__ == "__main__":

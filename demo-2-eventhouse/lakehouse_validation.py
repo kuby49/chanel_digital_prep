@@ -1,6 +1,7 @@
 """Spark checks and dimension preload for the Demo 2 shortcut."""
 
 import re
+import time
 from datetime import date
 
 from eventhouse_core import batch_identifier, identifier, lakehouse_join_query
@@ -110,18 +111,23 @@ def measured_batches(manifest):
             "negative-test",
         ):
             raise VerificationError("Manifest batch class is missing or invalid")
+        try:
+            batch_id = batch_identifier(batch["batch_id"])
+        except (KeyError, ValueError) as exc:
+            raise VerificationError("Manifest batch identity is invalid") from exc
+        if batch_id in seen:
+            raise VerificationError("Manifest batch IDs must be unique across all classes")
+        seen.add(batch_id)
         if batch["batch_class"] != "measured":
             continue
         try:
-            batch_id = batch_identifier(batch["batch_id"])
             checksum = batch["sha256"]
             count = batch["row_count"]
             total = batch["sales_amount_minor_units"]
         except (KeyError, ValueError) as exc:
             raise VerificationError("Manifest batch identity is invalid") from exc
         if (
-            batch_id in seen
-            or not isinstance(checksum, str)
+            not isinstance(checksum, str)
             or not re.fullmatch(r"[a-f0-9]{64}", checksum)
             or type(count) is not int
             or count < 1
@@ -142,7 +148,6 @@ def measured_batches(manifest):
                 raise VerificationError(f"Manifest {field} is invalid")
             if sum(groups.values()) != total:
                 raise VerificationError(f"Manifest {field} does not reconcile to the batch total")
-        seen.add(batch_id)
         measured.append(batch)
     if not measured:
         raise VerificationError("Manifest contains no measured batches")
@@ -200,6 +205,14 @@ def verify_lakehouse_batch(spark, batch, lakehouse, shortcut, schema=None):
         | (F.col("UnitPriceMinorUnits") < 0)
         | (F.col("SalesAmountMinorUnits") < 0)
         | (
+            F.col("UnitPrice") * F.lit(100)
+            != F.col("UnitPriceMinorUnits").cast("decimal(20,0)")
+        )
+        | (
+            F.col("SalesAmount") * F.lit(100)
+            != F.col("SalesAmountMinorUnits").cast("decimal(20,0)")
+        )
+        | (
             F.col("SalesAmountMinorUnits").cast("decimal(38,0)")
             != F.col("Quantity").cast("decimal(38,0)")
             * F.col("UnitPriceMinorUnits").cast("decimal(38,0)")
@@ -207,11 +220,15 @@ def verify_lakehouse_batch(spark, batch, lakehouse, shortcut, schema=None):
     )
     if joined.where(invalid).limit(1).count():
         raise VerificationError(f"Batch {batch_id} has invalid facts or orphaned dimensions")
-    amount = joined.agg(
-        F.sum(F.col("SalesAmountMinorUnits").cast("decimal(38,0)")).alias("Amount")
-    ).first()["Amount"]
+    totals = joined.agg(
+        F.sum(F.col("SalesAmountMinorUnits").cast("decimal(38,0)")).alias("Amount"),
+        F.sum("SalesAmount").alias("DecimalAmount"),
+    ).first()
+    amount = totals["Amount"]
     if amount is None or int(amount) != batch["sales_amount_minor_units"]:
         raise VerificationError(f"Batch {batch_id} has an incorrect exact total")
+    if totals["DecimalAmount"] is None or totals["DecimalAmount"] * 100 != amount:
+        raise VerificationError(f"Batch {batch_id} has an incorrect decimal total")
     for column, field in (
         ("Date", "amount_by_date"),
         ("ProductCategory", "amount_by_product_category"),
@@ -222,7 +239,35 @@ def verify_lakehouse_batch(spark, batch, lakehouse, shortcut, schema=None):
     return {"batch_id": batch_id, "row_count": raw_count, "sales_amount_minor_units": int(amount)}
 
 
+def verify_batch_with_timeout(
+    spark, batch, lakehouse, shortcut, schema, timeout_seconds, poll_interval_seconds,
+    *, clock=time.monotonic, sleep=time.sleep,
+):
+    for value in (timeout_seconds, poll_interval_seconds):
+        if type(value) is not int or value <= 0:
+            raise VerificationError("Verification timeout and poll interval must be positive integers")
+    deadline = clock() + timeout_seconds
+    while True:
+        try:
+            if not spark.catalog.tableExists(_table_name(lakehouse, shortcut, schema)):
+                raise NotVisible("Shortcut table is not yet visible")
+            result = verify_lakehouse_batch(spark, batch, lakehouse, shortcut, schema)
+            if clock() > deadline:
+                raise TimeoutError("Batch verification exceeded its configured timeout")
+            return result
+        except NotVisible as exc:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise TimeoutError("Batch did not become visible before its configured timeout") from exc
+            sleep(min(poll_interval_seconds, remaining))
+
+
 def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None):
+    if not batches or any(
+        not isinstance(batch, dict) or batch.get("batch_class") != "measured"
+        for batch in batches
+    ):
+        raise VerificationError("Run key verification accepts measured batches only")
     from pyspark.sql import functions as F
 
     facts = spark.table(_table_name(lakehouse, shortcut, schema)).where(

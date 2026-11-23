@@ -1,0 +1,141 @@
+{
+  "contract_version": 1,
+  "environment": "MCAP",
+  "recorded_at_utc": "2026-11-23T23:10:52Z",
+  "status": "partial",
+  "capacity": {
+    "name": "fabricadbmirror",
+    "id": "de12195c-40d2-4bee-af60-f0d6dedfbb0f"
+  },
+  "workspace": {
+    "name": "chanel-demo2-eventhouse",
+    "id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f"
+  },
+  "eventhouse": {
+    "name": "SalesEventhouse",
+    "id": "5c681ae1-b071-4ebe-be1b-80dfeba9b495"
+  },
+  "kql_database": {
+    "name": "SalesEventhouse",
+    "id": "9b3fd360-a689-4163-91d6-3981882cd6c8",
+    "query_endpoint": "https://trd-b87w58afbets4c8yby.z6.kusto.fabric.microsoft.com",
+    "ingestion_endpoint": "https://ingest-trd-b87w58afbets4c8yby.z6.kusto.fabric.microsoft.com",
+    "table": "FactSales",
+    "csv_mapping": "SalesCsvV1",
+    "table_ingestion_batching_policy": null,
+    "database_ingestion_batching_policy": {
+      "maximum_batching_time": "00:00:20",
+      "maximum_items": 500,
+      "maximum_raw_data_mb": 300
+    }
+  },
+  "onelake_mirroring": {
+    "enabled": true,
+    "format": "parquet",
+    "target_latency_minutes": 5,
+    "policy_path": "https://westus3-api.onelake.fabric.microsoft.com/aab2ed7b-fd2f-4696-84b3-b34ef931681f/9b3fd360-a689-4163-91d6-3981882cd6c8/Tables/FactSales",
+    "delta_log_readable": true
+  },
+  "lakehouse": {
+    "name": "SalesLakehouse",
+    "id": "04113b0b-8698-4a61-a69d-ad862e96b6e6",
+    "shortcut": {
+      "name": "EventhouseFactSales",
+      "path": "Tables",
+      "target_workspace_id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f",
+      "target_item_id": "9b3fd360-a689-4163-91d6-3981882cd6c8",
+      "target_path": "Tables/FactSales",
+      "readback_verified": true
+    },
+    "dimensions": {
+      "DimDate": 365,
+      "DimProduct": 20,
+      "DimCustomer": 100
+    },
+    "verification_notebook_id": "1ce63551-cd56-4cf6-91ea-bc854aec7198",
+    "dimension_preload_job_id": "1e36af09-66a5-4d97-aafe-484ca529009b"
+  },
+  "bootstrap": {
+    "batch_id": "demo2bootstrap_80b398bcea53_0001",
+    "batch_class": "bootstrap",
+    "sha256": "384ffeeb886fab376ce9b76368230d33146553d5ec1f146db487ebe5115aa470",
+    "row_count": 5,
+    "sales_amount_minor_units": 526232,
+    "amount_by_date": {
+      "2026-01-01": 7020,
+      "2026-01-02": 15028,
+      "2026-01-03": 94077,
+      "2026-01-04": 330712,
+      "2026-01-05": 79395
+    },
+    "amount_by_product_category": {
+      "Accessories": 330712,
+      "Beauty": 86415,
+      "Fashion": 15028,
+      "Fragrance": 94077
+    },
+    "amount_by_customer_region": {
+      "Americas": 337732,
+      "Asia Pacific": 94077,
+      "Europe": 94423
+    },
+    "source_id": "9eebc93c-a700-4f87-91b7-a1471c389aa1",
+    "ingestion_terminal_status": "succeeded",
+    "kql_verified": true,
+    "shortcut_verification_job_id": "e15f17bf-f27c-43e1-8345-8cc958f597f5",
+    "shortcut_exit_status": "verified",
+    "replay": {
+      "source_id": "998f04e2-54d2-4a07-bf46-5d78d9874e59",
+      "terminal_error_code": "Skipped_IngestByTagAlreadyExists",
+      "kql_rows_after_replay": 5,
+      "kql_total_after_replay_minor_units": 526232
+    }
+  },
+  "negative_test": {
+    "batch_id": "demo2negative_5f7d11269579_0001",
+    "batch_class": "negative-test",
+    "sha256": "ad31ba7af1a46dcf03b101df5cde472c439071549c92d989160489fc45943e77",
+    "status": "permanent_failure",
+    "reason": "CSV header does not match contract v1",
+    "kql_rows": 0
+  },
+  "monitor_probe": {
+    "run_id": "monitorprobe_76244a2ab807",
+    "job_id": "f1f7c602-9242-49ff-a33f-3c501e1176ac",
+    "runtime_identity_matches_producer": true,
+    "producer_sentinel_readable": true,
+    "verification_notebook_readable": true,
+    "state_written_with_manifest_absent": true,
+    "measured_batches_started": false,
+    "terminal_status": "Completed",
+    "owned_probe_notebook_and_objects_removed": true
+  },
+  "producer_runtime_probe": {
+    "job_id": "66c111f0-228c-4c12-83f6-e22ffc2e6868",
+    "sdk_and_adapter_loaded": true,
+    "runtime_identity_matches_producer": true,
+    "eventhouse_query_authenticated": true,
+    "conditional_storage_operations_verified": true,
+    "measured_batches_started": false
+  },
+  "concurrent_bootstrap_verifiers": {
+    "job_ids": [
+      "9b10ed4f-8240-4de3-a2aa-579f1d5b7ebb",
+      "f387d3c4-78f0-433e-947f-be39579d7a80"
+    ],
+    "both_verified_same_non_measured_batch": true,
+    "reported_high_concurrency": false,
+    "measured_batches_started": false
+  },
+  "measured_run": {
+    "started": false,
+    "bootstrap_exclusion": "Manifest batch-class filter; not yet exercised by a measured run"
+  },
+  "limitations": [
+    "Producer OneLake-to-local staging and packaged queued submission have not been verified in a measured run.",
+    "The independent per-batch monitor has not been verified against a measured run.",
+    "Two concurrent verifier jobs succeeded, but Fabric reported high-concurrency mode disabled.",
+    "Serialized replay was verified; concurrent duplicate submission safety was not established.",
+    "The coordinated measured run has not started."
+  ]
+}

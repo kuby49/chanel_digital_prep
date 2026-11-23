@@ -307,6 +307,6 @@ Recheck preview status and prerequisites during deployment; documentation is not
 ## 13. User decisions and course corrections
 
 - Use the signed-in MCAP identity where the relevant operation supports it.
-- The user permits starting and stopping resources needed for the demonstrations and scaling the approved capacity up to F64. Other approval requirements in this specification still apply.
+- The user permits starting and stopping resources needed for the demonstrations and scaling the approved capacity up to F64. Isolation, least-privilege and verification requirements remain in effect.
 - After testing, leave the capacity running at its final size. This does not change the requirement to stop the bounded producer and pause demo-owned schedules and event rules.
 - The user granted upfront approvals needed to test these demos live, including cross-workspace access. Limit permissions and changes to what the demos actually require, record them, and do not modify unrelated workloads. This approval does not establish feature availability or permit skipping readiness and runtime verification.

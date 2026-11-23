@@ -18,7 +18,8 @@ Manifest v1 provides top-level `contract_version`, `run_id`, `config`,
 count, minor-unit totals, grouped totals, generation time and destination
 delivery status/timestamp. Validation must include only `batch_class: measured`
 in coordinated-run totals; `bootstrap` and `negative-test` are separate.
-Manifest-to-destination reconciliation is not yet implemented.
+`batches` is an object keyed by batch number; group dictionaries are
+`amount_by_date`, `amount_by_product_category`, and `amount_by_customer_region`.
 
 ## Verified capabilities and unresolved gates
 
@@ -29,6 +30,17 @@ Manifest-to-destination reconciliation is not yet implemented.
 | Activator | [Reflex item definition](https://learn.microsoft.com/en-us/fabric/real-time-hub/consume-events-activator-rest-api), `ReflexEntities.json` | Capture an actual event and verify the binding, filters, source identity, region, deployed readback and invocation using a pipeline job and activity run. `activator.py` constructs a **disabled, untested candidate** only. Reference `subject` and `id` are documented event fields, but their resolution as pipeline parameters must be verified. |
 | Audit, recovery, serialization | No implementation yet | A durable per-file audit is insufficient by itself. Verify Copy upsert keyed by `SalesLineID` after a successful write followed by a failed audit commit and on duplicate events. Implement a durable single-writer mechanism or prove a supported safe concurrency strategy, including crash recovery and bounded retries. Do not equate activity concurrency with cross-run serialization. |
 | Completion | [Job Scheduler and activity runs](https://learn.microsoft.com/en-us/fabric/data-factory/pipeline-rest-api-capabilities) | Capture event, pipeline and activity timestamps, file identity, count and totals; validate replay, malformed CSV, joins, and visibility before marking ready. |
+
+On 2026-11-23, read-only MCAP cloud `supportedConnectionTypes` returned one
+`Lakehouse` type with creation method `Lakehouse.Contents`, optional Boolean
+`HierarchicalNavigation`, `EnableVorder`, and `OutputMetadataRefresh`, and
+credential types `OAuth2` and `ServicePrincipal`; it did **not** list
+`WorkspaceIdentity`. This generic metadata alone does not establish that the
+Copy connector uses the same creation method or that any identity can create
+and use that specific connection. The [connector overview](https://learn.microsoft.com/en-us/fabric/data-factory/connector-lakehouse-overview)
+lists organizational account authentication for pipelines. `Connection.Read.All`
+or `Connection.ReadWrite.All` permits metadata listing; creation requires
+`Connection.ReadWrite.All` and appropriate Fabric permissions.
 
 OneLake's documented [`FileCreated`](https://learn.microsoft.com/en-us/fabric/real-time-hub/explore-fabric-onelake-events)
 can mean create **or update**; rename is a different event. A move of a staged
@@ -53,3 +65,13 @@ Run `python -m unittest discover -s demo-3-onelake-events-copy/tests -v` from th
 The synthetic events in these tests exercise local structure only and are not
 evidence of Fabric behavior. No live presenter walkthrough or cleanup is
 available until deployment is implemented and approved.
+
+`python demo-3-onelake-events-copy/reconcile.py --manifest <manifest.json> --query-export <results.json>`
+compares measured batches only. The query export must contain `batches` keyed by
+batch ID, with each value holding `row_count`, `sales_amount_minor_units` and
+the three group dictionaries above. It must also include integer
+`duplicate_sales_line_ids` and `orphan_rows`. The query itself must restrict its
+results and global duplicate/orphan checks to the measured run. Missing or extra
+batches, non-integer values, and mismatches fail. This check does not prove
+delivery, checksums, event execution, pipeline success, CSV row validity, or
+query provenance; collect those independently.

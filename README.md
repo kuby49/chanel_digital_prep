@@ -10,6 +10,12 @@ Copy `config.example.json` to a private, untracked location and fill in the reso
 
 Use the signed-in MCAP identity where supported. In each PowerShell process set `$env:AZURE_CONFIG_DIR = "$HOME\.azure-mcap"` before invoking Azure CLI-backed operations; verify the active tenant, subscription and capacity. The configured identity alone does not grant cross-workspace permissions. All feature, permission, API-coverage, charge and approval checks in the specification remain required. Do not start cloud deployment until coordinated preflight and required approvals are complete.
 
+### Current preflight limits
+
+Read-only preflight found `fabricadbmirror` active at F8, and a capacity listing available to an administrator or contributor returned it. Tenant settings show workspace/item creation and service-principal APIs, workspace access and connections enabled, with no included or excluded groups reported. These observations do **not** prove workspace creation, notebook execution, or effective permissions. Workspace creation requires `Workspace.ReadWrite.All` and capacity contributor/admin access; verify the resulting workspace's capacity ID.
+
+A producer workspace identity would require explicit Contributor access on its own workspace before running its notebook. The proposed least-privilege model is folder-scoped Files ReadWrite and Lakehouse item Read for Demo 1/3 destinations, plus KQL table-level ingestor for Demo 2. These are proposals, not grants; obtain the required approvals after confirming exact supported identity and access paths. The documented Lakehouse Copy connector supports Organizational Account authentication; API creation of that exact connector is unverified. A direct-item connection with `Connection=none` and a preview shareable connection are distinct and do not establish that the required connector can be created through the API. Do not grant permissions or treat a draft definition as a deployed, working connection.
+
 ## Orchestration
 
 Requires Python 3.9 or later. From the repository root, for example:

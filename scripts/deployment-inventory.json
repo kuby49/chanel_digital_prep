@@ -8,6 +8,24 @@
   },
   "resources": [
     {
+      "track": "demo-1",
+      "type": "workspace",
+      "name": "chanel-demo1-mlv",
+      "id": "14080576-9158-4326-8014-427c8009ce12",
+      "owner_marker": "Isolated Demo 1 Materialized Lake Views workspace, created for the approved MCAP test.",
+      "verified_utc": "2026-11-23T22:21:43Z",
+      "evidence": "Fabric workspace GET returned matching name, description and capacity ID"
+    },
+    {
+      "track": "demo-1",
+      "type": "lakehouse",
+      "name": "ChanelDemo1Lakehouse",
+      "id": "aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659",
+      "workspace_id": "14080576-9158-4326-8014-427c8009ce12",
+      "verified_utc": "2026-11-23T22:21:43Z",
+      "evidence": "Fabric Lakehouse GET returned matching name, workspace ID and default schema dbo"
+    },
+    {
       "track": "shared",
       "type": "workspace",
       "name": "chanel-demo-data-generator",
@@ -120,6 +138,13 @@
   ],
   "reported_observations": [
     {
+      "track": "demo-1",
+      "source": "Demo 1 owner Spark readback",
+      "landing_uri": "abfss://14080576-9158-4326-8014-427c8009ce12@onelake.dfs.fabric.microsoft.com/aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659/Files/incoming/sales/",
+      "dimension_counts": {"DimDate": 365, "DimProduct": 20, "DimCustomer": 100},
+      "note": "Owner reports unique non-null dimension keys and an empty landing folder; date range is unverified. Empty-folder fixed-schema bronze MLV creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA; no bronze, silver or schedule created."
+    },
+    {
       "track": "shared",
       "source": "Producer owner no-sales pipeline probe",
       "storage_token_principal_id": "c2934d7c-4724-4cef-a50e-2a5d89afb4a4",
@@ -130,6 +155,9 @@
       "track": "demo-2",
       "source": "Demo 2 owner readback",
       "database_id": "9b3fd360-a689-4163-91d6-3981882cd6c8",
+      "database_name": "SalesEventhouse",
+      "ingestion_endpoint": "https://ingest-trd-b87w58afbets4c8yby.z6.kusto.fabric.microsoft.com",
+      "query_endpoint": "https://trd-b87w58afbets4c8yby.z6.kusto.fabric.microsoft.com",
       "table": "FactSales",
       "csv_mapping": "SalesCsvV1",
       "onelake_availability": "enabled",

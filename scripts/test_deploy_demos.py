@@ -38,7 +38,7 @@ if behavior.get('omit_result'):
     sys.exit(0)
 status = behavior.get('status', 'pass')
 monitor_path = pathlib.Path(a.state_dir) / 'demo-2-monitor.json'
-if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status') and status == 'pass':
+if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status', 'wait-monitor') and status == 'pass':
     if a.mode == 'start-monitor':
         shared = config['shared']
         root = ('https://onelake.blob.fabric.microsoft.com/' + shared['workspace_id'] + '/' +
@@ -49,7 +49,7 @@ if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status') and statu
                                      datetime.timedelta(seconds=10)).isoformat()}
     else:
         evidence = json.loads(monitor_path.read_text())
-        evidence['state'] = 'running'
+        evidence['state'] = 'completed' if a.mode == 'wait-monitor' else 'running'
     evidence.update(behavior.get('evidence', {}))
     if not behavior.get('omit_evidence'):
         monitor_path.write_text(json.dumps(evidence))
@@ -60,7 +60,7 @@ if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status') and statu
         original.update(behavior['start_record_evidence'])
         start_path.write_text(json.dumps(original))
 result = {'contract_version': 1, 'track': track, 'mode': a.mode, 'status': status,
-          'ready': behavior.get('ready', a.mode in ('deploy', 'validate-only', 'monitor-status')),
+          'ready': behavior.get('ready', a.mode in ('deploy', 'validate-only', 'monitor-status', 'wait-monitor')),
           'diagnostics': [] if status == 'pass' else ['not ready']}
 pathlib.Path(a.result).write_text(json.dumps(result))
 sys.exit(0 if status == 'pass' else 1)
@@ -156,11 +156,12 @@ class OrchestrationTests(unittest.TestCase):
         code, summary, events = self.run_cli("demo-2,demo-3", "--deploy", "--run-data")
         self.assertEqual(code, 0)
         modes = [event["mode"] for event in events]
-        self.assertEqual(modes[-3:], ["start-monitor", "monitor-status", "run-data"])
-        self.assertTrue(all(mode == "validate-only" for mode in modes[3:-3]))
-        self.assertEqual(events[-1]["selected"], "demo-2,demo-3")
+        self.assertEqual(modes[-4:], ["start-monitor", "monitor-status", "run-data", "wait-monitor"])
+        self.assertTrue(all(mode == "validate-only" for mode in modes[3:-4]))
         self.assertEqual(events[-2]["selected"], "demo-2,demo-3")
+        self.assertEqual(events[-3]["selected"], "demo-2,demo-3")
         self.assertTrue(summary["phases"]["monitor-status"]["demo-2"]["ready"])
+        self.assertTrue(summary["phases"]["wait-monitor"]["demo-2"]["ready"])
 
     def test_failed_monitor_start_attempts_stop_and_blocks_producer(self):
         self.config["behavior"] = {"demo-2:start-monitor": {"status": "blocked", "ready": False}}
@@ -261,6 +262,18 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(events[-1]["mode"], "run-data")
         self.assertNotIn("stop-monitor", summary["phases"])
 
+    def test_incomplete_or_unready_monitor_never_reports_success(self):
+        for behavior in ({"status": "blocked", "ready": False},
+                         {"ready": False}, {"evidence": {"state": "running"}},
+                         {"evidence": {"job_id": "different-job"}}):
+            with self.subTest(behavior=behavior):
+                self.config["behavior"] = {"demo-2:wait-monitor": behavior}
+                code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertNotEqual(summary["phases"]["wait-monitor"]["demo-2"]["status"], "pass")
+                self.assertEqual(events[-1]["mode"], "stop-monitor")
+                self.assertEqual(events[-1]["stop_job"], "job-1")
+
     def test_demo2_manifest_config_mismatch_blocks_before_deploy(self):
         self.config["shared"]["run_state_location"] = "https://example.invalid/other-root"
         code, _, events = self.run_cli("demo-2", "--deploy", "--run-data")
@@ -274,6 +287,11 @@ class OrchestrationTests(unittest.TestCase):
         self.config["demo-2"]["verification_timeout_seconds"] = 30
         _, duration = deploy.monitor_config(self.config)
         self.assertEqual(duration, 60)
+
+    def test_producer_timeout_includes_run_and_selected_verification(self):
+        self.config["demo-2"] = {"verification_timeout_seconds": 30}
+        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1"], 10), 35)
+        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1", "demo-2"], 10), 50)
 
     def test_partial_cleanup_excludes_shared(self):
         code, _, events = self.run_cli("demo-2", "--cleanup", "--yes")

@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import datetime
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -74,6 +75,24 @@ def validate_run_data(config):
         raise ValueError("data.max_duration_seconds must exceed the time of the last scheduled batch")
 
 
+def producer_timeout(config, selected, track_timeout):
+    verification_timeouts = []
+    for track in selected:
+        settings = config.get(track) or {}
+        timeout = settings.get("verification_timeout_seconds")
+        if timeout is None:
+            timeout = config["execution"].get("verification_timeout_seconds")
+        if type(timeout) is not int or timeout < 1:
+            raise ValueError(f"{track} verification timeout must be a positive integer")
+        verification_timeouts.append(timeout)
+    duration = track_timeout + config["data"]["max_duration_seconds"] + max(verification_timeouts)
+    try:
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
+    except OverflowError as error:
+        raise ValueError("Producer timeout bound is too large") from error
+    return duration
+
+
 def invoke(track, mode, config_path, prefix, state_dir, timeout, selected, yes=False):
     script = TRACKS[track]
     result_path = state_dir / f"{track}-{mode}.json"
@@ -84,7 +103,7 @@ def invoke(track, mode, config_path, prefix, state_dir, timeout, selected, yes=F
             "--prefix", prefix, "--state-dir", str(state_dir), "--result", str(result_path)]
     if yes:
         args.append("--yes")
-    if mode in {"run-data", "start-monitor", "monitor-status", "stop-monitor"}:
+    if mode in {"run-data", "start-monitor", "monitor-status", "wait-monitor", "stop-monitor"}:
         args += ["--selected-demos", ",".join(selected)]
     try:
         with log_path.open("w", encoding="utf-8") as log:
@@ -110,7 +129,7 @@ def invoke(track, mode, config_path, prefix, state_dir, timeout, selected, yes=F
             raise ValueError("failed/blocked result must be not ready and explain why")
         if (completed.returncode == 0) != (data["status"] == "pass"):
             raise ValueError(f"exit code {completed.returncode} disagrees with status")
-        if mode in {"deploy", "validate-only", "monitor-status"} and data["status"] == "pass" and not data["ready"]:
+        if mode in {"deploy", "validate-only", "monitor-status", "wait-monitor"} and data["status"] == "pass" and not data["ready"]:
             return result(track, mode, "blocked", "Entry point reported pass but did not verify readiness")
         return data
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -154,7 +173,7 @@ def monitor_config(config):
     return f"{root}/{config['data']['run_id']}/manifest.json", duration
 
 
-def monitor_evidence(path, run_id, manifest_uri, max_duration, require_running):
+def monitor_evidence(path, run_id, manifest_uri, max_duration, state, require_future=True):
     with path.open(encoding="utf-8") as file:
         evidence = json.load(file)
     if not isinstance(evidence, dict) or type(evidence.get("contract_version")) is not int or evidence["contract_version"] != 1:
@@ -166,15 +185,16 @@ def monitor_evidence(path, run_id, manifest_uri, max_duration, require_running):
         raise ValueError("monitor is observing a different run")
     if evidence["manifest_uri"] != manifest_uri:
         raise ValueError("monitor is observing a different manifest")
-    if evidence["state"] not in ({"running"} if require_running else {"submitted", "running"}):
+    states = {"start": {"submitted", "running"}, "running": {"running"}, "completed": {"completed"}}
+    if evidence["state"] not in states[state]:
         raise ValueError("monitor has an invalid lifecycle state")
     try:
         deadline = datetime.datetime.fromisoformat(evidence["deadline_utc"].replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError("invalid monitor deadline") from error
     now = datetime.datetime.now(datetime.timezone.utc)
-    if deadline.tzinfo is None or deadline <= now:
-        raise ValueError("monitor deadline must be a future, timezone-aware timestamp")
+    if deadline.tzinfo is None or (require_future and deadline <= now):
+        raise ValueError("monitor deadline must be a timezone-aware timestamp and not expired during startup")
     if deadline > now + datetime.timedelta(seconds=max_duration):
         raise ValueError("monitor deadline exceeds the configured bound")
     return evidence
@@ -186,6 +206,18 @@ def matching_monitor_identity(first, second):
             raise ValueError(f"monitor {key} does not match the start record")
 
 
+def stop_monitor(initial, config_path, prefix, state_dir, timeout, selected):
+    try:
+        if initial is not None:
+            with (state_dir / "demo-2-monitor-start.json").open(encoding="utf-8") as file:
+                record = json.load(file)
+            matching_monitor_identity(initial, record)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return result("demo-2", "stop-monitor", "fail",
+                      f"Start record changed or is unreadable; termination unconfirmed: {error}")
+    return invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, timeout, selected)
+
+
 def start_monitor(config, config_path, prefix, state_dir, timeout, selected, monitor_settings):
     phases = {}
     started = False
@@ -194,47 +226,61 @@ def start_monitor(config, config_path, prefix, state_dir, timeout, selected, mon
         start = invoke("demo-2", "start-monitor", config_path, prefix, state_dir, timeout, selected)
         phases["start-monitor"] = {"demo-2": start}
         if start["status"] != "pass":
-            return phases, False
+            return phases, False, None
         try:
             initial = monitor_evidence(state_dir / "demo-2-monitor-start.json",
-                                       config["data"]["run_id"], *monitor_settings, False)
+                                       config["data"]["run_id"], *monitor_settings, "start")
             sidecar = monitor_evidence(state_dir / "demo-2-monitor.json",
-                                       config["data"]["run_id"], *monitor_settings, False)
+                                       config["data"]["run_id"], *monitor_settings, "start")
             matching_monitor_identity(initial, sidecar)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "fail",
                                                         f"Invalid monitor evidence: {error}")}
-            return phases, False
+            return phases, False, None
         status = invoke("demo-2", "monitor-status", config_path, prefix, state_dir, timeout, selected)
         phases["monitor-status"] = {"demo-2": status}
         if status["status"] != "pass":
-            return phases, False
+            return phases, False, None
         try:
             record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
-                                      config["data"]["run_id"], *monitor_settings, False)
+                                      config["data"]["run_id"], *monitor_settings, "start")
             current = monitor_evidence(state_dir / "demo-2-monitor.json",
-                                       config["data"]["run_id"], *monitor_settings, True)
+                                       config["data"]["run_id"], *monitor_settings, "running")
             matching_monitor_identity(initial, record)
             matching_monitor_identity(initial, current)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             phases["monitor-status"] = {"demo-2": result("demo-2", "monitor-status", "fail",
                                                          f"Invalid monitor evidence: {error}")}
-            return phases, False
+            return phases, False, None
         started = True
-        return phases, True
+        return phases, True, initial
     finally:
         if not started:
-            try:
-                if initial is not None:
-                    with (state_dir / "demo-2-monitor-start.json").open(encoding="utf-8") as file:
-                        record = json.load(file)
-                    matching_monitor_identity(initial, record)
-            except (OSError, ValueError, TypeError, KeyError) as error:
-                stopped = result("demo-2", "stop-monitor", "fail",
-                                 f"Start record changed or is unreadable; termination unconfirmed: {error}")
-            else:
-                stopped = invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, timeout, selected)
-            phases["stop-monitor"] = {"demo-2": stopped}
+            phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
+                                                               state_dir, timeout, selected)}
+
+
+def wait_monitor(initial, config, config_path, prefix, state_dir, timeout, selected, monitor_settings):
+    deadline = datetime.datetime.fromisoformat(initial["deadline_utc"].replace("Z", "+00:00"))
+    remaining = max(0, math.ceil((deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+    outcome = invoke("demo-2", "wait-monitor", config_path, prefix, state_dir,
+                     remaining + timeout, selected)
+    phases = {"wait-monitor": {"demo-2": outcome}}
+    if outcome["status"] == "pass":
+        try:
+            record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
+                                      config["data"]["run_id"], *monitor_settings, "start", False)
+            current = monitor_evidence(state_dir / "demo-2-monitor.json",
+                                       config["data"]["run_id"], *monitor_settings, "completed", False)
+            matching_monitor_identity(initial, record)
+            matching_monitor_identity(initial, current)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            phases["wait-monitor"] = {"demo-2": result("demo-2", "wait-monitor", "fail",
+                                                       f"Invalid terminal monitor evidence: {error}")}
+    if phases["wait-monitor"]["demo-2"]["status"] != "pass":
+        phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
+                                                          state_dir, timeout, selected)}
+    return phases
 
 
 def main(argv=None):
@@ -269,6 +315,7 @@ def main(argv=None):
             raise ValueError("track_timeout_seconds must be a positive integer")
         if args.run_data:
             validate_run_data(config)
+            run_timeout = producer_timeout(config, args.selector, timeout)
             monitor_settings = monitor_config(config) if "demo-2" in args.selector else None
         state_root = args.state_dir.resolve()
         state_root.mkdir(parents=True, exist_ok=True)
@@ -285,15 +332,18 @@ def main(argv=None):
         if all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values()):
             monitor_ready = True
             if "demo-2" in args.selector:
-                monitor_phases, monitor_ready = start_monitor(config, config_path, prefix, state_dir,
-                                                               timeout, args.selector, monitor_settings)
+                monitor_phases, monitor_ready, monitor_initial = start_monitor(
+                    config, config_path, prefix, state_dir, timeout, args.selector, monitor_settings)
                 phases.update(monitor_phases)
             if monitor_ready:
                 phases["run-data"] = {"shared": invoke("shared", "run-data", config_path, prefix,
-                                                        state_dir, timeout, args.selector)}
+                                                        state_dir, run_timeout, args.selector)}
                 if phases["run-data"]["shared"]["status"] != "pass":
                     print("Producer outcome is not confirmed; inspect remote job state. "
                           "A local failure or timeout does not prove termination.", file=sys.stderr)
+                elif "demo-2" in args.selector:
+                    phases.update(wait_monitor(monitor_initial, config, config_path, prefix, state_dir,
+                                               timeout, args.selector, monitor_settings))
     summary = {"contract_version": 1, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                "selected_demos": args.selector, "prefix": prefix, "phases": phases}
     (state_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

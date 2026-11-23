@@ -183,7 +183,7 @@
       "bootstrap_sales_amount_minor_units": 526232,
       "bootstrap_replay_status": "Skipped_IngestByTagAlreadyExists",
       "negative_test_batch_id": "demo2negative_5f7d11269579_0001",
-      "note": "Owner reports schema, mapping, policy and shortcut readback. A controlled replay of the separately classified bootstrap was skipped; KQL still returned 5 unique rows and 526232 minor units. The adapter rejected a separately classified malformed batch, which has zero KQL rows. Measured verification excludes bootstrap and negative-test data; shortcut join and measured delivery remain unverified."
+      "note": "Owner reports schema, mapping, policy and shortcut readback. A controlled replay of the separately classified bootstrap was skipped; KQL still returned 5 unique rows and 526232 minor units. The adapter rejected a separately classified malformed batch, which has zero KQL rows. The policy-reported Delta log is readable and Lakehouse discovery lists EventhouseFactSales; the owner is re-running shortcut join and exact decimal checks with inspectable output. Measured verification excludes bootstrap and negative-test data; the join and measured delivery remain unverified."
     }
   ],
   "cross_workspace_grants": [],

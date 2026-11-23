@@ -152,7 +152,7 @@
       "source": "Demo 1 owner Spark readback",
       "landing_uri": "abfss://14080576-9158-4326-8014-427c8009ce12@onelake.dfs.fabric.microsoft.com/aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659/Files/incoming/sales/",
       "dimension_counts": {"DimDate": 365, "DimProduct": 20, "DimCustomer": 100},
-      "note": "Owner reports unique non-null dimension keys; date range is unverified. Empty-folder fixed-schema bronze creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA. A subsequent 111-byte header-only bootstrap enabled bronze and silver definition creation; bronze readback reports fixed schema, append-only refresh and zero rows. Silver readback, managed refresh and end-to-end readiness remain unverified."
+      "note": "Owner reports unique non-null dimension keys; date range is unverified. Empty-folder fixed-schema bronze creation failed with MLV_INGEST_SCHEMA_INFERENCE_FAILED / UNABLE_TO_INFER_SCHEMA. A 111-byte header-only bootstrap enabled bronze and silver creation; an on-demand full-lineage refresh completed with zero rows and intact schemas in both. A five-minute managed schedule was read back, but its first run and disabling and measured ingestion remain unverified."
     },
     {
       "track": "shared",
@@ -172,7 +172,10 @@
       "csv_mapping": "SalesCsvV1",
       "onelake_availability": "enabled",
       "target_latency_minutes": 5,
-      "note": "Owner reports schema, mapping and policy readback; data delivery and OneLake visibility remain unverified."
+      "bootstrap_batch_id": "demo2bootstrap_80b398bcea53_0001",
+      "bootstrap_row_count": 5,
+      "bootstrap_sales_amount_minor_units": 526232,
+      "note": "Owner reports schema, mapping, policy and shortcut readback and a separately classified bootstrap submitted to KQL. KQL verification filters by BatchID and measured shortcut verification excludes bootstrap; Delta visibility and replay remain unverified."
     }
   ],
   "cross_workspace_grants": [],

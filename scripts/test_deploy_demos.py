@@ -17,7 +17,7 @@ deploy = importlib.util.module_from_spec(spec)
 loader.exec_module(deploy)
 
 FAKE_TRACK = """
-import argparse, datetime, json, pathlib, sys
+import argparse, datetime, json, pathlib, sys, time
 p = argparse.ArgumentParser()
 for option in ('mode', 'config', 'prefix', 'state-dir', 'result'):
     p.add_argument('--' + option, required=True)
@@ -29,6 +29,8 @@ track = TRACK
 behavior = config.get('behavior', {}).get(track + ':' + a.mode, {})
 with pathlib.Path(config['audit']).open('a') as f:
     f.write(json.dumps({'track': track, 'mode': a.mode, 'yes': a.yes, 'selected': a.selected_demos}) + '\\n')
+if behavior.get('delay'):
+    time.sleep(behavior['delay'])
 if behavior.get('omit_result'):
     sys.exit(0)
 status = behavior.get('status', 'pass')
@@ -190,6 +192,15 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_missing_start_evidence_attempts_stop(self):
         self.config["behavior"] = {"demo-2:start-monitor": {"omit_evidence": True}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertNotIn("run-data", summary["phases"])
+
+    def test_monitor_start_timeout_attempts_stop_before_producer(self):
+        self.config["execution"]["track_timeout_seconds"] = 1
+        self.config["behavior"] = {"demo-2:start-monitor": {"delay": 3}}
         code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
         self.assertEqual(code, 1)
         self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")

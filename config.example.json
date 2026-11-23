@@ -23,7 +23,7 @@
     "file_count": 10,
     "interval_seconds": 60,
     "max_duration_seconds": 1800,
-    "currency": "EUR"
+    "currency": "USD"
   },
   "demo-1": {
     "workspace_name": "{prefix}-demo1-mlv",

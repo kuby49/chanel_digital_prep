@@ -40,6 +40,8 @@ def load_config(path):
         raise ValueError("configuration contract_version must be 1")
     if not isinstance(config.get("execution"), dict):
         raise ValueError("configuration execution must be an object")
+    if not isinstance(config.get("data"), dict) or config["data"].get("currency") != "USD":
+        raise ValueError("data.currency must be USD; the current producer only supports USD")
     return config
 
 

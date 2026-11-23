@@ -55,7 +55,7 @@ class OrchestrationTests(unittest.TestCase):
             "contract_version": 1, "prefix": "chanel", "audit": str(self.audit),
             "execution": {"max_concurrency": 4, "track_timeout_seconds": 10},
             "data": {"run_id": "run-1", "file_count": 2, "rows_per_file": 2,
-                     "interval_seconds": 1, "max_duration_seconds": 10},
+                     "interval_seconds": 1, "max_duration_seconds": 10, "currency": "USD"},
         }
 
     def run_cli(self, *args):
@@ -117,6 +117,12 @@ class OrchestrationTests(unittest.TestCase):
     def test_invalid_run_bound_prevents_any_invocation(self):
         self.config["data"]["max_duration_seconds"] = 1
         code, _, events = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 2)
+        self.assertEqual(events, [])
+
+    def test_unsupported_currency_prevents_any_invocation(self):
+        self.config["data"]["currency"] = "EUR"
+        code, _, events = self.run_cli("demo-1", "--deploy")
         self.assertEqual(code, 2)
         self.assertEqual(events, [])
 

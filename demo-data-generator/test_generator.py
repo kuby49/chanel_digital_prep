@@ -96,6 +96,24 @@ class GeneratorTests(unittest.TestCase):
                 self.assertEqual(data["status"], status)
                 self.assertFalse(data["ready"])
 
+    def test_run_data_requires_a_safe_bounded_configuration(self):
+        script = Path(__file__).with_name("deploy.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, result = root / "config.json", root / "result.json"
+            data = {"run_id": "run-1", "seed": 42, "start_date": "2024-01-01",
+                    "date_count": 365, "product_count": 20, "customer_count": 100,
+                    "rows_per_file": 1000, "file_count": 10, "interval_seconds": 60,
+                    "max_duration_seconds": 540, "currency": "USD"}
+            args = [sys.executable, str(script), "--mode", "run-data", "--config", str(config),
+                    "--prefix", "chanel", "--state-dir", str(root), "--result", str(result),
+                    "--selected-demos", "demo-1,demo-2"]
+            for duration, status in ((540, "fail"), (541, "blocked")):
+                data["max_duration_seconds"] = duration
+                config.write_text(json.dumps({"contract_version": 1, "data": data}), encoding="utf-8")
+                self.assertEqual(subprocess.run(args).returncode, 1)
+                self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["status"], status)
+
 
 if __name__ == "__main__":
     unittest.main()

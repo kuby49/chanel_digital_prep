@@ -30,7 +30,10 @@ and durability behavior have only been tested locally, not on OneLake.
 the closed staged path, batch ID, SHA-256, row count and exact total after recording
 `submitting`. An adapter's `submit(staged_path, batch_id, sha256, row_count,
 sales_amount_minor_units)` receives a **driver-readable local file**, not an
-ABFSS URI; materialization from OneLake is not yet implemented. Record its
+ABFSS URI. `fabric_files.materialize_staged` copies a staged file through
+`notebookutils.fs.cp` to a temporary driver-local file, checks its SHA-256, and
+removes the local copy after submission. This helper is locally tested with a
+mock filesystem, not verified in Fabric. Record its
 `submitted`, `retryable_failure`, `unknown`, or `permanent_failure` result with
 `record_submission`. `retryable_failure` means the adapter has proved that the
 request was not accepted. A crash in `submitting` or an `unknown` result requires

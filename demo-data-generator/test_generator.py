@@ -7,9 +7,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from generator import HEADER, RunConfig, batch_bytes, dimensions, stage_batch
 from delivery import begin_submission, record_submission, record_verification
+from fabric_files import materialize_staged
 
 
 class GeneratorTests(unittest.TestCase):
@@ -112,6 +115,23 @@ class GeneratorTests(unittest.TestCase):
             record_submission(root, "uncertain", 1, "demo-2", "unknown")
             with self.assertRaises(RuntimeError):
                 begin_submission(root, "uncertain", 1, "demo-2", 3)
+
+    def test_materialize_verifies_and_removes_driver_file(self):
+        class FakeFs:
+            def exists(self, uri):
+                return uri == "Files/stage/batch.csv"
+
+            def cp(self, source, destination, recurse):
+                Path(url2pathname(urlsplit(destination).path)).write_bytes(b"batch")
+                return True
+
+        digest = hashlib.sha256(b"batch").hexdigest()
+        with materialize_staged(FakeFs(), "Files/stage/batch.csv", digest) as path:
+            self.assertEqual(Path(path).read_bytes(), b"batch")
+        self.assertFalse(Path(path).exists())
+        with self.assertRaises(RuntimeError):
+            with materialize_staged(FakeFs(), "Files/stage/batch.csv", "0" * 64):
+                self.fail("mismatched bytes must not be delivered")
 
     def test_notebook_and_pipeline_drafts_have_matching_parameters(self):
         directory = Path(__file__).parent

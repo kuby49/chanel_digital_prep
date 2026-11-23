@@ -127,8 +127,8 @@ def _atomic_json(path, value):
             os.unlink(name)
 
 
-def stage_batch(root, config, batch_number, destinations):
-    """Stage once; callers must serialize access to a run directory."""
+def initialize_run(root, config, destinations):
+    """Create or validate a run manifest; callers must serialize access."""
     config.validate()
     if not destinations or len(set(destinations)) != len(destinations) or any(
         name not in ("demo-1", "demo-2", "demo-3") for name in destinations
@@ -143,11 +143,18 @@ def stage_batch(root, config, batch_number, destinations):
         if manifest["config"] != expected_config or manifest["destinations"] != sorted(destinations):
             raise ValueError("existing run configuration or destinations differ; use a new run ID")
     else:
-        if any(root.iterdir()):
+        if any(path.name != ".producer.lock" for path in root.iterdir()):
             raise RuntimeError("run contains untracked files; manual recovery required")
         manifest = {"contract_version": 1, "run_id": config.run_id, "config": expected_config,
                     "destinations": sorted(destinations), "batches": {}}
         _atomic_json(manifest_path, manifest)
+    return root, manifest
+
+
+def stage_batch(root, config, batch_number, destinations):
+    """Stage once; callers must serialize access to a run directory."""
+    root, manifest = initialize_run(root, config, destinations)
+    manifest_path = root / "manifest.json"
     key = str(batch_number)
     if key in manifest["batches"]:
         entry = manifest["batches"][key]

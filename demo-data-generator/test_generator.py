@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
@@ -13,6 +14,7 @@ from urllib.request import url2pathname
 from generator import HEADER, RunConfig, batch_bytes, dimensions, stage_batch
 from delivery import begin_submission, record_submission, record_verification
 from fabric_files import materialize_staged
+from runner import Submission, run_batches
 
 
 class GeneratorTests(unittest.TestCase):
@@ -142,6 +144,80 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(set(pipeline["properties"]["parameters"]), {"run_config_json", "selected_demos_json"})
         self.assertEqual(set(pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]),
                          {"run_config_json", "selected_demos_json"})
+
+    def test_runner_spaces_batches_and_isolates_failures_on_resume(self):
+        class FakeClock:
+            now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+            def clock(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += timedelta(seconds=seconds)
+
+        with tempfile.TemporaryDirectory() as root:
+            clock = FakeClock()
+            calls = []
+
+            def healthy(request, deadline):
+                calls.append(("demo-1", request["batch_id"], clock.now))
+                if len([c for c in calls if c[0] == "demo-1" and c[1] == request["batch_id"]]) == 1:
+                    return Submission("retryable_failure")
+                return Submission("submitted", "operation")
+
+            def uncertain(request, deadline):
+                calls.append(("demo-2", request["batch_id"], clock.now))
+                raise ConnectionError("outcome unknown")
+
+            config = RunConfig("timed", file_count=3, rows_per_file=2, interval_seconds=60)
+            adapters = {"demo-1": healthy, "demo-2": uncertain}
+            result = run_batches(root, config, adapters, 181, 2, clock=clock.clock, sleep=clock.sleep)
+            self.assertFalse(result["submitted"])
+            self.assertEqual(len([c for c in calls if c[0] == "demo-1"]), 6)
+            self.assertEqual(len([c for c in calls if c[0] == "demo-2"]), 3)
+            times = [c[2] for c in calls if c[0] == "demo-2"]
+            self.assertEqual([int((t - times[0]).total_seconds()) for t in times], [0, 60, 120])
+            previous_calls = len(calls)
+            run_batches(root, config, adapters, 181, 2, clock=clock.clock, sleep=clock.sleep)
+            self.assertEqual(len(calls), previous_calls)
+            with self.assertRaises(ValueError):
+                run_batches(root, config, adapters, 200, 2, clock=clock.clock, sleep=clock.sleep)
+
+    def test_runner_stops_new_batches_at_original_deadline(self):
+        class FakeClock:
+            now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+            def clock(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += timedelta(seconds=seconds)
+
+        with tempfile.TemporaryDirectory() as root:
+            clock = FakeClock()
+
+            def slow(request, deadline):
+                clock.now += timedelta(seconds=120)
+                return Submission("submitted")
+
+            config = RunConfig("deadline", file_count=2, rows_per_file=1, interval_seconds=60)
+            result = run_batches(root, config, {"demo-1": slow}, 61, 1, clock=clock.clock, sleep=clock.sleep)
+            self.assertFalse(result["submitted"])
+            self.assertTrue(any("deadline" in error for error in result["errors"]))
+            manifest = json.loads((Path(root) / config.run_id / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(list(manifest["batches"]), ["1"])
+
+    def test_runner_rejects_an_existing_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = RunConfig("locked", file_count=1, rows_per_file=1)
+            directory = Path(root) / config.run_id
+            directory.mkdir()
+            lock = directory / ".producer.lock"
+            lock.write_text("", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                run_batches(root, config, {"demo-1": lambda *_: Submission("submitted")}, 1, 1)
+            self.assertTrue(lock.exists())
+            self.assertFalse((directory / "manifest.json").exists())
 
     def test_deploy_contract_never_claims_unimplemented_readiness(self):
         script = Path(__file__).with_name("deploy.py")

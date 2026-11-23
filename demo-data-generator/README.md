@@ -43,6 +43,18 @@ row count, exact total and distinct sales-line count before setting `verified`.
 Eventhouse must additionally verify the batch-specific query and deduplication
 behavior; concurrent in-flight retries cannot rely on tags alone.
 
+`runner.run_batches` is a local, dependency-injected scheduler that records a
+run's start, deadline and batch start times, spaces new batches by at least the
+configured interval, retries only proven non-acceptance, and continues other
+destinations after an ambiguous failure. A resumed run retains the original
+deadline and never resubmits a queued or ambiguous request. An adapter receives
+the submission request and UTC deadline; it must enforce its own I/O timeout.
+The runner cannot interrupt a blocking adapter, and it does not prove a hard
+job duration. An exclusive local lock rejects concurrent runners; a lock left by
+a crash requires operator verification and explicit recovery. Fabric pipeline/job
+timeouts and OneLake persistence, exclusive locking,
+event finalization, and connector behavior must be validated before activation.
+
 `deploy.py` implements the shared v1 invocation and result envelope. Dry-run
 is a plan only; all other operations explicitly report blocked. The local
 notebook and pipeline are **draft assets**, not deployed or end-to-end runnable;

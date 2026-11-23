@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from generator import HEADER, RunConfig, batch_bytes, dimensions, stage_batch
+from delivery import begin_submission, record_submission, record_verification
 
 
 class GeneratorTests(unittest.TestCase):
@@ -80,6 +81,47 @@ class GeneratorTests(unittest.TestCase):
             batch_bytes(RunConfig("ok"), 0)
         self.assertEqual(batch_bytes(RunConfig("test", batch_class="bootstrap"), 1)[1]["batch_class"], "bootstrap")
         self.assertEqual(batch_bytes(RunConfig("test", batch_class="negative-test"), 1)[1]["batch_class"], "negative-test")
+
+    def test_delivery_recovers_safely_and_requires_verification(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = RunConfig("delivery", rows_per_file=2)
+            entry = stage_batch(root, config, 1, ["demo-2", "demo-3"])
+            request = begin_submission(root, config.run_id, 1, "demo-2", 2)
+            self.assertEqual(Path(request["staged_path"]).read_bytes(), batch_bytes(config, 1)[0])
+            self.assertEqual(request["sha256"], entry["sha256"])
+            with self.assertRaises(RuntimeError):
+                begin_submission(root, config.run_id, 1, "demo-2", 2)
+            record_submission(root, config.run_id, 1, "demo-2", "retryable_failure")
+            begin_submission(root, config.run_id, 1, "demo-2", 2)
+            record_submission(root, config.run_id, 1, "demo-2", "submitted", "operation")
+            with self.assertRaises(ValueError):
+                record_verification(root, config.run_id, 1, "demo-2", 2, entry["sales_amount_minor_units"], 1)
+            record_verification(root, config.run_id, 1, "demo-2", 2, entry["sales_amount_minor_units"], 2)
+            manifest = json.loads((Path(root) / config.run_id / "manifest.json").read_text(encoding="utf-8"))
+            deliveries = manifest["batches"]["1"]["deliveries"]
+            self.assertEqual(deliveries["demo-2"]["status"], "verified")
+            self.assertEqual(deliveries["demo-2"]["attempts"], 2)
+            self.assertEqual(deliveries["demo-3"]["status"], "pending")
+            with self.assertRaises(RuntimeError):
+                begin_submission(root, config.run_id, 1, "demo-2", 2)
+
+    def test_ambiguous_submission_cannot_be_retried(self):
+        with tempfile.TemporaryDirectory() as root:
+            stage_batch(root, RunConfig("uncertain", rows_per_file=1), 1, ["demo-2"])
+            begin_submission(root, "uncertain", 1, "demo-2", 3)
+            record_submission(root, "uncertain", 1, "demo-2", "unknown")
+            with self.assertRaises(RuntimeError):
+                begin_submission(root, "uncertain", 1, "demo-2", 3)
+
+    def test_notebook_and_pipeline_drafts_have_matching_parameters(self):
+        directory = Path(__file__).parent
+        notebook = json.loads((directory / "notebook.ipynb").read_text(encoding="utf-8"))
+        pipeline = json.loads((directory / "pipeline-content.json").read_text(encoding="utf-8"))
+        for cell in notebook["cells"]:
+            compile("".join(cell["source"]), "notebook", "exec")
+        self.assertEqual(set(pipeline["properties"]["parameters"]), {"run_config_json", "selected_demos_json"})
+        self.assertEqual(set(pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]),
+                         {"run_config_json", "selected_demos_json"})
 
     def test_deploy_contract_never_claims_unimplemented_readiness(self):
         script = Path(__file__).with_name("deploy.py")

@@ -1,0 +1,21 @@
+{
+  "properties": {
+    "parameters": {
+      "run_config_json": {"type": "string"},
+      "selected_demos_json": {"type": "string"}
+    },
+    "activities": [
+      {
+        "name": "RunProducer",
+        "type": "TridentNotebook",
+        "typeProperties": {
+          "notebookId": "<producer-notebook-id>",
+          "parameters": {
+            "run_config_json": {"value": {"value": "@pipeline().parameters.run_config_json", "type": "Expression"}, "type": "string"},
+            "selected_demos_json": {"value": {"value": "@pipeline().parameters.selected_demos_json", "type": "Expression"}, "type": "string"}
+          }
+        }
+      }
+    ]
+  }
+}

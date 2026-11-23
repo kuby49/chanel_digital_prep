@@ -25,10 +25,27 @@ regenerating them. It requires a single writer per run; a crash between staging
 a file and updating the manifest requires manual recovery. Filesystem rename
 and durability behavior have only been tested locally, not on OneLake.
 
+`delivery.py` provides single-writer, persisted delivery transitions.
+`begin_submission(root, run_id, batch_number, destination, max_attempts)` returns
+the closed staged path, batch ID, SHA-256, row count and exact total after recording
+`submitting`. An adapter's `submit(staged_path, batch_id, sha256, row_count,
+sales_amount_minor_units)` receives a **driver-readable local file**, not an
+ABFSS URI; materialization from OneLake is not yet implemented. Record its
+`submitted`, `retryable_failure`, `unknown`, or `permanent_failure` result with
+`record_submission`. `retryable_failure` means the adapter has proved that the
+request was not accepted. A crash in `submitting` or an `unknown` result requires
+reconciliation, not blind retry. Never log secrets in diagnostics. Queue
+acceptance is not verified ingestion: `record_verification` checks the observed
+row count, exact total and distinct sales-line count before setting `verified`.
+Eventhouse must additionally verify the batch-specific query and deduplication
+behavior; concurrent in-flight retries cannot rely on tags alone.
+
 `deploy.py` implements the shared v1 invocation and result envelope. Dry-run
-is a plan only; all other operations explicitly report blocked. In particular,
-there is no deployed notebook, pipeline, destination transport, delivery retry,
-delivery-state update, or source scheduler yet. No measured run can be started
+is a plan only; all other operations explicitly report blocked. The local
+notebook and pipeline are **draft assets**, not deployed or end-to-end runnable;
+the notebook intentionally fails before generating data. Deploy-time notebook
+Lakehouse binding and built-in resources have not been implemented. There is no
+destination transport or source scheduler yet. No measured run can be started
 until Fabric storage semantics, cross-workspace permissions, Eventhouse
 idempotency, and readiness validation are implemented and verified. A rename is
 not assumed to emit the `FileCreated` event: the selected completion operation,

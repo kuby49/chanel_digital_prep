@@ -151,7 +151,7 @@
       "track": "demo-3",
       "source": "Demo 3 owner",
       "intended_landing_uri": "abfss://744223de-ceab-4c4f-82ba-f811bcb5c7d7@onelake.dfs.fabric.microsoft.com/02fd5f73-32d5-4295-bfb5-c5436e9c3b62/Files/incoming/sales/",
-      "note": "The setup notebook failed. Folder creation, event mapping and the Copy pipeline are not verified; this intended URI is not proof of readiness."
+      "note": "Owner reports the setup notebook subsequently completed and OneLake readback confirmed the landing folder exists and is empty. Dimension counts match the shared generator (365 dates, 20 products, 100 customers); FactSales and its Spark amount view exist. The organizational-account connection UI is reachable, but connection creation, event mapping and Copy runtime behavior remain unverified. Any access sentinel must remain under Files/_preflight/producer-access/, outside the event filter."
     },
     {
       "track": "demo-1",

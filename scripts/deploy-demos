@@ -154,8 +154,8 @@ def monitor_config(config):
     return f"{root}/{config['data']['run_id']}/manifest.json", duration
 
 
-def monitor_evidence(state_dir, run_id, manifest_uri, max_duration, require_running):
-    with (state_dir / "demo-2-monitor.json").open(encoding="utf-8") as file:
+def monitor_evidence(path, run_id, manifest_uri, max_duration, require_running):
+    with path.open(encoding="utf-8") as file:
         evidence = json.load(file)
     if not isinstance(evidence, dict) or type(evidence.get("contract_version")) is not int or evidence["contract_version"] != 1:
         raise ValueError("invalid monitor evidence version")
@@ -166,8 +166,8 @@ def monitor_evidence(state_dir, run_id, manifest_uri, max_duration, require_runn
         raise ValueError("monitor is observing a different run")
     if evidence["manifest_uri"] != manifest_uri:
         raise ValueError("monitor is observing a different manifest")
-    if require_running and evidence["state"] != "running":
-        raise ValueError("monitor is not running")
+    if evidence["state"] not in ({"running"} if require_running else {"submitted", "running"}):
+        raise ValueError("monitor has an invalid lifecycle state")
     try:
         deadline = datetime.datetime.fromisoformat(evidence["deadline_utc"].replace("Z", "+00:00"))
     except ValueError as error:
@@ -180,16 +180,27 @@ def monitor_evidence(state_dir, run_id, manifest_uri, max_duration, require_runn
     return evidence
 
 
+def matching_monitor_identity(first, second):
+    for key in ("contract_version", "run_id", "job_id", "manifest_uri", "deadline_utc"):
+        if first[key] != second[key]:
+            raise ValueError(f"monitor {key} does not match the start record")
+
+
 def start_monitor(config, config_path, prefix, state_dir, timeout, selected, monitor_settings):
     phases = {}
     started = False
+    initial = None
     try:
         start = invoke("demo-2", "start-monitor", config_path, prefix, state_dir, timeout, selected)
         phases["start-monitor"] = {"demo-2": start}
         if start["status"] != "pass":
             return phases, False
         try:
-            initial = monitor_evidence(state_dir, config["data"]["run_id"], *monitor_settings, False)
+            initial = monitor_evidence(state_dir / "demo-2-monitor-start.json",
+                                       config["data"]["run_id"], *monitor_settings, False)
+            sidecar = monitor_evidence(state_dir / "demo-2-monitor.json",
+                                       config["data"]["run_id"], *monitor_settings, False)
+            matching_monitor_identity(initial, sidecar)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "fail",
                                                         f"Invalid monitor evidence: {error}")}
@@ -199,10 +210,12 @@ def start_monitor(config, config_path, prefix, state_dir, timeout, selected, mon
         if status["status"] != "pass":
             return phases, False
         try:
-            current = monitor_evidence(state_dir, config["data"]["run_id"], *monitor_settings, True)
-            for key in ("run_id", "job_id", "manifest_uri", "deadline_utc"):
-                if current[key] != initial[key]:
-                    raise ValueError(f"monitor {key} changed between start and status")
+            record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
+                                      config["data"]["run_id"], *monitor_settings, False)
+            current = monitor_evidence(state_dir / "demo-2-monitor.json",
+                                       config["data"]["run_id"], *monitor_settings, True)
+            matching_monitor_identity(initial, record)
+            matching_monitor_identity(initial, current)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             phases["monitor-status"] = {"demo-2": result("demo-2", "monitor-status", "fail",
                                                          f"Invalid monitor evidence: {error}")}
@@ -211,8 +224,17 @@ def start_monitor(config, config_path, prefix, state_dir, timeout, selected, mon
         return phases, True
     finally:
         if not started:
-            phases["stop-monitor"] = {"demo-2": invoke("demo-2", "stop-monitor", config_path, prefix,
-                                                        state_dir, timeout, selected)}
+            try:
+                if initial is not None:
+                    with (state_dir / "demo-2-monitor-start.json").open(encoding="utf-8") as file:
+                        record = json.load(file)
+                    matching_monitor_identity(initial, record)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                stopped = result("demo-2", "stop-monitor", "fail",
+                                 f"Start record changed or is unreadable; termination unconfirmed: {error}")
+            else:
+                stopped = invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, timeout, selected)
+            phases["stop-monitor"] = {"demo-2": stopped}
 
 
 def main(argv=None):

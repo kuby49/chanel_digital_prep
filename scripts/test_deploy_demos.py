@@ -27,8 +27,11 @@ a = p.parse_args()
 config = json.loads(pathlib.Path(a.config).read_text())
 track = TRACK
 behavior = config.get('behavior', {}).get(track + ':' + a.mode, {})
-with pathlib.Path(config['audit']).open('a') as f:
-    f.write(json.dumps({'track': track, 'mode': a.mode, 'yes': a.yes, 'selected': a.selected_demos}) + '\\n')
+start_path = pathlib.Path(a.state_dir) / 'demo-2-monitor-start.json'
+stop_job = json.loads(start_path.read_text())['job_id'] if a.mode == 'stop-monitor' and start_path.exists() else None
+event_path = pathlib.Path(a.state_dir) / ('event-' + str(time.time_ns()) + '-' + track + '-' + a.mode + '.json')
+event_path.write_text(json.dumps({'track': track, 'mode': a.mode, 'yes': a.yes, 'selected': a.selected_demos,
+                                  'stop_job': stop_job}))
 if behavior.get('delay'):
     time.sleep(behavior['delay'])
 if behavior.get('omit_result'):
@@ -50,6 +53,12 @@ if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status') and statu
     evidence.update(behavior.get('evidence', {}))
     if not behavior.get('omit_evidence'):
         monitor_path.write_text(json.dumps(evidence))
+    if a.mode == 'start-monitor' and not behavior.get('omit_start_record'):
+        start_path.write_text(json.dumps(evidence))
+    if a.mode == 'monitor-status' and behavior.get('start_record_evidence'):
+        original = json.loads(start_path.read_text())
+        original.update(behavior['start_record_evidence'])
+        start_path.write_text(json.dumps(original))
 result = {'contract_version': 1, 'track': track, 'mode': a.mode, 'status': status,
           'ready': behavior.get('ready', a.mode in ('deploy', 'validate-only', 'monitor-status')),
           'diagnostics': [] if status == 'pass' else ['not ready']}
@@ -70,9 +79,8 @@ class OrchestrationTests(unittest.TestCase):
             script = self.root / (track + ".py")
             script.write_text("TRACK = " + repr(track) + "\n" + FAKE_TRACK, encoding="utf-8")
             deploy.TRACKS[track] = script
-        self.audit = self.root / "audit.jsonl"
         self.config = {
-            "contract_version": 1, "prefix": "chanel", "audit": str(self.audit),
+            "contract_version": 1, "prefix": "chanel",
             "execution": {"max_concurrency": 4, "track_timeout_seconds": 10,
                           "verification_timeout_seconds": 15},
             "data": {"run_id": "run-1", "file_count": 2, "rows_per_file": 2,
@@ -89,8 +97,9 @@ class OrchestrationTests(unittest.TestCase):
             code = deploy.main([*args, "--config", str(config_path),
                                 "--state-dir", str(self.root / "state")])
         states = list((self.root / "state").glob("run-*")) if (self.root / "state").exists() else []
-        summary = json.loads((states[-1] / "summary.json").read_text()) if states else None
-        events = [json.loads(line) for line in self.audit.read_text().splitlines()] if self.audit.exists() else []
+        latest = max(states, key=lambda state: (state / "summary.json").stat().st_mtime_ns) if states else None
+        summary = json.loads((latest / "summary.json").read_text()) if latest else None
+        events = [json.loads(path.read_text()) for path in sorted(latest.glob("event-*.json"))] if latest else []
         return code, summary, events
 
     def test_subset_does_not_run_other_tracks_and_does_not_start_data(self):
@@ -182,6 +191,7 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
                 self.assertNotIn("run-data", summary["phases"])
                 self.assertEqual(events[-1]["mode"], "stop-monitor")
+                self.assertEqual(events[-1]["stop_job"], "job-1")
 
     def test_monitor_must_report_fresh_readiness(self):
         self.config["behavior"] = {"demo-2:monitor-status": {"ready": False}}
@@ -196,6 +206,25 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")
         self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertNotIn("run-data", summary["phases"])
+
+    def test_missing_original_job_record_blocks_producer(self):
+        self.config["behavior"] = {"demo-2:start-monitor": {"omit_start_record": True}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertIsNone(events[-1]["stop_job"])
+        self.assertNotIn("run-data", summary["phases"])
+
+    def test_changed_original_job_record_blocks_producer(self):
+        self.config["behavior"] = {"demo-2:monitor-status": {
+            "start_record_evidence": {"job_id": "different-job"}}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
+        self.assertEqual(summary["phases"]["stop-monitor"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "monitor-status")
         self.assertNotIn("run-data", summary["phases"])
 
     def test_monitor_start_timeout_attempts_stop_before_producer(self):
@@ -255,7 +284,7 @@ class OrchestrationTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as error:
             self.run_cli("all", "--cleanup")
         self.assertEqual(error.exception.code, 2)
-        self.assertFalse(self.audit.exists())
+        self.assertFalse((self.root / "state").exists())
 
     def test_invalid_or_missing_result_is_failure(self):
         self.config["behavior"] = {"demo-1:deploy": {"omit_result": True}}

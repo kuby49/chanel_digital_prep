@@ -48,6 +48,7 @@ def build_notebook(
     verification_timeout_seconds=900,
     poll_interval_seconds=15,
     synthetic_run_id=None,
+    dimension_maintenance=False,
 ):
     """Build an ipynb; source modules are embedded without a runtime install."""
     workspace_id = _uuid(workspace_id, "workspace_id")
@@ -73,6 +74,8 @@ def build_notebook(
         "lakehouse_validation": (_HERE / "lakehouse_validation.py").read_text(encoding="utf-8"),
         "chanel_generator": generator_source,
     }
+    if dimension_maintenance:
+        sources["dimension_expansion"] = (_HERE / "dimension_expansion.py").read_text(encoding="utf-8")
     encoded = {
         name: base64.b64encode(source.encode("utf-8")).decode("ascii")
         for name, source in sources.items()
@@ -91,6 +94,20 @@ def build_notebook(
             "",
         )
     )
+    maintenance = """\
+elif MODE == "dimension_gaps":
+    from dimension_expansion import dimension_gaps
+    result = {"mode": MODE, "status": "verified",
+              "missing": dimension_gaps(spark, data, generator, LAKEHOUSE_NAME, schema)}
+elif MODE == "expand_dimensions":
+    from dimension_expansion import dimension_gaps, expand_dimensions
+    before = dimension_gaps(spark, data, generator, LAKEHOUSE_NAME, schema)
+    expand_dimensions(spark, data, generator, LAKEHOUSE_NAME, schema)
+    after = dimension_gaps(spark, data, generator, LAKEHOUSE_NAME, schema)
+    if any(after.values()):
+        raise ValueError("Dimension expansion did not fill every missing row")
+    result = {"mode": MODE, "status": "verified", "missing_before": before, "missing_after": after}
+""" if dimension_maintenance else ""
     body = f"""\
 import base64
 import json
@@ -174,6 +191,7 @@ elif MODE == "verify_run":
     else:
         verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema)
     result = {{"mode": MODE, "status": "verified", "batches": results}}
+{maintenance}\
 else:
     raise ValueError("Unsupported Demo 2 notebook mode")
 """

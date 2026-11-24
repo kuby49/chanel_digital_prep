@@ -195,6 +195,46 @@ class MonitorControllerTests(unittest.TestCase):
         self.client = FakeClient(self.cfg)
         self.controller = Controller(self.cfg, self.client, clock=self.clock, sleep=self.clock.advance)
 
+    def test_measured_synthetic_target_requires_exact_notebook_binding(self):
+        target = {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"}
+        config = {"run_id": RUN, "batch_class": "measured", "file_count": 1}
+        targets = {"demo-2": target}
+        binding = hashlib.sha256(json.dumps(
+            {"targets": targets, "generator_sha256": GENERATOR_SHA256, "config": config},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode()).hexdigest()
+        params = {**self.params, "EXPECTED_PRODUCER_CONFIG_JSON": json.dumps(config),
+                  "EXPECTED_TARGET_BINDINGS_JSON": json.dumps(targets),
+                  "EXPECTED_MONITOR_BINDING_SHA256": binding}
+        with self.assertRaisesRegex(MonitorError, "exact isolated synthetic target"):
+            settings(params, lakehouse_id=LAKEHOUSE)
+        actual = settings(params, lakehouse_id=LAKEHOUSE, reused_synthetic_target=target)
+        self.assertEqual(actual["target_bindings"], targets)
+        self.assertIsNone(actual["synthetic_run_id"])
+        for wrong in ({**target, "item_id": str(uuid.UUID(int=42))},
+                      {**target, "workspace_id": PRODUCER_WORKSPACE},
+                      {**target, "fact": "FactSales"}):
+            with self.subTest(wrong=wrong), self.assertRaises(MonitorError):
+                settings(params, lakehouse_id=LAKEHOUSE, reused_synthetic_target=wrong)
+        params["EXPECTED_PRODUCER_CONFIG_JSON"] = json.dumps({**config, "batch_class": "bootstrap"})
+        with self.assertRaisesRegex(MonitorError, "measured run"):
+            settings(params, lakehouse_id=LAKEHOUSE, reused_synthetic_target=target)
+
+    def test_measured_monitor_notebook_pins_target_in_definition(self):
+        target = {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"}
+        notebook = build_monitor_notebook(
+            workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
+            reused_synthetic_target=target,
+        )
+        runtime = "".join(notebook["cells"][1]["source"])
+        self.assertIn(repr(target), runtime)
+        compile(runtime, "measured-monitor", "exec")
+        with self.assertRaises(ValueError):
+            build_monitor_notebook(
+                workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
+                reused_synthetic_target={**target, "workspace_id": PRODUCER_WORKSPACE},
+            )
+
     def test_synthetic_monitor_reconciles_bootstrap_without_accepting_measured_data(self):
         run = "demo2synthetic_123456abcdef"
         target = {"demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"}}

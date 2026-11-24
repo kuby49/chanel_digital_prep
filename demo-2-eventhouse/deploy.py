@@ -172,6 +172,9 @@ def validate_config(config, prefix):
         raise Failure("demo-2 and execution must be objects")
     if not isinstance(data, dict) or not isinstance(shared, dict) or not isinstance(capacity, dict):
         raise Failure("data, shared and capacity must be objects")
+    reuse_synthetic_target = demo.get("reuse_synthetic_target", False)
+    if type(reuse_synthetic_target) is not bool:
+        raise Failure("demo-2.reuse_synthetic_target must be a boolean")
 
     if "verification_timeout_seconds" in execution:
         _positive_seconds(execution["verification_timeout_seconds"], "execution.verification_timeout_seconds")
@@ -280,6 +283,9 @@ def validate_config(config, prefix):
         "monitor_notebook_name": _optional_name(demo.get("monitor_notebook_name"), "Demo2Monitor",
                                                 "monitor notebook name"),
         "monitor_notebook_id": _optional_uuid(demo.get("monitor_notebook_id"), "demo-2.monitor_notebook_id"),
+        "measured_notebook_name": "Demo2MeasuredValidation",
+        "measured_monitor_notebook_name": "Demo2MeasuredMonitor",
+        "reuse_synthetic_target": reuse_synthetic_target,
         "table": _optional_name(demo.get("sales_table"), "FactSales", "sales table"),
         "mapping": _optional_name(demo.get("csv_mapping"), "SalesCsvV1", "CSV mapping"),
         "shortcut": _optional_name(demo.get("shortcut_name"), "EventhouseFactSales", "shortcut name"),
@@ -308,6 +314,16 @@ def validate_config(config, prefix):
         "data": {key: data.get(key) for key in
                  ("run_id", "seed", "start_date", "date_count", "product_count", "customer_count")},
     }
+
+
+def _synthetic_run(settings):
+    scope = re.fullmatch(r"demo2synthetic-([0-9a-f]{12})", settings.get("prefix", ""))
+    return bool(scope and settings.get("data", {}).get("run_id") == f"demo2synthetic_{scope[1]}")
+
+
+def _notebook_key(settings, *, monitor=False):
+    role = "monitor_notebook" if monitor else "notebook"
+    return f"measured_{role}" if settings.get("reuse_synthetic_target") else role
 
 
 def _atomic_json(path, value):
@@ -448,7 +464,8 @@ class Ledger:
             uuid.UUID(state["owner_marker"][len(expected_prefix):])
         except ValueError as exc:
             raise Blocked("The ownership marker in the ledger is invalid.") from exc
-        for key in ("workspace", "eventhouse", "database", "lakehouse", "notebook", "monitor_notebook"):
+        for key in ("workspace", "eventhouse", "database", "lakehouse", "notebook", "monitor_notebook",
+                    "measured_notebook", "measured_monitor_notebook"):
             entry = state["resources"].get(key)
             if entry is not None:
                 try:
@@ -822,6 +839,22 @@ def _verify_notebook_exit(job, mode, batch):
                 or type(nested.get("sales_amount_minor_units")) is not int
                 or nested["sales_amount_minor_units"] != batch["sales_amount_minor_units"]):
             raise Blocked("The notebook exit value does not prove the requested verification mode and batch.")
+    return result
+
+
+def _verify_dimension_exit(result, mode, settings):
+    base = ".".join(part for part in (settings["lakehouse_name"], settings["schema"]) if part)
+    expected = {f"{base}.{name}": count for name, count in (
+        ("DimDate", settings["data"]["date_count"]), ("DimProduct", settings["data"]["product_count"]),
+        ("DimCustomer", settings["data"]["customer_count"]),
+    )}
+    fields = ("missing",) if mode == "dimension_gaps" else ("missing_before", "missing_after")
+    for field in fields:
+        counts = result.get(field)
+        if (not isinstance(counts, dict) or set(counts) != set(expected)
+                or any(type(counts[key]) is not int or not 0 <= counts[key] <= expected[key] for key in expected)
+                or (field == "missing_after" and any(counts.values()))):
+            raise Blocked("The dimension-maintenance notebook did not verify the exact expected dimensions.")
 
 
 def _load_builder():
@@ -1130,6 +1163,17 @@ class Deployment:
         verify_schema(self._kql(database, f".show table {table} schema as json"), table, self.marker)
         return database
 
+    def reused_synthetic_target(self):
+        try:
+            target = _targets(self.s["target_bindings"])["demo-2"]
+            expected = {"workspace_id": self.resources["workspace"]["id"],
+                        "item_id": self.resources["database"]["id"], "fact": self.s["table"]}
+        except (KeyError, TargetBindingError, TypeError) as exc:
+            raise Blocked("The measured reuse target is not bound to the owned database.") from exc
+        if target != expected or target["fact"] != "SyntheticFactSales":
+            raise Blocked("The measured reuse target does not match the owned synthetic table.")
+        return target
+
     def configure_kql(self, database):
         table, mapping = self.s["table"], self.s["mapping"]
         commands = schema_commands(table, mapping)
@@ -1257,21 +1301,24 @@ class Deployment:
         try:
             # Dimensions are independent of run ID; keep the verifier reusable across runs.
             dimension_data = {**self.s["data"], "run_id": None}
+            maintenance = {"dimension_maintenance": True} if self.s.get("reuse_synthetic_target") else {}
             notebook = module.build_notebook(
                 generator, workspace_id=self.resources["workspace"]["id"],
                 lakehouse_id=self.resources["lakehouse"]["id"], lakehouse_name=self.s["lakehouse_name"],
                 data=dimension_data, shortcut_name=self.s["shortcut"], schema=self.s["schema"],
                 verification_timeout_seconds=self.s["timeout"], poll_interval_seconds=self.s["poll"],
-                synthetic_run_id=self.s["data"]["run_id"] if self.s["prefix"].startswith("demo2synthetic-") else None,
+                synthetic_run_id=self.s["data"]["run_id"] if _synthetic_run(self.s) else None,
+                **maintenance,
             )
             definition = module.fabric_definition(notebook)
         except Exception as exc:
             raise Blocked(f"Cannot build the Demo 2 notebook ({type(exc).__name__}).") from exc
         expected = _notebook_projection(notebook)
         _read_notebook_definition(definition)
-        self.item("notebook", "Notebook", self.s["notebook_name"], create, definition)
+        key = _notebook_key(self.s)
+        self.item(key, "Notebook", self.s[f"{key}_name"], create, definition)
         ws = self.resources["workspace"]["id"]
-        notebook_id = self.resources["notebook"]["id"]
+        notebook_id = self.resources[key]["id"]
         status, headers, actual = self.client.fabric(
             "POST", f"/v1/workspaces/{ws}/items/{notebook_id}/getDefinition?format=ipynb", {}
         )
@@ -1289,19 +1336,23 @@ class Deployment:
         module, _ = self.builder
         monitor_builder = _load_monitor_builder()
         try:
+            reuse = ({"reused_synthetic_target": self.reused_synthetic_target()}
+                     if self.s.get("reuse_synthetic_target") else {})
             notebook = monitor_builder.build_monitor_notebook(
                 workspace_id=self.resources["workspace"]["id"],
                 lakehouse_id=self.resources["lakehouse"]["id"],
                 lakehouse_name=self.s["lakehouse_name"],
+                **reuse,
             )
             definition = module.fabric_definition(notebook)
         except Exception as exc:
             raise Blocked(f"Cannot build the Demo 2 monitor notebook ({type(exc).__name__}).") from exc
         expected = _notebook_projection(notebook)
         _read_notebook_definition(definition)
-        self.item("monitor_notebook", "Notebook", self.s["monitor_notebook_name"], create, definition)
+        key = _notebook_key(self.s, monitor=True)
+        self.item(key, "Notebook", self.s[f"{key}_name"], create, definition)
         ws = self.resources["workspace"]["id"]
-        notebook_id = self.resources["monitor_notebook"]["id"]
+        notebook_id = self.resources[key]["id"]
         status, headers, actual = self.client.fabric(
             "POST", f"/v1/workspaces/{ws}/items/{notebook_id}/getDefinition?format=ipynb", {}
         )
@@ -1313,9 +1364,25 @@ class Deployment:
             raise Blocked("The live monitor notebook definition or Lakehouse binding differs from the trusted builder.")
 
     @_spark_operation
+    def ensure_dimension_quiescent(self):
+        ws = self.resources["workspace"]["id"]
+        sessions = self.client.pages(f"/v1/workspaces/{ws}/spark/livySessions")
+        if any(not isinstance(session, dict) or session.get("state") not in
+               ("Succeeded", "Failed", "Cancelled") for session in sessions):
+            raise Blocked("A workspace Spark session is active or has an unknown state; dimension maintenance is blocked.")
+        for key in ("notebook", "monitor_notebook", "measured_notebook", "measured_monitor_notebook"):
+            entry = self.resources.get(key)
+            if entry is None:
+                continue
+            jobs = self.client.pages(f"/v1/workspaces/{ws}/items/{entry['id']}/jobs/instances")
+            if any(not isinstance(job, dict) or job.get("status") not in
+                   ("Completed", "Failed", "Cancelled", "Deduped") for job in jobs):
+                raise Blocked("A recorded notebook job is active or has an unknown state; dimension maintenance is blocked.")
+
+    @_spark_operation
     def run_notebook(self, mode, batch=None, *, synthetic_preparation=None):
         ws = self.resources["workspace"]["id"]
-        notebook_id = self.resources["notebook"]["id"]
+        notebook_id = self.resources[_notebook_key(self.s)]["id"]
         jobs_path = f"/v1/workspaces/{ws}/items/{notebook_id}/jobs/instances"
         jobs = self.client.pages(jobs_path)
         if any(isinstance(job, dict) and job.get("status") in ("NotStarted", "InProgress") for job in jobs):
@@ -1339,13 +1406,14 @@ class Deployment:
         job_id = _job_id(headers.get("location"), ws, notebook_id)
         self.ledger.data["pending"]["job_id"] = job_id
         self.ledger.save()
-        self._poll_notebook_job(job_id, mode, expected, headers.get("retry-after"))
-        return job_id
+        result = self._poll_notebook_job(job_id, mode, expected, headers.get("retry-after"),
+                                         notebook_id=notebook_id)
+        return job_id, result
 
     @_spark_operation
-    def _poll_notebook_job(self, job_id, mode, batch, retry_after=None):
+    def _poll_notebook_job(self, job_id, mode, batch, retry_after=None, *, notebook_id=None):
         ws = self.resources["workspace"]["id"]
-        notebook_id = self.resources["notebook"]["id"]
+        notebook_id = notebook_id or self.resources[_notebook_key(self.s)]["id"]
         job_id = _uuid(job_id, "job ID")
         jobs_path = f"/v1/workspaces/{ws}/notebooks/{notebook_id}/jobs/execute/instances"
         if retry_after is not None:
@@ -1360,9 +1428,11 @@ class Deployment:
                 pending = self.ledger.data["pending"]
                 preparation = pending.get("synthetic_preparation")
                 try:
-                    _verify_notebook_exit(job, mode, batch)
+                    result = _verify_notebook_exit(job, mode, batch)
+                    if mode in ("dimension_gaps", "expand_dimensions"):
+                        _verify_dimension_exit(result, mode, self.s)
                 except Blocked:
-                    if preparation is None:
+                    if preparation is None and mode != "expand_dimensions":
                         self.ledger.finish()
                     raise
                 if preparation is not None:
@@ -1379,8 +1449,11 @@ class Deployment:
                         raise Blocked("The synthetic preload job does not match its preparation intent.")
                     self.resources["synthetic_preparation"] = {**expected, "job_id": job_id}
                 self.ledger.finish()
-                return
+                return result
             if state in ("Failed", "Cancelled", "Deduped"):
+                if mode == "expand_dimensions":
+                    raise Blocked("Dimension maintenance did not complete; inspect the exact job and dimensions "
+                                  "before reconciling its retained intent.")
                 self.ledger.finish()
                 raise Failure(f"The notebook job ended in state {state}.")
             if state not in ("NotStarted", "InProgress"):
@@ -1591,10 +1664,13 @@ def _recover_pending(deployment):
     if (re.fullmatch(r"demo2synthetic-[0-9a-f]{12}", deployment.s["prefix"])
             and pending.get("kind") == "create-item" and not pending.get("operation_id")
             and pending.get("item_type") == "Notebook"
-            and pending.get("key") in ("notebook", "monitor_notebook")):
+            and pending.get("key") in ("notebook", "monitor_notebook", "measured_notebook",
+                                       "measured_monitor_notebook")):
         key = pending["key"]
-        expected = deployment.s["notebook_name" if key == "notebook" else "monitor_notebook_name"]
-        if pending.get("name") != expected or key in deployment.resources:
+        monitor = key.endswith("monitor_notebook")
+        expected = deployment.s[f"{key}_name"]
+        if (key != _notebook_key(deployment.s, monitor=monitor)
+                or pending.get("name") != expected or key in deployment.resources):
             raise Blocked("The interrupted synthetic notebook creation has an ambiguous identity.")
         with _spark_client(deployment.client):
             deployment.verify_target_ownership(expected_pending=pending)
@@ -1602,7 +1678,7 @@ def _recover_pending(deployment):
             deployment.resources[key] = {"id": _uuid(value.get("id"), "Notebook ID"),
                                          "name": expected, "type": "Notebook", "confirmed": True}
             try:
-                if key == "notebook":
+                if not monitor:
                     deployment.notebook(False)
                 else:
                     deployment.monitor_notebook(False)
@@ -1645,9 +1721,14 @@ def _recover_pending(deployment):
             "lakehouse": ("Lakehouse", deployment.s["lakehouse_name"]),
             "notebook": ("Notebook", deployment.s["notebook_name"]),
             "monitor_notebook": ("Notebook", deployment.s["monitor_notebook_name"]),
+            "measured_notebook": ("Notebook", deployment.s["measured_notebook_name"]),
+            "measured_monitor_notebook": ("Notebook", deployment.s["measured_monitor_notebook_name"]),
             "database": ("KQLDatabase", deployment.s["database_name"]),
         }
-        if key not in expected or expected[key] != (kind, name) or key in deployment.resources:
+        if (key not in expected or expected[key] != (kind, name) or key in deployment.resources
+                or (kind == "Notebook" and key != _notebook_key(
+                    deployment.s, monitor=key.endswith("monitor_notebook")
+                ))):
             raise Blocked("The interrupted item creation does not match the requested deployment.")
         scope = _spark_client(deployment.client) if kind == "Notebook" else contextlib.nullcontext()
         with scope:
@@ -1669,10 +1750,14 @@ def _recover_pending(deployment):
     if pending.get("kind") == "notebook-job" and pending.get("job_id"):
         ws = deployment.resources.get("workspace", {}).get("id")
         notebook = pending.get("notebook_id")
-        if not ws or deployment.resources.get("notebook", {}).get("id") != notebook:
+        key = _notebook_key(deployment.s)
+        if not ws or deployment.resources.get(key, {}).get("id") != notebook:
             raise Blocked("The interrupted notebook job does not match the ownership ledger.")
         mode, batch = pending.get("mode"), pending.get("batch")
-        if (mode not in ("preload", "verify_batch") or (mode == "preload" and batch is not None)
+        if (mode not in ("preload", "verify_batch", "dimension_gaps", "expand_dimensions")
+                or (mode != "verify_batch" and batch is not None)
+                or (mode in ("dimension_gaps", "expand_dimensions")
+                    and not deployment.s.get("reuse_synthetic_target"))
                 or (mode == "verify_batch" and (not isinstance(batch, dict)
                     or not isinstance(batch.get("batch_id"), str)
                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", batch["batch_id"])
@@ -1682,8 +1767,11 @@ def _recover_pending(deployment):
             raise Blocked("The interrupted notebook job has invalid mode or batch evidence.")
         with _spark_client(deployment.client):
             deployment.workspace(False)
-            deployment.item("notebook", "Notebook", deployment.s["notebook_name"], False)
-            deployment._poll_notebook_job(pending["job_id"], mode, batch)
+            deployment.item(key, "Notebook", deployment.s[f"{key}_name"], False)
+            job_id = pending["job_id"]
+            result = deployment._poll_notebook_job(job_id, mode, batch, notebook_id=notebook)
+        if mode in ("dimension_gaps", "expand_dimensions"):
+            return {"mode": mode, "job_id": job_id, "result": result}
         return
     raise Blocked("An earlier resource operation has an uncertain outcome; reconcile its ledger before retrying.")
 
@@ -1720,7 +1808,7 @@ def _monitor_duration(track_timeout, max_duration, verification_timeout, *, lega
     return headroom + max_duration + verification_timeout
 
 
-def _monitor_config(settings, selected, *, bind=True):
+def _monitor_config(settings, selected, *, bind=True, require_run=True):
     if selected is not None and "demo-2" not in selected:
         raise Failure("Demo 2 must be included in --selected-demos for monitor operations")
     required = {
@@ -1734,6 +1822,8 @@ def _monitor_config(settings, selected, *, bind=True):
         "data.rows_per_file": settings["rows_per_file"],
         "data.interval_seconds": settings["interval_seconds"],
     }
+    if not require_run:
+        required.pop("data.run_id")
     missing = [key for key, value in required.items() if value is None]
     if missing:
         raise Blocked("Monitor configuration requires " + ", ".join(missing) + ".")
@@ -1745,7 +1835,7 @@ def _monitor_config(settings, selected, *, bind=True):
     if settings["max_duration"] <= (settings["expected_batch_count"] - 1) * settings["interval_seconds"]:
         raise Failure("data.max_duration_seconds must exceed the final scheduled batch offset")
     data = settings["data"]
-    synthetic = settings["prefix"].startswith("demo2synthetic-")
+    synthetic = _synthetic_run(settings)
     if synthetic and bind and selected != {"demo-2"}:
         raise Blocked("Synthetic monitor requires --selected-demos demo-2.")
     producer_config = {
@@ -1780,7 +1870,7 @@ def _monitor_config(settings, selected, *, bind=True):
     return {
         "run_id": settings["data"]["run_id"],
         "producer_root": producer_root,
-        "manifest_uri": f"{producer_root}/{settings['data']['run_id']}/manifest.json",
+        "manifest_uri": (f"{producer_root}/{data['run_id']}/manifest.json" if data["run_id"] else None),
         "sentinel_uri": (f"{ONELAKE}/{settings['shared_workspace_id']}/{settings['shared_lakehouse_id']}"
                          "/Files/preflight/producer-monitor-heartbeat-v1.txt"),
         "duration": duration,
@@ -1865,6 +1955,16 @@ class Monitor:
         else:
             _atomic_json(self.path, self.evidence)
 
+    def _recorded_notebook_key(self, notebook_id, *, monitor=False):
+        role = "monitor_notebook" if monitor else "notebook"
+        keys = (role, f"measured_{role}")
+        matches = [key for key in keys
+                   if isinstance(self.d.resources.get(key), dict)
+                   and self.d.resources[key].get("id") == notebook_id]
+        if len(matches) != 1:
+            raise Blocked("The monitor notebook identity is not uniquely recorded in the ownership ledger.")
+        return matches[0]
+
     def _load_start(self, *, current_run=True, allow_legacy=False, check_binding=True):
         try:
             with self.start_path.open(encoding="utf-8") as stream:
@@ -1888,6 +1988,11 @@ class Monitor:
                         != _monitor_binding(targets, digest, start.get("producer_config"))):
                     raise ValueError
             resources = self.d.resources
+            self._recorded_notebook_key(start.get("monitor_notebook_id"), monitor=True)
+            self._recorded_notebook_key(start.get("verifier_notebook_id"))
+            previous_class = ("bootstrap" if re.fullmatch(
+                r"demo2synthetic_[0-9a-f]{12}", str(start.get("run_id"))
+            ) else "measured")
             valid = (
                 isinstance(start, dict) and type(start.get("contract_version")) is int
                 and start["contract_version"] == 1 and start.get("state") == "submitted"
@@ -1897,8 +2002,6 @@ class Monitor:
                 and start.get("owner_marker") == self.d.marker
                 and start.get("workspace_id") == resources["workspace"]["id"]
                 and start.get("lakehouse_id") == resources["lakehouse"]["id"]
-                and start.get("monitor_notebook_id") == resources["monitor_notebook"]["id"]
-                and start.get("verifier_notebook_id") == resources["notebook"]["id"]
                 and isinstance(start.get("run_id"), str)
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", start["run_id"]) is not None
                 and start.get("manifest_uri") == f"{self.config['producer_root']}/{start['run_id']}/manifest.json"
@@ -1911,7 +2014,7 @@ class Monitor:
                          "max_concurrent_batches", "track_timeout_seconds", "max_duration_seconds"))
                 and isinstance(start.get("producer_config"), dict)
                 and start["producer_config"].get("run_id") == start["run_id"]
-                and start["producer_config"].get("batch_class") == self.config["producer_config"]["batch_class"]
+                and start["producer_config"].get("batch_class") == previous_class
                 and type(start["producer_config"].get("file_count")) is int
                 and start["producer_config"]["file_count"] == start["expected_batch_count"]
                 and all(key in record and key in start and _same_json(record[key], start[key]) for key in fixed)
@@ -2012,11 +2115,17 @@ class Monitor:
             self._check_target()
         self.d.item("lakehouse", "Lakehouse", self.s["lakehouse_name"], False)
         if definitions:
+            if (self._recorded_notebook_key(self.evidence["verifier_notebook_id"]) != _notebook_key(self.s)
+                    or self._recorded_notebook_key(self.evidence["monitor_notebook_id"], monitor=True)
+                    != _notebook_key(self.s, monitor=True)):
+                raise Blocked("The current monitor does not use this run's verifier and controller definitions.")
             self.d.notebook(False)
             self.d.monitor_notebook(False)
         else:
-            self.d.item("notebook", "Notebook", self.s["notebook_name"], False)
-            self.d.item("monitor_notebook", "Notebook", self.s["monitor_notebook_name"], False)
+            verifier = self._recorded_notebook_key(self.evidence["verifier_notebook_id"])
+            monitor = self._recorded_notebook_key(self.evidence["monitor_notebook_id"], monitor=True)
+            self.d.item(verifier, "Notebook", self.s[f"{verifier}_name"], False)
+            self.d.item(monitor, "Notebook", self.s[f"{monitor}_name"], False)
 
     def _check_target(self):
         expected = self.config["target_bindings"]["demo-2"]
@@ -2407,8 +2516,8 @@ class Monitor:
             if status != 404:
                 raise Blocked("A prior monitor state or writer lock already exists for this run; reconcile it first.")
         self.d.monitor_notebook(True)
-        monitor = self.d.resources["monitor_notebook"]["id"]
-        verifier = self.d.resources["notebook"]["id"]
+        monitor = self.d.resources[_notebook_key(self.s, monitor=True)]["id"]
+        verifier = self.d.resources[_notebook_key(self.s)]["id"]
         if replacing_prior:
             self.start_path.unlink()
         if self.start_path.exists():
@@ -2667,22 +2776,43 @@ def _verify_synthetic_preparation(deployment, monitor_config, *, verify_definiti
     _verify_notebook_exit(job, "preload", None)
 
 
+def _reconcile_prior_monitor(deployment, monitor_config):
+    monitor = Monitor(deployment, monitor_config)
+    if monitor.path.exists():
+        monitor._load(current_run=False)
+        monitor._archive_previous()
+    elif deployment.ledger.data.get("monitor_job") is not None or monitor.start_path.exists():
+        raise Blocked("A monitor submission was recorded without its sidecar; reconciliation is required.")
+
+
 def _run(args, settings):
-    synthetic = re.fullmatch(r"demo2synthetic-([0-9a-f]{12})", settings["prefix"])
+    scope = re.fullmatch(r"demo2synthetic-([0-9a-f]{12})", settings["prefix"])
+    synthetic = _synthetic_run(settings)
+    reuse = settings["reuse_synthetic_target"]
     synthetic_modes = {"provision-synthetic", "prepare-synthetic-monitor", "start-synthetic-monitor", "synthetic-monitor-status",
                        "wait-synthetic-monitor"}
     target_checks = {"resolve-target-candidate", "verify-target-ownership"}
-    if synthetic:
+    reuse_modes = {"prepare-measured-monitor", "check-dimension-gaps", "expand-compatible-dimensions",
+                   "validate-only", "start-monitor", "monitor-status", "wait-monitor", "stop-monitor"}
+    if scope:
         if (settings["workspace_name"] != f"{settings['prefix']}-demo2-eventhouse"
                 or settings["table"] != "SyntheticFactSales"):
             raise Failure("Synthetic work requires the reserved workspace and table names.")
         run_id = settings["data"]["run_id"]
-        if run_id != f"demo2synthetic_{synthetic[1]}" and (
-                args.mode not in target_checks or (run_id or "").casefold().startswith("demo2synthetic_")):
-            raise Failure("Synthetic work requires the matching reserved run ID outside ownership checks.")
-        if args.mode not in synthetic_modes | target_checks | {"dry-run", "stop-monitor"}:
-            raise Blocked("Production modes cannot use the reserved synthetic deployment scope.")
-    elif (args.mode in synthetic_modes or settings["prefix"].startswith("demo2synthetic-")
+        if reuse:
+            if synthetic or (run_id or "").casefold().startswith("demo2synthetic_"):
+                raise Blocked("Measured reuse requires a non-synthetic run ID.")
+            if args.mode not in reuse_modes | target_checks | {"dry-run"}:
+                raise Blocked("The existing synthetic target may only be reused through measured-safe modes.")
+        else:
+            if not synthetic and (args.mode not in target_checks
+                                  or (run_id or "").casefold().startswith("demo2synthetic_")):
+                raise Failure("Synthetic work requires the matching reserved run ID outside ownership checks.")
+            if args.mode not in synthetic_modes | target_checks | {"dry-run", "stop-monitor"}:
+                raise Blocked("Production modes cannot use the reserved synthetic deployment scope.")
+    elif (reuse or args.mode in synthetic_modes or args.mode in {
+              "prepare-measured-monitor", "check-dimension-gaps", "expand-compatible-dimensions"}
+          or settings["prefix"].startswith("demo2synthetic-")
           or (settings["data"]["run_id"] or "").casefold().startswith("demo2synthetic_")
           or settings["table"].casefold() == "syntheticfactsales"):
         raise Blocked("Synthetic runs and resources require an isolated synthetic deployment scope.")
@@ -2695,15 +2825,19 @@ def _run(args, settings):
         return _resolve_target_candidate(args, settings)
     if args.mode == "cleanup" and not args.yes:
         raise Failure("cleanup requires --yes; no resources were removed")
+    if args.mode == "expand-compatible-dimensions" and not args.yes:
+        raise Failure("expand-compatible-dimensions requires --yes; no dimensions were changed")
     monitor_mode = {"start-synthetic-monitor": "start-monitor", "synthetic-monitor-status": "monitor-status",
                     "wait-synthetic-monitor": "wait-monitor"}.get(args.mode, args.mode)
-    monitor_config = (_monitor_config(settings, args.selected_demos, bind=monitor_mode != "stop-monitor")
+    preparation_modes = {"prepare-measured-monitor", "check-dimension-gaps", "expand-compatible-dimensions"}
+    monitor_config = (_monitor_config(settings, args.selected_demos, bind=monitor_mode != "stop-monitor",
+                                     require_run=monitor_mode not in preparation_modes)
                       if monitor_mode in ("prepare-synthetic-monitor", "start-monitor", "monitor-status",
-                                          "wait-monitor", "stop-monitor") else None)
+                                          "wait-monitor", "stop-monitor") or monitor_mode in preparation_modes else None)
     if settings["tenant_id"] is None:
         raise Blocked("tenant_id is required to verify the Azure CLI identity safely.")
-    builder = _load_builder() if monitor_mode in ("deploy", "prepare-synthetic-monitor", "start-monitor", "monitor-status", "wait-monitor") else None
-    if monitor_mode in ("prepare-synthetic-monitor", "start-monitor", "monitor-status", "wait-monitor"):
+    builder = _load_builder() if monitor_mode in ("deploy", "prepare-synthetic-monitor", "start-monitor", "monitor-status", "wait-monitor") or monitor_mode in preparation_modes else None
+    if monitor_mode in ("prepare-synthetic-monitor", "start-monitor", "monitor-status", "wait-monitor") or monitor_mode in preparation_modes:
         _load_monitor_builder()
     deadline = Deadline(settings["track_timeout"], label="track")
     if args.mode == "validate-only" and not (args.state_dir / STATE_FILE).exists():
@@ -2717,7 +2851,14 @@ def _run(args, settings):
             deployment.verify_target_ownership()
             return "pass", False, ["Fresh Fabric and KQL readbacks match the recorded Demo 2 ownership; "
                                    "producer permissions and readiness are unverified."]
-        _recover_pending(deployment)
+        recovered = _recover_pending(deployment)
+        if recovered is not None:
+            expected_mode = {"check-dimension-gaps": "dimension_gaps",
+                             "expand-compatible-dimensions": "expand_dimensions"}.get(args.mode)
+            if recovered["mode"] != expected_mode:
+                raise Blocked("A previous dimension-maintenance job was reconciled; rerun the intended command.")
+            return "pass", False, [f"Reconciled dimension job {recovered['job_id']}: "
+                                   f"{json.dumps(recovered['result'], sort_keys=True)}"]
         if args.mode == "provision-synthetic":
             deployment.workspace(True)
             deployment.item("eventhouse", "Eventhouse", settings["eventhouse_name"], True)
@@ -2748,6 +2889,29 @@ def _run(args, settings):
                 _verify_synthetic_preparation(deployment, monitor_config)
             return "pass", False, ["Synthetic dimensions, shortcut and notebook definitions were prepared; "
                                    "producer runtime admission and monitor start are not established."]
+        if args.mode in preparation_modes:
+            database = deployment.verify_target_ownership()
+            if deployment.resources["workspace"]["id"] == settings["shared_workspace_id"]:
+                raise Blocked("Producer staging and the reused Eventhouse must be in distinct workspaces.")
+            deployment.reused_synthetic_target()
+            deployment.item("lakehouse", "Lakehouse", settings["lakehouse_name"], False)
+            deployment.shortcut(deployment.mirror(database), False)
+            with _spark_client(client):
+                _reconcile_prior_monitor(deployment, monitor_config)
+                if args.mode == "prepare-measured-monitor":
+                    deployment.notebook(True)
+                    deployment.monitor_notebook(True)
+                    return "pass", False, ["The prior monitor was reconciled and separate measured notebook "
+                                           "definitions were verified; producer readiness remains unverified."]
+                deployment.notebook(False)
+                if args.mode == "expand-compatible-dimensions":
+                    deployment.ensure_dimension_quiescent()
+                    mode = "expand_dimensions"
+                else:
+                    mode = "dimension_gaps"
+                job_id, result = deployment.run_notebook(mode)
+                return "pass", False, [f"Dimension job {job_id}: {json.dumps(result, sort_keys=True)}; "
+                                       "producer readiness remains unverified."]
         if monitor_config is not None:
             monitor = Monitor(deployment, monitor_config)
             admission_expires_at = None
@@ -2801,7 +2965,9 @@ def main(argv=None):
                                                           "verify-target-ownership", "validate-only", "deploy", "cleanup",
                                                           "start-monitor", "monitor-status", "wait-monitor",
                                                           "stop-monitor", "provision-synthetic", "prepare-synthetic-monitor", "start-synthetic-monitor",
-                                                          "synthetic-monitor-status", "wait-synthetic-monitor"))
+                                                          "synthetic-monitor-status", "wait-synthetic-monitor",
+                                                          "prepare-measured-monitor", "check-dimension-gaps",
+                                                          "expand-compatible-dimensions"))
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True, type=Path)

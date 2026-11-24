@@ -124,6 +124,35 @@ class NotebookBuilderTests(unittest.TestCase):
         runtime = "".join(first["cells"][1]["source"])
         self.assertIn("measured_batches(manifest)", runtime)
 
+    def test_explicit_maintenance_definition_checks_before_and_after_expansion(self):
+        ordinary = build_notebook(self.generator, **self.options)
+        maintenance = build_notebook(self.generator, **self.options, dimension_maintenance=True)
+        self.assertNotIn('MODE == "expand_dimensions"', "".join(ordinary["cells"][1]["source"]))
+        gaps = {"SalesLakehouse.DimDate": 361, "SalesLakehouse.DimProduct": 17,
+                "SalesLakehouse.DimCustomer": 97}
+        results, calls = [], []
+        real_exec = builtins.exec
+
+        def packaged_exec(code, namespace, *args):
+            real_exec(code, namespace, *args)
+            if getattr(code, "co_filename", "") == "<packaged dimension_expansion>":
+                namespace["dimension_gaps"] = lambda *_: gaps if not calls else dict.fromkeys(gaps, 0)
+                namespace["expand_dimensions"] = lambda *_: calls.append("expanded")
+
+        scope = {
+            "spark": types.SimpleNamespace(conf=types.SimpleNamespace(set=lambda *_: None)),
+            "notebookutils": types.SimpleNamespace(
+                notebook=types.SimpleNamespace(exit=lambda value: results.append(json.loads(value)))
+            ),
+        }
+        with mock.patch.dict(sys.modules), mock.patch.object(builtins, "exec", side_effect=packaged_exec):
+            real_exec("".join(maintenance["cells"][0]["source"]), scope)
+            scope["MODE"] = "expand_dimensions"
+            real_exec("".join(maintenance["cells"][1]["source"]), scope)
+        self.assertEqual(calls, ["expanded"])
+        self.assertEqual(results, [{"mode": "expand_dimensions", "status": "verified",
+                                    "missing_before": gaps, "missing_after": dict.fromkeys(gaps, 0)}])
+
     def test_generator_binding_normalizes_only_line_endings(self):
         self.generator.write_bytes(b"first = 1\r\nsecond = 2\rthird = 3\n")
         runtime = "".join(build_notebook(self.generator, **self.options)["cells"][1]["source"])

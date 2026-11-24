@@ -217,16 +217,28 @@ is the `SalesDatabase` KQL database, not the Eventhouse or Lakehouse.
 
 For seed 42 and start date `2026-01-01`, the synthetic dimensions (4 dates,
 3 products, 3 customers) are generated subsets of the normal dimensions
-(365 dates, 20 products, 100 customers). In an explicitly coordinated,
-Lakehouse-bound Spark maintenance job, `dimension_expansion.dimension_gaps`
-checks the three live tables without writing. If compatible and other
-dimension writers are stopped, `expand_dimensions` inserts only missing
-keys, never updates existing rows, and verifies the full result. It is not
-run by deployment, validation, or any monitor command. Measured execution
-still needs the matching verifier definitions, a reconciled monitor
-transition, and fresh producer-runtime authorization for the exact target.
-Keep the retained bootstrap and authorization rows out of measured results
-by filtering to the measured manifest's batch IDs.
+(365 dates, 20 products, 100 customers). Set
+`demo-2.reuse_synthetic_target: true` and supply the original prefix, state
+directory, exact target binding and common producer settings. With a
+coordinated window and other dimension writers stopped:
+
+1. Run `prepare-measured-monitor` with the normal track arguments and
+   `--selected-demos`. It reconciles the recorded old monitor and children,
+   archives their records, and creates separately owned measured verifier and
+   monitor notebooks. It does not start a monitor or establish readiness.
+2. Run `expand-compatible-dimensions --yes` with the same arguments. It checks
+   workspace Spark sessions and owned notebook jobs, validates all three
+   dimensions before inserting missing keys, and verifies the full result.
+   `check-dimension-gaps` is the read-only alternative. No existing row is
+   updated. If a maintenance outcome is uncertain or failed, reconcile its
+   exact journaled job and dimensions before attempting another write.
+
+The measured verifier is bound to the selected dimensions and its monitor
+definition pins the exact owned synthetic target; neither is the old synthetic
+notebook. Measured execution still requires fresh producer-runtime
+authorization and readiness for that target. Keep the retained bootstrap and
+authorization rows out of results by filtering to the measured manifest's
+batch IDs.
 
 The producer uses `SalesLineID` values 1 through the row count in each batch,
 reusing those values across batches and on replay. The fact key is

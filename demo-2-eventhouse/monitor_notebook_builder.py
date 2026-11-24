@@ -10,10 +10,17 @@ from eventhouse_core import identifier
 _HERE = Path(__file__).resolve().parent
 
 
-def build_monitor_notebook(*, workspace_id, lakehouse_id, lakehouse_name):
+def build_monitor_notebook(*, workspace_id, lakehouse_id, lakehouse_name, reused_synthetic_target=None):
     workspace_id = _uuid(workspace_id, "workspace_id")
     lakehouse_id = _uuid(lakehouse_id, "lakehouse_id")
     lakehouse_name = identifier(lakehouse_name, "lakehouse")
+    if reused_synthetic_target is not None:
+        target = reused_synthetic_target
+        if (not isinstance(target, dict) or set(target) != {"workspace_id", "item_id", "fact"}
+                or target["workspace_id"] != workspace_id or target["fact"] != "SyntheticFactSales"
+                or _uuid(target["item_id"], "target item_id") != target["item_id"]):
+            raise ValueError("Measured reuse must pin the exact synthetic target")
+        reused_synthetic_target = dict(target)
     sources = {
         name: base64.b64encode((_HERE / f"{name}.py").read_bytes()).decode("ascii")
         for name in ("eventhouse_core", "lakehouse_validation", "monitor_controller")
@@ -66,7 +73,8 @@ names = [
     "EXPECTED_BATCH_COUNT",
     "VERIFICATION_TIMEOUT_SECONDS", "POLL_INTERVAL_SECONDS", "MAX_CONCURRENT_BATCHES",
 ]
-cfg = settings({{name: globals()[name] for name in names}}, lakehouse_id={lakehouse_id!r})
+cfg = settings({{name: globals()[name] for name in names}}, lakehouse_id={lakehouse_id!r},
+               reused_synthetic_target={reused_synthetic_target!r})
 if cfg["workspace_id"] != {workspace_id!r}:
     raise MonitorError("Verifier and monitor workspaces must match")
 result = Controller(cfg, FabricClient(notebookutils, cfg)).run()

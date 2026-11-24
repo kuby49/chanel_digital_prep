@@ -94,7 +94,7 @@ def _blob_parts(value, name):
     return [_uuid(parts[0], name), _uuid(parts[1], name), *parts[2:]]
 
 
-def settings(parameters, *, lakehouse_id):
+def settings(parameters, *, lakehouse_id, reused_synthetic_target=None):
     run_id = parameters.get("RUN_ID")
     if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
         raise MonitorError("RUN_ID is invalid")
@@ -139,14 +139,29 @@ def settings(parameters, *, lakehouse_id):
     synthetic = run_id.casefold().startswith("demo2synthetic_")
     if synthetic:
         target = targets["demo-2"]
-        if (not re.fullmatch(r"demo2synthetic_[0-9a-f]{12}", run_id)
+        if (reused_synthetic_target is not None
+                or not re.fullmatch(r"demo2synthetic_[0-9a-f]{12}", run_id)
                 or producer_config.get("batch_class") != "bootstrap"
                 or set(targets) != {"demo-2"} or target.get("workspace_id") != workspace_id
                 or target.get("fact") != "SyntheticFactSales" or manifest[0] == workspace_id):
             raise MonitorError("Synthetic monitor must bind an isolated bootstrap target")
-    elif (producer_config.get("batch_class", "measured") != "measured"
-          or any(str(target.get("fact", "")).casefold() == "syntheticfactsales" for target in targets.values())):
-        raise MonitorError("Production monitor requires a measured run and nonsynthetic targets")
+    else:
+        synthetic_targets = [name for name, target in targets.items()
+                             if str(target.get("fact", "")).casefold() == "syntheticfactsales"]
+        if producer_config.get("batch_class", "measured") != "measured":
+            raise MonitorError("Production monitor requires a measured run")
+        if synthetic_targets or reused_synthetic_target is not None:
+            if (synthetic_targets != ["demo-2"] or not isinstance(reused_synthetic_target, dict)
+                    or set(reused_synthetic_target) != {"workspace_id", "item_id", "fact"}
+                    or targets["demo-2"] != reused_synthetic_target
+                    or reused_synthetic_target.get("workspace_id") != workspace_id
+                    or reused_synthetic_target.get("fact") != "SyntheticFactSales"
+                    or manifest[0] == workspace_id):
+                raise MonitorError("Measured reuse requires the notebook's exact isolated synthetic target")
+            for field in ("workspace_id", "item_id"):
+                value = reused_synthetic_target[field]
+                if _uuid(value, field) != value or uuid.UUID(value).int == 0:
+                    raise MonitorError("Measured reuse target identity must be canonical and nonzero")
     binding = hashlib.sha256(_canonical_json({
         "targets": targets, "generator_sha256": generator_sha256, "config": producer_config,
     })).hexdigest()

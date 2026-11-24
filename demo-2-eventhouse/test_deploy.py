@@ -32,6 +32,8 @@ LAKEHOUSE = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 NOTEBOOK = "11111111-1111-4111-8111-111111111111"
 OPERATION = "22222222-2222-4222-8222-222222222222"
 MONITOR_NOTEBOOK = "33333333-3333-4333-8333-333333333333"
+MEASURED_NOTEBOOK = "12121212-1212-4212-8212-121212121212"
+MEASURED_MONITOR_NOTEBOOK = "13131313-1313-4313-8313-131313131313"
 MONITOR_JOB = "44444444-4444-4444-8444-444444444444"
 NEXT_MONITOR_JOB = "99999999-9999-4999-8999-999999999999"
 CHILD_JOB = "55555555-5555-4555-8555-555555555555"
@@ -271,11 +273,11 @@ class FakeFabric:
 
 
 class FakeMonitorBuilder:
-    def build_monitor_notebook(self, *, workspace_id, lakehouse_id, lakehouse_name):
+    def build_monitor_notebook(self, *, workspace_id, lakehouse_id, lakehouse_name, reused_synthetic_target=None):
         result = FakeBuilder().build_notebook(
             ROOT, workspace_id=workspace_id, lakehouse_id=lakehouse_id, lakehouse_name=lakehouse_name,
         )
-        result["cells"][1]["source"] = "run_monitor()"
+        result["cells"][1]["source"] = f"run_monitor({reused_synthetic_target!r})"
         return result
 
 
@@ -397,6 +399,67 @@ class FakeMonitorFabric(FakeFabric):
         raise AssertionError(f"Unexpected storage request: {method} {url}")
 
 
+class FakeMeasuredReuseFabric(FakeMonitorFabric):
+    def __init__(self):
+        super().__init__()
+        self.measured_definitions = {}
+        self.maintenance_jobs = {}
+
+    def pages(self, path):
+        if path == f"/v1/workspaces/{WORKSPACE}/spark/livySessions":
+            return [{"state": "InProgress"}] if "active_spark" in self.flags else []
+        for notebook, jobs in ((MONITOR_NOTEBOOK, self.monitor_jobs),
+                               (MEASURED_NOTEBOOK, self.maintenance_jobs),
+                               (MEASURED_MONITOR_NOTEBOOK, self.monitor_jobs)):
+            if path == f"/v1/workspaces/{WORKSPACE}/items/{notebook}/jobs/instances":
+                return [copy.deepcopy(job) for job in jobs.values() if job["itemId"] == notebook]
+        return super().pages(path)
+
+    def fabric(self, method, path, body=None, allow_missing=False):
+        item_path = f"/v1/workspaces/{WORKSPACE}/items"
+        names = {"Demo2MeasuredValidation": MEASURED_NOTEBOOK,
+                 "Demo2MeasuredMonitor": MEASURED_MONITOR_NOTEBOOK}
+        if method == "POST" and path == item_path and isinstance(body, dict) and body.get("displayName") in names:
+            notebook = names[body["displayName"]]
+            self.calls.append((method, path, copy.deepcopy(body)))
+            self.items[notebook] = self._item(notebook, body["displayName"], "Notebook", body["description"])
+            self.measured_definitions[notebook] = copy.deepcopy(body["definition"])
+            return 201, {}, copy.deepcopy(self.items[notebook])
+        for notebook, definition in self.measured_definitions.items():
+            if method == "POST" and path == f"{item_path}/{notebook}/getDefinition?format=ipynb":
+                self.calls.append((method, path, copy.deepcopy(body)))
+                return 200, {}, {"definition": copy.deepcopy(definition)}
+        execute = f"/v1/workspaces/{WORKSPACE}/notebooks/{MEASURED_NOTEBOOK}/jobs/execute/instances"
+        if method == "POST" and path == execute + "?beta=false":
+            self.calls.append((method, path, copy.deepcopy(body)))
+            mode = next(param["value"] for param in body["parameters"] if param["name"] == "MODE")
+            before = {"SalesLakehouse.DimDate": 361, "SalesLakehouse.DimProduct": 17,
+                      "SalesLakehouse.DimCustomer": 97}
+            result = {"mode": mode, "status": "verified"}
+            if mode == "dimension_gaps":
+                result["missing"] = before
+            else:
+                result.update(missing_before=before, missing_after=dict.fromkeys(before, 0))
+            job_id = str(uuid.UUID(int=500 + len(self.maintenance_jobs)))
+            self.maintenance_jobs[job_id] = {"id": job_id, "itemId": MEASURED_NOTEBOOK,
+                                             "status": "Completed",
+                                             "properties": {"exitValue": json.dumps(result)}}
+            location = f"{deploy.FABRIC}{item_path}/{MEASURED_NOTEBOOK}/jobs/instances/{job_id}"
+            return 202, {"location": location}, None
+        if method == "GET" and path.startswith(execute + "/"):
+            job_id = path.rsplit("/", 1)[-1].split("?", 1)[0]
+            return 200, {}, copy.deepcopy(self.maintenance_jobs[job_id])
+        if MEASURED_MONITOR_NOTEBOOK in path and "jobs/" in path:
+            old_path = path.replace(MEASURED_MONITOR_NOTEBOOK, MONITOR_NOTEBOOK)
+            status, headers, value = super().fabric(method, old_path, body, allow_missing)
+            if method == "POST" and "/jobs/execute/" in path and status == 202:
+                job_id = deploy._job_id(headers["location"], WORKSPACE, MONITOR_NOTEBOOK)
+                self.monitor_jobs[job_id]["itemId"] = MEASURED_MONITOR_NOTEBOOK
+                headers["location"] = headers["location"].replace(MONITOR_NOTEBOOK, MEASURED_MONITOR_NOTEBOOK)
+            return status, headers, value
+        return super().fabric(method, path, body, allow_missing)
+
+
 class DeployTests(unittest.TestCase):
     def test_synthetic_scope_rejects_production_modes_and_cross_use_without_writes(self):
         token = "123456abcdef"
@@ -435,6 +498,121 @@ class DeployTests(unittest.TestCase):
         self.assertEqual((mismatch["status"], mismatch["ready"]), ("blocked", False), mismatch)
         self.assertFalse(self.backend.calls)
 
+    def test_explicit_reuse_transitions_monitor_and_expands_only_compatible_dimensions(self):
+        prefix = "demo2synthetic-123456abcdef"
+        self.backend = FakeMeasuredReuseFabric()
+        self.config["demo-2"]["sales_table"] = "SyntheticFactSales"
+        self.config["shared"].update({
+            "workspace_id": SHARED_WORKSPACE, "staging_lakehouse_id": STAGING_LAKEHOUSE,
+            "identity_id": PRODUCER_IDENTITY, "target_bindings": {
+                "demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"},
+            },
+        })
+        self.config["execution"].update({"track_timeout_seconds": 10, "max_concurrency": 2})
+        self.config["data"].update({"run_id": "demo2synthetic_123456abcdef", "file_count": 2,
+                                    "rows_per_file": 5, "interval_seconds": 30, "max_duration_seconds": 300})
+        for patcher in (
+            mock.patch.object(deploy, "_generator_digest", return_value="a" * 64),
+            mock.patch.object(deploy, "_load_monitor_builder", return_value=FakeMonitorBuilder()),
+            mock.patch.object(deploy, "verify_synthetic_runtime_access",
+                              return_value=deploy._now() + timedelta(minutes=5)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        for mode in ("provision-synthetic", "prepare-synthetic-monitor", "start-synthetic-monitor"):
+            _, result = self.cli(mode, prefix=prefix, selected="demo-2")
+            self.assertEqual((result["status"], result["ready"]), ("pass", False), result)
+        old_start = (self.state / deploy.MONITOR_START_FILE).read_bytes()
+        old = json.loads(old_start)
+        self.backend.monitor_jobs[old["job_id"]]["status"] = "Completed"
+        self.backend.blobs.pop(deploy._lock_uri(old["state_uri"]))
+
+        self.config["demo-2"]["reuse_synthetic_target"] = True
+        self.config["data"].update({
+            "run_id": "customer_demo_20261124_e0c409cc05ef", "date_count": 365,
+            "product_count": 20, "customer_count": 100, "file_count": 1,
+            "rows_per_file": 10, "interval_seconds": 60, "max_duration_seconds": 1800,
+        })
+        self.config["shared"]["target_bindings"]["demo-1"] = {
+            "workspace_id": SHARED_WORKSPACE, "item_id": STAGING_LAKEHOUSE, "fact": "FactSales",
+        }
+        selected = "demo-1,demo-2"
+        _, prepared = self.cli("prepare-measured-monitor", prefix=prefix, selected=selected)
+        self.assertEqual((prepared["status"], prepared["ready"]), ("pass", False), prepared)
+        self.assertEqual((self.state / deploy.MONITOR_START_FILE).read_bytes(), old_start)
+        archived = self.state / f"demo-2-monitor-start.{old['run_id']}.{old['job_id']}.json"
+        self.assertEqual(archived.read_bytes(), old_start)
+        self.assertIn(MEASURED_NOTEBOOK, self.backend.items)
+        self.assertIn(MEASURED_MONITOR_NOTEBOOK, self.backend.items)
+        options = self.builder.calls[-1][1]
+        self.assertEqual((options["data"]["date_count"], options["data"]["product_count"],
+                          options["data"]["customer_count"]), (365, 20, 100))
+        self.assertIsNone(options["synthetic_run_id"])
+        self.assertTrue(options["dimension_maintenance"])
+
+        self.backend.flags.add("active_spark")
+        _, active = self.cli("expand-compatible-dimensions", prefix=prefix, selected=selected, yes=True)
+        self.assertEqual((active["status"], active["ready"]), ("blocked", False), active)
+        self.assertFalse(self.backend.maintenance_jobs)
+        self.backend.flags.remove("active_spark")
+        _, expanded = self.cli("expand-compatible-dimensions", prefix=prefix, selected=selected, yes=True)
+        self.assertEqual((expanded["status"], expanded["ready"]), ("pass", False), expanded)
+        self.assertIn('"missing_after"', expanded["diagnostics"][0])
+        self.assertEqual(len(self.backend.maintenance_jobs), 1)
+
+        _, blocked = self.cli("start-monitor", prefix=prefix, selected=selected)
+        self.assertEqual((blocked["status"], blocked["ready"]), ("blocked", False), blocked)
+        self.assertIn("producer-runtime identity", blocked["diagnostics"][0])
+        with mock.patch.object(deploy, "verify_monitor_readiness", return_value=None):
+            _, running = self.cli("start-monitor", prefix=prefix, selected=selected)
+        self.assertEqual((running["status"], running["ready"]), ("pass", True), running)
+        current = json.loads((self.state / deploy.MONITOR_START_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(current["run_id"], "customer_demo_20261124_e0c409cc05ef")
+        self.assertEqual(current["producer_config"]["batch_class"], "measured")
+        self.assertEqual((current["verifier_notebook_id"], current["monitor_notebook_id"]),
+                         (MEASURED_NOTEBOOK, MEASURED_MONITOR_NOTEBOOK))
+        self.assertEqual(archived.read_bytes(), old_start)
+
+    def test_reuse_flag_cannot_bypass_synthetic_scope(self):
+        self.config["demo-2"].update({"reuse_synthetic_target": True, "sales_table": "SyntheticFactSales"})
+        self.config["data"]["run_id"] = "customer_demo_20261124_e0c409cc05ef"
+        for mode, prefix in (("prepare-measured-monitor", "chanel"),
+                             ("deploy", "demo2synthetic-123456abcdef"),
+                             ("cleanup", "demo2synthetic-123456abcdef")):
+            with self.subTest(mode=mode, prefix=prefix):
+                _, result = self.cli(mode, prefix=prefix, yes=True)
+                self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+        self.config["data"]["run_id"] = "demo2synthetic_123456abcdef"
+        _, synthetic = self.cli("start-synthetic-monitor", prefix="demo2synthetic-123456abcdef")
+        self.assertEqual((synthetic["status"], synthetic["ready"]), ("blocked", False), synthetic)
+        self.config["demo-2"]["reuse_synthetic_target"] = "true"
+        _, invalid = self.cli("dry-run", prefix="demo2synthetic-123456abcdef")
+        self.assertEqual((invalid["status"], invalid["ready"]), ("fail", False), invalid)
+        self.assertFalse(self.backend.calls)
+
+    def test_failed_or_unverified_dimension_write_keeps_its_exact_job_intent(self):
+        self.config["demo-2"].update({"reuse_synthetic_target": True, "sales_table": "SyntheticFactSales"})
+        settings = deploy.validate_config(self.config, "demo2synthetic-123456abcdef")
+        ledger = mock.MagicMock()
+        ledger.data = {"pending": {"kind": "notebook-job", "mode": "expand_dimensions",
+                                   "notebook_id": MEASURED_NOTEBOOK, "batch": None, "job_id": CHILD_JOB},
+                       "owner_marker": "test", "resources": {
+                           "workspace": {"id": WORKSPACE}, "measured_notebook": {"id": MEASURED_NOTEBOOK}}}
+        client = mock.MagicMock()
+        deployment = deploy.Deployment(settings, client, mock.MagicMock(), ledger)
+        for job in (
+            {"id": CHILD_JOB, "itemId": MEASURED_NOTEBOOK, "status": "Failed"},
+            {"id": CHILD_JOB, "itemId": MEASURED_NOTEBOOK, "status": "Completed",
+             "properties": {"exitValue": json.dumps({"mode": "expand_dimensions", "status": "verified"})}},
+        ):
+            with self.subTest(status=job["status"]):
+                client.fabric.return_value = (200, {}, job)
+                with self.assertRaises(deploy.Blocked):
+                    deployment._poll_notebook_job(CHILD_JOB, "expand_dimensions", None)
+                ledger.finish.assert_not_called()
+                self.assertEqual(ledger.data["pending"]["job_id"], CHILD_JOB)
+
     def test_synthetic_status_and_wait_do_not_require_a_fresh_pending_manifest(self):
         prefix = "demo2synthetic-123456abcdef"
         self.config["data"]["run_id"] = "demo2synthetic_123456abcdef"
@@ -449,7 +627,8 @@ class DeployTests(unittest.TestCase):
                 mock.patch.object(deploy, "_load_builder"), mock.patch.object(deploy, "_load_monitor_builder"), \
                 mock.patch.object(deploy, "Ledger"), mock.patch.object(deploy, "FabricClient"), \
                 mock.patch.object(deploy, "Deployment", return_value=deployment), \
-                mock.patch.object(deploy, "_recover_pending"), mock.patch.object(deploy, "Monitor", return_value=monitor), \
+                mock.patch.object(deploy, "_recover_pending", return_value=None), \
+                mock.patch.object(deploy, "Monitor", return_value=monitor), \
                 mock.patch.object(deploy, "verify_synthetic_runtime_access") as admission:
             for mode in ("synthetic-monitor-status", "wait-synthetic-monitor"):
                 with self.subTest(mode=mode):
@@ -474,7 +653,8 @@ class DeployTests(unittest.TestCase):
                 mock.patch.object(deploy, "_load_builder"), mock.patch.object(deploy, "_load_monitor_builder"), \
                 mock.patch.object(deploy, "Ledger"), mock.patch.object(deploy, "FabricClient"), \
                 mock.patch.object(deploy, "Deployment", return_value=deployment), \
-                mock.patch.object(deploy, "_recover_pending"), mock.patch.object(deploy, "Monitor", return_value=monitor), \
+                mock.patch.object(deploy, "_recover_pending", return_value=None), \
+                mock.patch.object(deploy, "Monitor", return_value=monitor), \
                 mock.patch.object(deploy, "_verify_synthetic_preparation"), \
                 mock.patch.object(deploy, "verify_synthetic_runtime_access", side_effect=deploy.Blocked("unverified")):
             args = types.SimpleNamespace(mode="start-synthetic-monitor", selected_demos={"demo-2"},

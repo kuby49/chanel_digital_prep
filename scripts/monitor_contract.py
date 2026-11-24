@@ -70,8 +70,8 @@ def monitor_config(config):
         verification_timeout = config["execution"].get("verification_timeout_seconds")
     if type(verification_timeout) is not int or verification_timeout < 1:
         raise ValueError("Demo 2 verification timeout must be a positive integer")
-    duration = (2 * config["execution"]["track_timeout_seconds"]
-                + config["data"]["max_duration_seconds"] + verification_timeout)
+    duration = (4 * config["execution"]["track_timeout_seconds"]
+                + config["data"]["max_duration_seconds"] + PRODUCER_HEADROOM_SECONDS + verification_timeout)
     try:
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
     except OverflowError as error:

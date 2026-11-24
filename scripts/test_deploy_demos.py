@@ -849,10 +849,10 @@ class OrchestrationTests(unittest.TestCase):
     def test_monitor_uses_default_timeout_when_demo_override_is_null(self):
         self.config["demo-2"] = {"verification_timeout_seconds": None}
         _, duration = deploy.monitor_config(self.config)
-        self.assertEqual(duration, 45)
+        self.assertEqual(duration, 1115)
         self.config["demo-2"]["verification_timeout_seconds"] = 30
         _, duration = deploy.monitor_config(self.config)
-        self.assertEqual(duration, 60)
+        self.assertEqual(duration, 1130)
 
     def test_producer_timeout_includes_validators_and_wrapper_headroom(self):
         self.config["demo-2"] = {"verification_timeout_seconds": 30}

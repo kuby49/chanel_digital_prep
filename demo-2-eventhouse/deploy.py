@@ -9,6 +9,7 @@ import argparse
 import base64
 import contextlib
 import functools
+import hashlib
 import importlib
 import json
 import os
@@ -37,6 +38,7 @@ from eventhouse_core import (
     shortcut_payload,
 )
 from lakehouse_validation import VerificationError, measured_batches
+from reservation_verification import ReservationError, _targets
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -259,6 +261,7 @@ def validate_config(config, prefix):
         "query_endpoint": query_endpoint,
         "expected_location": expected_location,
         "producer_identity": _optional_uuid(shared.get("identity_id"), "shared.identity_id"),
+        "target_bindings": shared.get("target_bindings"),
         "shared_workspace_id": _optional_uuid(shared.get("workspace_id"), "shared.workspace_id"),
         "shared_lakehouse_id": _optional_uuid(shared.get("staging_lakehouse_id"),
                                                "shared.staging_lakehouse_id"),
@@ -1539,7 +1542,22 @@ def _selected_demos(value):
     return set(parts)
 
 
-def _monitor_config(settings, selected):
+def _generator_digest():
+    try:
+        source = (ROOT / "demo-data-generator" / "generator.py").read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise Blocked("The shared generator source cannot be bound to the monitor.") from exc
+    return hashlib.sha256(source.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")).hexdigest()
+
+
+def _monitor_binding(targets, generator_digest, producer_config):
+    value = {"targets": targets, "generator_sha256": generator_digest, "config": producer_config}
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                         allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _monitor_config(settings, selected, *, bind=True):
     if selected is not None and "demo-2" not in selected:
         raise Failure("Demo 2 must be included in --selected-demos for monitor operations")
     required = {
@@ -1577,6 +1595,23 @@ def _monitor_config(settings, selected):
         _now() + timedelta(seconds=duration + settings["track_timeout"])
     except (OverflowError, ValueError) as exc:
         raise Failure("The monitor deadline bound is too large") from exc
+    targets = None
+    generator_digest = None
+    binding_digest = None
+    if bind:
+        try:
+            targets = _targets(settings["target_bindings"])
+        except ReservationError as exc:
+            raise Blocked("Complete independently supplied selected target bindings are required.") from exc
+        if "demo-2" not in targets or (selected is not None and set(targets) != selected):
+            raise Blocked("The target binding map must match every selected demo, including Demo 2.")
+        expected = targets["demo-2"]
+        if (settings["workspace_id"] is not None and expected["workspace_id"] != settings["workspace_id"]
+                or settings["database_id"] is not None and expected["item_id"] != settings["database_id"]
+                or expected["fact"] != settings["table"]):
+            raise Blocked("The Demo 2 target binding conflicts with its configured workspace, database or table.")
+        generator_digest = _generator_digest()
+        binding_digest = _monitor_binding(targets, generator_digest, producer_config)
     return {
         "run_id": settings["data"]["run_id"],
         "producer_root": producer_root,
@@ -1585,6 +1620,9 @@ def _monitor_config(settings, selected):
                          "/Files/preflight/producer-monitor-heartbeat-v1.txt"),
         "duration": duration,
         "producer_config": producer_config,
+        "target_bindings": targets,
+        "generator_sha256": generator_digest,
+        "monitor_binding_sha256": binding_digest,
     }
 
 
@@ -1635,7 +1673,9 @@ class Monitor:
     START_FIXED = IMMUTABLE + ("prefix", "tenant_id", "identity_id", "owner_marker", "sentinel_uri",
                                "duration_seconds", "expected_batch_count", "verification_timeout_seconds",
                                "poll_interval_seconds", "max_concurrent_batches", "track_timeout_seconds",
-                               "max_duration_seconds", "producer_config")
+                               "max_duration_seconds", "producer_config", "target_bindings",
+                               "generator_sha256", "monitor_binding_sha256")
+    BINDING_FIELDS = ("target_bindings", "generator_sha256", "monitor_binding_sha256")
 
     def __init__(self, deployment, config):
         self.d = deployment
@@ -1659,7 +1699,7 @@ class Monitor:
         else:
             _atomic_json(self.path, self.evidence)
 
-    def _load_start(self, *, current_run=True):
+    def _load_start(self, *, current_run=True, allow_legacy=False, check_binding=True):
         try:
             with self.start_path.open(encoding="utf-8") as stream:
                 start = json.load(stream)
@@ -1667,6 +1707,20 @@ class Monitor:
             raise Blocked("The immutable monitor start record is absent or invalid; termination cannot be established.") from exc
         record = self.ledger.data.get("monitor_job")
         try:
+            if not isinstance(start, dict) or not isinstance(record, dict):
+                raise ValueError
+            legacy = not any(key in start for key in self.BINDING_FIELDS)
+            if legacy and (not allow_legacy or any(key in record for key in self.BINDING_FIELDS)):
+                raise ValueError
+            fixed = tuple(key for key in self.START_FIXED if not legacy or key not in self.BINDING_FIELDS)
+            if not legacy:
+                targets = _targets(start.get("target_bindings"))
+                digest = start.get("generator_sha256")
+                if ("demo-2" not in targets or not isinstance(digest, str)
+                        or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+                        or start.get("monitor_binding_sha256")
+                        != _monitor_binding(targets, digest, start.get("producer_config"))):
+                    raise ValueError
             resources = self.d.resources
             valid = (
                 isinstance(start, dict) and type(start.get("contract_version")) is int
@@ -1694,7 +1748,7 @@ class Monitor:
                 and start["producer_config"].get("batch_class") == "measured"
                 and type(start["producer_config"].get("file_count")) is int
                 and start["producer_config"]["file_count"] == start["expected_batch_count"]
-                and all(key in record and _same_json(record[key], start.get(key)) for key in self.START_FIXED)
+                and all(key in record and key in start and _same_json(record[key], start[key]) for key in fixed)
             )
             if (not valid or _uuid(start.get("controller_id"), "controller ID") != start["controller_id"]
                     or _uuid(start.get("job_id"), "owned monitor job ID") != start["job_id"]):
@@ -1721,9 +1775,11 @@ class Monitor:
                 or start.get("track_timeout_seconds") != self.s["track_timeout"]
                 or start.get("max_duration_seconds") != self.s["max_duration"]
                 or not _same_json(start.get("producer_config"), self.config["producer_config"])
+                or (check_binding and any(not _same_json(start.get(key), self.config[key])
+                                          for key in self.BINDING_FIELDS))
             ):
                 raise ValueError
-        except (Blocked, Failure, KeyError, TypeError, ValueError, OverflowError) as exc:
+        except (Blocked, Failure, ReservationError, KeyError, TypeError, ValueError, OverflowError) as exc:
             raise Blocked("The immutable monitor start record and ownership ledger do not match; "
                           "termination cannot be established.") from exc
         if ledger_job is None:
@@ -1783,6 +1839,8 @@ class Monitor:
 
     def _owned(self, *, definitions):
         self.d.workspace(False)
+        if not self.stopping:
+            self._check_target()
         self.d.item("lakehouse", "Lakehouse", self.s["lakehouse_name"], False)
         if definitions:
             self.d.notebook(False)
@@ -1790,6 +1848,13 @@ class Monitor:
         else:
             self.d.item("notebook", "Notebook", self.s["notebook_name"], False)
             self.d.item("monitor_notebook", "Notebook", self.s["monitor_notebook_name"], False)
+
+    def _check_target(self):
+        expected = self.config["target_bindings"]["demo-2"]
+        if (expected["workspace_id"] != self.d.resources["workspace"]["id"]
+                or expected["item_id"] != self.d.resources["database"]["id"]
+                or expected["fact"] != self.s["table"]):
+            raise Blocked("The Demo 2 target binding does not match the recorded owned database and table.")
 
     def _object(self, uri):
         status, headers, value = self.client.onelake("GET", uri, allow_missing=True)
@@ -1916,6 +1981,7 @@ class Monitor:
                 or any(name not in ("demo-1", "demo-2", "demo-3") for name in destinations)
                 or len(destinations) != len(set(destinations))
                 or "demo-2" not in destinations
+                or set(destinations) != set(evidence["target_bindings"])
                 or not _same_json(manifest.get("config"), evidence["producer_config"])):
             raise Blocked("The final producer manifest configuration or destinations do not match this run.")
         try:
@@ -2138,6 +2204,7 @@ class Monitor:
             raise Blocked("A monitor submission was recorded without its sidecar; reconciliation is required.")
 
         self.d.workspace(False)
+        self._check_target()
         self.d.item("lakehouse", "Lakehouse", self.s["lakehouse_name"], False)
         self.d.notebook(False)
         ws = self.d.resources["workspace"]["id"]
@@ -2172,6 +2239,9 @@ class Monitor:
             "max_concurrent_batches": self.s["max_concurrency"],
             "track_timeout_seconds": self.s["track_timeout"], "max_duration_seconds": self.s["max_duration"],
             "producer_config": self.config["producer_config"],
+            "target_bindings": self.config["target_bindings"],
+            "generator_sha256": self.config["generator_sha256"],
+            "monitor_binding_sha256": self.config["monitor_binding_sha256"],
             "cancel_requests": {},
         }
         self.evidence = evidence
@@ -2276,7 +2346,7 @@ class Monitor:
                 self.client.deadline = previous_client
 
     def stop(self):
-        start = self._load_start()
+        start = self._load_start(allow_legacy=True, check_binding=False)
         self.evidence = {**start, "state": "stopping", "cancel_requests": self._journal(start)}
         self.stopping = True
         self._owned(definitions=False)
@@ -2291,7 +2361,7 @@ class Monitor:
                 sidecar = json.load(stream)
             if (not isinstance(sidecar, dict) or type(sidecar.get("contract_version")) is not int
                     or sidecar["contract_version"] != 1
-                    or any(not _same_json(sidecar.get(key), start[key]) for key in self.START_FIXED)
+                    or any(not _same_json(sidecar.get(key), start[key]) for key in self.START_FIXED if key in start)
                     or sidecar.get("job_id") != start["job_id"]):
                 return False
         except (OSError, ValueError):
@@ -2313,15 +2383,56 @@ class MonitorPending(Blocked):
     """The exact monitor instance has not produced readiness evidence yet."""
 
 
+def _resolve_target_candidate(args, settings):
+    ledger = Ledger(args.state_dir, settings)
+    try:
+        with ledger.path.open(encoding="utf-8") as stream:
+            ledger.data = json.load(stream)
+        ledger._validate()
+        resources = ledger.data["resources"]
+        workspace, eventhouse, database, table = (resources[key] for key in
+                                                   ("workspace", "eventhouse", "database", "table"))
+        if (settings["tenant_id"] is None or uuid.UUID(settings["tenant_id"]).int == 0
+                or ledger.data["pending"] is not None
+                or any(not isinstance(item, dict) or item.get("confirmed") is not True
+                       for item in (workspace, eventhouse, database, table))
+                or workspace.get("type") != "Workspace" or workspace.get("name") != settings["workspace_name"]
+                or eventhouse.get("type") != "Eventhouse" or eventhouse.get("name") != settings["eventhouse_name"]
+                or uuid.UUID(eventhouse["id"]).int == 0
+                or database.get("type") != "KQLDatabase" or database.get("name") != settings["database_name"]
+                or database.get("parent_eventhouse_id") != eventhouse["id"]
+                or table.get("database_id") != database["id"] or table.get("name") != settings["table"]
+                or any(settings[key] is not None and settings[key] != item["id"]
+                       for key, item in (("workspace_id", workspace), ("eventhouse_id", eventhouse),
+                                         ("database_id", database)))):
+            raise ValueError
+        target = {"workspace_id": workspace["id"], "item_id": database["id"], "fact": table["name"]}
+        _targets({"demo-2": target})
+    except (OSError, KeyError, TypeError, ValueError, ReservationError) as exc:
+        raise Blocked("A complete, confirmed Demo 2 ownership ledger is required for a target candidate.") from exc
+    candidate = {"contract_version": 1, "track": "demo-2", "tenant_id": settings["tenant_id"],
+                 "prefix": settings["prefix"], "target": target}
+    path = args.result.parent / "demo-2-target-candidate.json"
+    if path.resolve() == args.result.resolve() or path.resolve() == args.config.resolve():
+        raise Failure("The target candidate path conflicts with the result or configuration.")
+    try:
+        _atomic_create_json(path, candidate)
+    except OSError as exc:
+        raise Blocked("The fresh target candidate could not be created without replacing an existing file.") from exc
+    return "pass", False, ["A provisional ownership-ledger target candidate was recorded; live readiness is unverified."]
+
+
 def _run(args, settings):
     if args.mode == "dry-run":
         return "pass", False, [
             f"Offline configuration check only; no deployment or readiness was verified. "
             f"Verification timeout: {settings['timeout']} seconds."
         ]
+    if args.mode == "resolve-target-candidate":
+        return _resolve_target_candidate(args, settings)
     if args.mode == "cleanup" and not args.yes:
         raise Failure("cleanup requires --yes; no resources were removed")
-    monitor_config = (_monitor_config(settings, args.selected_demos)
+    monitor_config = (_monitor_config(settings, args.selected_demos, bind=args.mode != "stop-monitor")
                       if args.mode in ("start-monitor", "monitor-status", "wait-monitor", "stop-monitor") else None)
     if settings["tenant_id"] is None:
         raise Blocked("tenant_id is required to verify the Azure CLI identity safely.")
@@ -2371,7 +2482,7 @@ def _run(args, settings):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", required=True, choices=("dry-run", "validate-only", "deploy", "cleanup",
+    parser.add_argument("--mode", required=True, choices=("dry-run", "resolve-target-candidate", "validate-only", "deploy", "cleanup",
                                                           "start-monitor", "monitor-status", "wait-monitor",
                                                           "stop-monitor"))
     parser.add_argument("--config", required=True, type=Path)

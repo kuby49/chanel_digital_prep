@@ -2,6 +2,7 @@ import base64
 import builtins
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -433,7 +434,16 @@ class DeployTests(unittest.TestCase):
         self.backend = FakeMonitorFabric()
         self.config["shared"].update({"workspace_id": SHARED_WORKSPACE,
                                       "staging_lakehouse_id": STAGING_LAKEHOUSE,
-                                      "identity_id": PRODUCER_IDENTITY})
+                                      "identity_id": PRODUCER_IDENTITY,
+                                      "target_bindings": {
+                                          "demo-1": {"workspace_id": SHARED_WORKSPACE, "item_id": STAGING_LAKEHOUSE,
+                                                     "fact": "FactSales"},
+                                          "demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE,
+                                                     "fact": "FactSales"},
+                                      }})
+        patcher = mock.patch.object(deploy, "_generator_digest", return_value="a" * 64)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.config["data"].update({"file_count": 3, "max_duration_seconds": 120,
                                     "rows_per_file": 2, "interval_seconds": 30})
         self.config["execution"].update({"track_timeout_seconds": 10, "max_concurrency": 2})
@@ -1093,8 +1103,100 @@ class DeployTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["ready"]), ("fail", False), result)
                 self.assertEqual(self.backend.calls, [])
         self.config["data"] = dict(original, interval_seconds=0)
+        self.config["shared"]["target_bindings"] = {
+            "demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "FactSales"}
+        }
         settings = deploy.validate_config(self.config, "chanel")
-        self.assertEqual(deploy._monitor_config(settings, {"demo-2"})["producer_config"]["interval_seconds"], 0)
+        with mock.patch.object(deploy, "_generator_digest", return_value="a" * 64):
+            self.assertEqual(deploy._monitor_config(settings, {"demo-2"})["producer_config"]["interval_seconds"], 0)
+
+    def test_monitor_binds_all_targets_and_generator_and_rejects_changes(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        self.assertEqual(evidence["target_bindings"], self.config["shared"]["target_bindings"])
+        self.assertEqual(evidence["generator_sha256"], "a" * 64)
+        self.assertEqual(evidence["monitor_binding_sha256"], deploy._monitor_binding(
+            evidence["target_bindings"], evidence["generator_sha256"], evidence["producer_config"]))
+        original = copy.deepcopy(self.config["shared"]["target_bindings"])
+        for change in ("other", "missing", "extra"):
+            with self.subTest(change=change):
+                targets = copy.deepcopy(original)
+                if change == "other":
+                    targets["demo-1"]["item_id"] = str(uuid.UUID(int=42))
+                elif change == "missing":
+                    targets.pop("demo-1")
+                else:
+                    targets["demo-3"] = copy.deepcopy(targets["demo-1"])
+                self.config["shared"]["target_bindings"] = targets
+                _, result = self.cli("monitor-status", selected="demo-1,demo-2")
+                self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+        self.config["shared"]["target_bindings"] = original
+        with mock.patch.object(deploy, "_generator_digest", return_value="b" * 64):
+            _, result = self.cli("monitor-status")
+        self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+        _, stopped = self.cli("stop-monitor")
+        self.assertEqual((stopped["status"], stopped["ready"]), ("pass", False), stopped)
+
+    def test_generator_binding_hashes_strict_utf8_with_normalized_newlines(self):
+        source = self.root / "demo-data-generator" / "generator.py"
+        source.parent.mkdir()
+        source.write_bytes(b"first\r\nsecond\rthird\n")
+        with mock.patch.object(deploy, "ROOT", self.root):
+            self.assertEqual(deploy._generator_digest(),
+                             hashlib.sha256(b"first\nsecond\nthird\n").hexdigest())
+            source.write_bytes(b"\xff")
+            with self.assertRaises(deploy.Blocked):
+                deploy._generator_digest()
+
+    def test_candidate_is_local_exclusive_and_never_proves_readiness(self):
+        _, missing = self.cli("resolve-target-candidate")
+        self.assertEqual((missing["status"], missing["ready"]), ("blocked", False))
+        self.deploy_success()
+        self.backend.calls.clear()
+        before = (self.state / deploy.STATE_FILE).read_bytes()
+        _, result = self.cli("resolve-target-candidate")
+        self.assertEqual((result["status"], result["ready"]), ("pass", False), result)
+        path = self.result.parent / "demo-2-target-candidate.json"
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {
+            "contract_version": 1, "track": "demo-2", "tenant_id": TENANT, "prefix": "chanel",
+            "target": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "FactSales"},
+        })
+        self.assertEqual(self.backend.calls, [])
+        self.assertEqual((self.state / deploy.STATE_FILE).read_bytes(), before)
+        _, repeated = self.cli("resolve-target-candidate")
+        self.assertEqual((repeated["status"], repeated["ready"]), ("blocked", False))
+        self.config["demo-2"]["kql_database_id"] = str(uuid.UUID(int=42))
+        path.unlink()
+        _, conflict = self.cli("resolve-target-candidate")
+        self.assertEqual((conflict["status"], conflict["ready"]), ("blocked", False))
+        self.assertFalse(path.exists())
+
+    def test_legacy_monitor_can_be_stopped_but_not_reused(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        paths = [self.state / deploy.MONITOR_START_FILE, self.state / deploy.MONITOR_FILE,
+                 self.state / deploy.STATE_FILE]
+        for path in paths:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            record = data["monitor_job"] if path.name == deploy.STATE_FILE else data
+            for key in deploy.Monitor.BINDING_FIELDS:
+                record.pop(key)
+            path.write_text(json.dumps(data), encoding="utf-8")
+        _, status = self.cli("monitor-status")
+        self.assertEqual((status["status"], status["ready"]), ("blocked", False))
+        _, stopped = self.cli("stop-monitor")
+        self.assertEqual((stopped["status"], stopped["ready"]), ("pass", False), stopped)
+        self.assertEqual(self.backend.monitor_jobs[evidence["job_id"]]["status"], "Cancelled")
+
+    def test_completion_rejects_manifest_with_different_selected_targets(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        self.complete_monitor(evidence)
+        manifest, etag = self.backend.blobs[evidence["manifest_uri"]]
+        manifest["destinations"] = ["demo-2"]
+        self.backend.blobs[evidence["manifest_uri"]] = (manifest, etag)
+        _, result = self.cli("wait-monitor")
+        self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
 
     def test_monitor_start_records_exact_bounded_parameters_and_fresh_proof(self):
         self.monitor_setup()
@@ -1231,7 +1333,7 @@ class DeployTests(unittest.TestCase):
         self.backend.calls.clear()
         with mock.patch.object(self.backend, "fabric", side_effect=eventually_complete), \
                 mock.patch.object(deploy.Deadline, "wait") as wait:
-            _, result = self.cli("wait-monitor", selected="all")
+            _, result = self.cli("wait-monitor", selected="demo-1,demo-2")
         self.assertEqual((result["status"], result["ready"]), ("pass", True), result)
         wait.assert_called_once_with(1)
         self.assertEqual(len(attempts), 2)

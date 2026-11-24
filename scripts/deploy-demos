@@ -19,8 +19,9 @@ import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from scripts.monitor_contract import (demo2_deployment_scope, matching_monitor_identity,
-                                      monitor_binding, monitor_config, monitor_evidence, strict_json)
+from scripts.monitor_contract import (PRODUCER_HEADROOM_SECONDS, demo2_deployment_scope,
+                                      matching_monitor_identity, monitor_binding, monitor_config,
+                                      monitor_evidence, strict_json)
 
 TRACKS = {
     "demo-1": ROOT / "demo-1-materialized-lake-views" / "deploy.py",
@@ -120,7 +121,6 @@ def validate_run_data(config):
 
 
 def producer_timeout(config, selected, track_timeout):
-    verification_timeouts = []
     for track in selected:
         settings = config.get(track) or {}
         timeout = settings.get("verification_timeout_seconds")
@@ -128,8 +128,8 @@ def producer_timeout(config, selected, track_timeout):
             timeout = config["execution"].get("verification_timeout_seconds")
         if type(timeout) is not int or timeout < 1:
             raise ValueError(f"{track} verification timeout must be a positive integer")
-        verification_timeouts.append(timeout)
-    duration = track_timeout + config["data"]["max_duration_seconds"] + max(verification_timeouts)
+    duration = (track_timeout * (2 if "demo-2" in selected else 1)
+                + config["data"]["max_duration_seconds"] + PRODUCER_HEADROOM_SECONDS)
     try:
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
     except OverflowError as error:

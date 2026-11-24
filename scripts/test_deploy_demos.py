@@ -175,6 +175,22 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(all(event["state_dir"] != str(owned) and event["argument_prefix"] == "chanel"
                             for event in events if event["track"] != "demo-2"))
 
+    def test_demo2_monitor_failure_stops_job_in_owned_scope(self):
+        owned = self.root / "demo2-owned"
+        owned.mkdir()
+        self.config["demo-2"] = {
+            "deployment_prefix": "demo2synthetic-123456abcdef",
+            "deployment_state_dir": str(owned),
+        }
+        self.config["behavior"] = {"demo-2:monitor-status": {"status": "blocked", "ready": False}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertNotIn("run-data", summary["phases"])
+        self.assertEqual(summary["phases"]["stop-monitor"]["demo-2"]["status"], "pass")
+        stop = next(event for event in events if event["mode"] == "stop-monitor")
+        self.assertEqual((stop["state_dir"], stop["argument_prefix"], stop["stop_job"]),
+                         (str(owned), "demo2synthetic-123456abcdef", "job-1"))
+
     def test_demo2_scope_requires_both_valid_fields_and_existing_absolute_directory(self):
         for settings in ({"deployment_prefix": "owned"},
                          {"deployment_state_dir": str(self.root)},
@@ -838,10 +854,10 @@ class OrchestrationTests(unittest.TestCase):
         _, duration = deploy.monitor_config(self.config)
         self.assertEqual(duration, 60)
 
-    def test_producer_timeout_includes_run_and_selected_verification(self):
+    def test_producer_timeout_includes_validators_and_wrapper_headroom(self):
         self.config["demo-2"] = {"verification_timeout_seconds": 30}
-        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1"], 10), 35)
-        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1", "demo-2"], 10), 50)
+        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1"], 10), 1070)
+        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1", "demo-2"], 10), 1080)
 
     def test_partial_cleanup_excludes_shared(self):
         code, _, events = self.run_cli("demo-2", "--cleanup", "--yes")

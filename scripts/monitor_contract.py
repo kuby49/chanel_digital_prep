@@ -9,6 +9,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parent.parent
+PRODUCER_HEADROOM_SECONDS = 900 + 120 + 30
 
 
 def strict_json(path):

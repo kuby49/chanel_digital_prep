@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from urllib.parse import parse_qs, urlsplit
 
 from definition_plan import build_refresh_schedule_request
 from fresh_deploy import _persist
@@ -143,12 +144,47 @@ def _record(config, prefix, state_dir, journal):
     return record
 
 
-def _page(client, path):
-    _, body = _object_response(client, path)
-    if (not isinstance(body.get("value"), list) or body.get("continuationToken")
-            or body.get("continuationUri") or any(not isinstance(row, dict) for row in body["value"])):
-        raise CandidateBlocked("Native schedule/job listing is incomplete or paginated.")
-    return body["value"]
+def _page(client, path, *, read=None):
+    read = read or _object_response
+    _, body = read(client, path)
+    rows, seen_tokens, seen_ids = [], set(), set()
+    for _ in range(100):
+        if (not isinstance(body.get("value"), list)
+                or any(not isinstance(row, dict) for row in body["value"])):
+            raise CandidateBlocked("Native schedule/job listing is incomplete.")
+        for row in body["value"]:
+            identifier = row.get("id")
+            if identifier is not None:
+                if not isinstance(identifier, str) or identifier in seen_ids:
+                    raise CandidateBlocked("Native schedule/job listing has duplicate or invalid IDs.")
+                seen_ids.add(identifier)
+            rows.append(row)
+        token, uri = body.get("continuationToken"), body.get("continuationUri")
+        if not token and not uri:
+            return rows
+        if (not isinstance(token, str) or not token or len(token) > 8192
+                or not isinstance(uri, str) or token in seen_tokens
+                or not re.fullmatch(
+                    r"/v1/workspaces/[0-9a-fA-F-]+/lakehouses/[0-9a-fA-F-]+/"
+                    r"jobs/refreshMaterializedLakeViews/(?:instances|schedules)", path)):
+            raise CandidateBlocked("Invalid native schedule/job continuation.")
+        try:
+            parsed = urlsplit(uri)
+            query = parse_qs(parsed.query, strict_parsing=True)
+            host = parsed.hostname or ""
+            if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
+                    or parsed.port is not None or parsed.fragment or parsed.path != path
+                    or not (host == "api.fabric.microsoft.com"
+                            or re.fullmatch(r"wabi-[a-z0-9-]+\.analysis\.windows\.net", host))
+                    or query != {"continuationToken": [token]}):
+                raise ValueError
+        except ValueError:
+            raise CandidateBlocked("Invalid native schedule/job continuation URI.") from None
+        seen_tokens.add(token)
+        status, _, body, readable = client.request("GET", path, continuation_token=token)
+        if status != 200 or not readable or not isinstance(body, dict):
+            raise CandidateBlocked("Native schedule/job continuation could not be read.")
+    raise CandidateBlocked("Native schedule/job listing exceeded the pagination limit.")
 
 
 def check_idle(history, item):

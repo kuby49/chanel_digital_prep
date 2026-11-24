@@ -10,6 +10,7 @@ import re
 import sys
 import time
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from fresh_deploy import (
@@ -65,15 +66,25 @@ class FabricClient:
             raise CandidateBlocked("Fabric polling delay exceeds the provisioning deadline.")
         time.sleep(delay)
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, *, continuation_token=None):
         if not re.fullmatch(r"/v1/[A-Za-z0-9/-]+", path):
             raise ValueError("Invalid Fabric control-plane path")
+        query = ""
+        if continuation_token is not None:
+            if (method != "GET" or body is not None
+                    or not re.fullmatch(
+                        r"/v1/workspaces/[0-9a-fA-F-]+/lakehouses/[0-9a-fA-F-]+/"
+                        r"jobs/refreshMaterializedLakeViews/(?:instances|schedules)", path)
+                    or not isinstance(continuation_token, str) or not continuation_token
+                    or len(continuation_token) > 8192):
+                raise ValueError("Invalid MLV pagination request")
+            query = "?" + urlencode({"continuationToken": continuation_token})
         payload = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json",
                    "x-ms-fabric-skill": "spark-cli"}
         if payload is not None:
             headers["Content-Type"] = "application/json"
-        request = Request(FABRIC_ORIGIN + path, data=payload, headers=headers, method=method)
+        request = Request(FABRIC_ORIGIN + path + query, data=payload, headers=headers, method=method)
         try:
             with self.requester.open(request, timeout=min(45, self.remaining())) as response:
                 status = response.status

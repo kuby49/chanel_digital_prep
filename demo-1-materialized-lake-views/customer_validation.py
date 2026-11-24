@@ -13,7 +13,7 @@ from urllib.request import Request, build_opener
 
 from definition_plan import bootstrap_csv_bytes, render_bronze_sql, render_silver_sql
 from fresh_deploy import verify_readback
-from managed_refresh import check_idle, check_schedule, recurring_run
+from managed_refresh import _page as _mlv_page, check_idle, check_schedule, recurring_run
 from ownership import (
     STATE_FILE, CandidateBlocked, _az_json, _resource, _state_lock, _unique_pairs, _uuid,
 )
@@ -111,6 +111,11 @@ def _sql_readback(endpoint, lakehouse, tenant, principal, data):
 
 
 def _page(client, path):
+    if re.fullmatch(
+        r"/v1/workspaces/[0-9a-fA-F-]+/lakehouses/[0-9a-fA-F-]+/"
+        r"jobs/refreshMaterializedLakeViews/(?:instances|schedules)", path,
+    ):
+        return _mlv_page(client, path, read=_object_response)
     _, body = _object_response(client, path)
     if (not isinstance(body.get("value"), list) or body.get("continuationUri")
             or body.get("continuationToken") or any(not isinstance(row, dict) for row in body["value"])):

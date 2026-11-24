@@ -284,6 +284,14 @@ class TransportTest(unittest.TestCase):
                     self.assertEqual(send.call_args.args[0].full_url, FABRIC_ORIGIN + path)
             with self.assertRaisesRegex(ValueError, "Invalid Fabric"):
                 client.request("GET", WS + "?outside=guard")
+            path = f"{LH}/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances"
+            client.request("GET", path, continuation_token="a+b")
+            sent = send.call_args.args[0]
+            self.assertEqual(sent.full_url, FABRIC_ORIGIN + path + "?continuationToken=a%2Bb")
+            self.assertEqual(sent.get_header("X-ms-fabric-skill"), "spark-cli")
+            for method, unsafe_path in (("GET", WS), ("POST", path)):
+                with self.subTest(method=method, path=unsafe_path), self.assertRaises(ValueError):
+                    client.request(method, unsafe_path, continuation_token="token")
 
     @patch("ownership.shutil.which", return_value="az")
     @patch("ownership.subprocess.run")

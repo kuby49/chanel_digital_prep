@@ -121,6 +121,25 @@ class CustomerValidationTest(unittest.TestCase):
                 validate_customer(self.config, "chanel", self.root)
         self.sql.assert_not_called()
 
+    def test_customer_admission_checks_paginated_jobs_and_schedules(self):
+        root = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews"
+        for suffix, later in (
+            ("instances", {"id": INTENT, "status": "InProgress", "itemId": LAKEHOUSE}),
+            ("schedules", {"id": INTENT, "enabled": True}),
+        ):
+            path = root + "/" + suffix
+            first = ({"id": OWNER, "status": "Completed", "itemId": LAKEHOUSE,
+                      "startTimeUtc": "2026-11-24"} if suffix == "instances"
+                     else {"id": OWNER, "enabled": False})
+            self.overrides = {path: {
+                "value": [first], "continuationToken": "token",
+                "continuationUri": "https://api.fabric.microsoft.com" + path + "?continuationToken=token",
+            }}
+            self.client.return_value.request.return_value = (200, {}, {"value": [later]}, True)
+            with self.subTest(suffix=suffix), self.assertRaises(CandidateBlocked):
+                validate_customer(self.config, "chanel", self.root)
+        self.sql.assert_not_called()
+
     def test_sql_failure_never_reports_readiness(self):
         self.sql.side_effect = CandidateBlocked("Live dimension readback failed")
         with self.assertRaisesRegex(CandidateBlocked, "dimension readback"):
@@ -379,6 +398,53 @@ class SqlReadinessTest(unittest.TestCase):
         self.assertIn("FROM silver.dimcustomer", statements[2])
         self.assertIn("payload_variants IS NULL", statements[-1])
         connection.close.assert_called_once()
+
+
+class MlvPaginationTest(unittest.TestCase):
+    def test_paginated_history_checks_all_pages_for_active_jobs(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances"
+        uri = "https://wabi-west-us3-a-primary-redirect.analysis.windows.net" + path + "?continuationToken=abc%2Bdef"
+        first = {"value": [{"id": OWNER, "status": "Completed", "itemId": LAKEHOUSE}],
+                 "continuationToken": "abc+def", "continuationUri": uri}
+        client = Mock()
+        client.request.return_value = (200, {}, {
+            "value": [{"id": INTENT, "status": "InProgress", "itemId": LAKEHOUSE}]}, True)
+        with patch("managed_refresh._object_response", return_value=({}, first)):
+            rows = managed_refresh._page(client, path)
+        client.request.assert_called_once_with("GET", path, continuation_token="abc+def")
+        with self.assertRaisesRegex(CandidateBlocked, "already active"):
+            managed_refresh.check_idle(rows, LAKEHOUSE)
+
+    def test_rejects_mismatched_malicious_and_repeated_continuations(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/schedules"
+        good = "https://api.fabric.microsoft.com" + path + "?continuationToken=token"
+        for uri in (good.replace("token", "other"), good.replace("api.fabric.microsoft.com", "evil.example"),
+                    good.replace("/schedules", "/instances"), good + "&extra=1",
+                    good.replace("https:", "http:")):
+            with self.subTest(uri=uri), patch("managed_refresh._object_response", return_value=({}, {
+                    "value": [], "continuationToken": "token", "continuationUri": uri})):
+                client = Mock()
+                with self.assertRaises(CandidateBlocked):
+                    managed_refresh._page(client, path)
+                client.request.assert_not_called()
+        page = {"value": [], "continuationToken": "token", "continuationUri": good}
+        client = Mock()
+        client.request.return_value = (200, {}, page, True)
+        with patch("managed_refresh._object_response", return_value=({}, page)):
+            with self.assertRaises(CandidateBlocked):
+                managed_refresh._page(client, path)
+        self.assertEqual(client.request.call_count, 1)
+
+    def test_rejects_failed_page_and_duplicate_ids(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances"
+        page = {"value": [{"id": OWNER}], "continuationToken": "t",
+                "continuationUri": "https://api.fabric.microsoft.com" + path + "?continuationToken=t"}
+        for response in ((500, {}, None, False), (200, {}, {"value": [{"id": OWNER}]}, True)):
+            with self.subTest(response=response), patch("managed_refresh._object_response", return_value=({}, page)):
+                client = Mock()
+                client.request.return_value = response
+                with self.assertRaises(CandidateBlocked):
+                    managed_refresh._page(client, path)
 
 
 if __name__ == "__main__":

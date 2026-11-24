@@ -149,6 +149,13 @@
   "reported_observations": [
     {
       "track": "demo-3",
+      "source": "Shared integration CLI-principal selected-target metadata readback",
+      "recorded_utc": "2026-11-24T02:41:06Z",
+      "candidate_fact_binding": {"workspace_id": "744223de-ceab-4c4f-82ba-f811bcb5c7d7", "item_id": "02fd5f73-32d5-4295-bfb5-c5436e9c3b62", "fact": "dbo.factsales"},
+      "note": "A read-only selected-target helper call using a provisional candidate and the expected MCAP CLI principal matched workspace, generic and typed Lakehouse item, configured same-item landing identity and a single-page OneLake Delta listing with the exact case-sensitive fact and physical path. The full deployment and validate-only workflow was not run live. This point-in-time read does not prove deployment ownership, landing-to-fact linkage, the measured runtime principal's access, complete retained-key inventory or writer quiescence."
+    },
+    {
+      "track": "demo-3",
       "source": "Demo 3 owner",
       "intended_landing_uri": "abfss://744223de-ceab-4c4f-82ba-f811bcb5c7d7@onelake.dfs.fabric.microsoft.com/02fd5f73-32d5-4295-bfb5-c5436e9c3b62/Files/incoming/sales/",
       "connection_id": "c906689d-a8de-48fb-b505-1ac3b4c8a9c5",

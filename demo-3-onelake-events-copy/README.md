@@ -1,14 +1,14 @@
 # Demo 3: OneLake events and Copy
 
-**Status: blocked for the shared run.** An isolated MCAP probe verified a
+**Status: narrowly bound for the one-file customer run.** An isolated MCAP probe verified a
 real OneLake event through Activator, guarded Copy and target verification.
-Its rule is stopped. These run-specific assets are not yet bound to the shared
-producer, and the entry point remains fail-closed; `dry-run` only validates
-the local contract.
+Its rule is stopped. The customer-run assets are bound to the shared producer;
+the explicit preflight below verifies admission, not live delivery.
+General deployment remains fail-closed; `dry-run` only validates the local contract.
 
 ## Contract
 
-`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate,provision-owned,verify-owned} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup and `provision-owned` require `--yes`. A v1 result reports `track: demo-3`; `ready` remains false. Deploy, validation and cleanup currently return `blocked` and make no Fabric requests; cleanup never deletes anything.
+`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate,provision-owned,verify-owned} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup and `provision-owned` require `--yes`. A v1 result reports `track: demo-3`. Deploy, general validation and cleanup return `blocked`; cleanup never deletes anything. Only the explicit customer preflight can return `ready:true`.
 
 `provision-owned` explicitly creates a new workspace and Lakehouse shell, journaling
 each creation intent and confirming live readback; `verify-owned` reads that
@@ -136,6 +136,29 @@ one-file, ten-row customer run `customer_demo_20261124_e0c409cc05ef`. This is a
 small demonstration, not the separate ten-file acceptance run. The existing
 guarded Copy pipeline is reused; enable the rule only after the producer and
 other destinations are ready, then monitor and stop it after the run.
+
+For this exact run only, `validate-only` accepts `demo-3.customer_preflight:true`,
+prefix `chanel`, the original `demo3-customer-binding-state.json` directory,
+and the pinned producer snapshot under `demo3-current-producer/demo-data-generator`
+there. The `demo-3` object must identify the exact workspace, Lakehouse ID/name,
+`destination_table:"dbo.factsales"` and `landing_path:"Files/incoming/sales"`.
+The shared staging and target binding must match the notebook, with USD and a
+positive `data.max_duration_seconds` no greater than 1800.
+
+The read-only preflight checks live owned identities, exact packaged notebook
+and pipeline definitions, connection, original dimension/access proofs, terminal
+owned jobs and absent source/audit/writer lock. It accepts a stopped rule before
+enable or the exact enabled rule after a confirmed journaled enable; stopped,
+failed or uncertain runtime attempts cannot be silently relaunched. It does not
+enable anything or require a future manifest/file, SQL synchronization or live
+delivery. `ready:true` means admission to this bounded customer demonstration
+only, not general deployment or completion of the acceptance run.
+
+The owned SQL endpoint's `dbo.factsales` visibility was restored with one
+targeted `refreshMetadata` call using `recreateTables:false`: SQL subsequently
+returned the three bootstrap facts totaling 116125 minor units. No tables or
+data were recreated. This is a verified point-in-time recovery, not proof that
+automatic SQL synchronization will stay current for the customer batch.
 
 `setup_notebook.py --allow-dimension-expansion` is an explicit insert-only
 option for a quiescent, owned existing target. It validates existing and

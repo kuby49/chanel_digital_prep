@@ -186,7 +186,9 @@ def main(argv=None):
         print("Result path must be absolute", file=sys.stderr)
         return 1
     protected = (args.config, args.state_dir / STATE_FILE, args.state_dir / LOCK_FILE,
-                 args.result.parent / CANDIDATE_FILE)
+                 args.result.parent / CANDIDATE_FILE,
+                 args.state_dir / "demo3-customer-binding-state.json",
+                 args.state_dir / "demo3-staging-access-state.json")
     if args.result.resolve() in {path.resolve() for path in protected}:
         print("Result path conflicts with input, state, or candidate", file=sys.stderr)
         return 1
@@ -216,6 +218,11 @@ def main(argv=None):
             result["diagnostics"].append(
                 "Local ownership candidate only; live identity, access, and readiness are not established."
             )
+        elif args.mode == "validate-only" and config["demo-3"].get("customer_preflight") is True:
+            from customer_preflight import validate
+
+            result["diagnostics"].extend(validate(config, args.prefix, args.state_dir))
+            result.update(status="pass", ready=True)
         elif args.mode in ("provision-owned", "verify-owned"):
             from ownership import FabricControl, provision
 

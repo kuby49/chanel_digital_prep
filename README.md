@@ -25,8 +25,7 @@ owned Copy work or known unresolved ingestion; these point-in-time checks and
 the fence do not exclude uncoordinated writers. Subsequent local runtime
 pagination and bodyless-request fixes were not published to the old notebook.
 They have been read back in a replacement notebook in the new workspace; its
-pipeline defaults to blocked until its new profile and destination access are
-verified.
+pipeline was subsequently rebound to the new profile and read back.
 The replacement pipeline's no-sales diagnostic initially failed before an
 activity started. A controlled comparison changing only its activity timeout
 from an expression to a literal completed the parent and notebook; the notebook
@@ -36,10 +35,19 @@ independently verified, and Demo 3's rebound profile passed a point-in-time
 readiness check against the replacement staging Lakehouse and enabled rule.
 These checks do not establish end-to-end sales delivery. The final producer
 bundle uses a literal timeout covering the native run window plus startup.
+After fresh admission, the replacement pipeline accepted one native run on
+2026-11-24. Its lifecycle entered stopping before production: Demo 1 preparation
+failed with Spark `REQUIRES_SINGLE_PART_NAMESPACE` for its three-part
+namespace. The parent and its linked notebook failed, and the launcher lock was
+retained for reconciliation. Demo 2's manifest had zero batches, its bootstrap
+and monitor jobs were terminal, and its writer lock was absent. Demo 3's owned
+jobs were terminal and its writer lock was absent; event-queue drainage remains
+unverified. No sales delivery is claimed.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
 bounded schedule and updated profile were subsequently confirmed. The
 first-cycle Demo 3 rule was disabled and read back; its second cycle was
-enabled after rebinding the guard to the replacement staging Lakehouse. A requested
+enabled after rebinding the guard to the replacement staging Lakehouse and
+disabled again after the failed run. A requested
 capacity restart was completed after the user accepted interruption of the
 shared capacity, and it was subsequently scaled to F32. The capacity was
 read back Active at F32; the requested live retry remains incomplete.

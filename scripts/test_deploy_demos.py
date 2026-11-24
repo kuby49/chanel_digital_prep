@@ -517,6 +517,26 @@ class OrchestrationTests(unittest.TestCase):
         self.assertNotIn("stop-monitor", summary["phases"])
         self.assertNotIn("run-data", summary["phases"])
 
+    def test_generator_change_after_monitor_start_blocks_producer_and_attempts_stop(self):
+        binding = deploy.monitor_binding
+        calls = 0
+
+        def changed_after_start(config):
+            nonlocal calls
+            calls += 1
+            current = binding(config)
+            if calls == 2:
+                current["generator_sha256"] = "0" * 64
+            return current
+
+        with mock.patch.object(deploy, "monitor_binding", side_effect=changed_after_start):
+            code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertEqual(events[-1]["stop_job"], "job-1")
+        self.assertNotIn("run-data", summary["phases"])
+
     def test_failed_monitor_stop_is_not_hidden(self):
         self.config["behavior"] = {
             "demo-2:start-monitor": {"status": "blocked", "ready": False},
@@ -656,7 +676,7 @@ class OrchestrationTests(unittest.TestCase):
         def unavailable_after_start(config):
             nonlocal calls
             calls += 1
-            if calls == 1:
+            if calls <= 2:
                 return binding(config)
             raise OSError("generator unavailable")
 

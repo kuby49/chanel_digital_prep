@@ -466,13 +466,14 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
         if status["status"] != "pass":
             return phases, False, None
         try:
+            binding = monitor_binding(config)
             record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
                                       config["data"]["run_id"], *monitor_settings, "start", binding)
             current = monitor_evidence(state_dir / "demo-2-monitor.json",
                                        config["data"]["run_id"], *monitor_settings, "running", binding)
             matching_monitor_identity(initial, record)
             matching_monitor_identity(initial, current)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
             phases["monitor-status"] = {"demo-2": result("demo-2", "monitor-status", "fail",
                                                          f"Invalid monitor evidence: {error}")}
             return phases, False, None

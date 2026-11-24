@@ -34,6 +34,8 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from generator import RunConfig, strict_json_loads
+from job_lifecycle import JOURNAL_DIR_NAME, LifecycleBlocked, PipelineJob
+from sales_ids import canonical_bytes
 from target_readback import TargetReadbackBlocked, read_selected_targets, selected_candidates
 
 
@@ -1179,6 +1181,45 @@ def _check_assets(plan):
     return spec
 
 
+def _recover_pipeline(mode, config, plan, state_dir, selected_demos):
+    selected = _validate_run(config, selected_demos)
+    if any(not plan[field] for field in ("tenant_id", "capacity_id", "identity_id")):
+        raise Blocked("Recovery requires the original tenant, capacity and identity; termination unconfirmed.")
+    state = load_owned_state(StateStore(state_dir), plan)
+    if state is None or state.get("pending"):
+        raise Blocked("Owned producer deployment is missing or pending; termination unconfirmed.")
+    resources = state.get("resources", {})
+    if any(kind not in resources for kind in ("workspace", "staging_lakehouse", "pipeline", "notebook")):
+        raise Blocked("Owned producer resource identities are incomplete; termination unconfirmed.")
+    workspace_id = resources["workspace"]["id"]
+    lakehouse_id = resources["staging_lakehouse"]["id"]
+    run_id = config["data"]["run_id"]
+    try:
+        fingerprint = hashlib.sha256(canonical_bytes(config)).hexdigest()
+    except (TypeError, ValueError, UnicodeError):
+        raise ContractError("The original effective configuration is not valid canonical JSON.") from None
+    expected = {"run_id": run_id, "tenant_id": plan["tenant_id"], "prefix": plan["prefix"],
+                "config_sha256": fingerprint, "selected_demos": sorted(selected),
+                "workspace_id": workspace_id, "pipeline_id": resources["pipeline"]["id"],
+                "notebook_id": resources["notebook"]["id"],
+                "manifest_uri": (f"https://onelake.blob.fabric.microsoft.com/{workspace_id}/{lakehouse_id}/"
+                                 f"Files/producer/runs/{run_id}/manifest.json")}
+    job = PipelineJob.recover(state_dir, expected)
+    try:
+        client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
+        principal_type = _workspace_principal(client, state, plan)
+        _verify_item(client, state, plan, "pipeline", principal_type)
+        job.client = client
+        snapshot = job.status_detail()
+    except (FabricHttpError, FabricTransportError) as exc:
+        raise Blocked(f"{exc} Termination unconfirmed.") from None
+    action = ("Cancellation was not requested because job and child provenance are not yet authenticated."
+              if mode == "stop-producer" else "No cancellation was requested.")
+    return [f"Recorded pipeline job {snapshot['job_id']} has live status {snapshot['status']}.",
+            action,
+            "Blocked: notebook-child termination and in-flight delivery reconciliation are unproven; termination unconfirmed."]
+
+
 def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, candidate_path=None):
     plan = parse_config(config, prefix)
     if mode == "cleanup" and not yes:
@@ -1186,6 +1227,14 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
     if mode == "run-data":
         _validate_run(config, selected_demos)
         return ["Blocked: fresh readiness for the shared producer and every selected destination is not implemented; no job was started.", *BLOCKERS]
+    if mode in ("producer-status", "stop-producer"):
+        try:
+            return _recover_pipeline(mode, config, plan, state_dir, selected_demos)
+        except (Blocked, LifecycleBlocked) as exc:
+            message = str(exc)
+            if "termination unconfirmed" not in message.lower():
+                message += " Termination unconfirmed."
+            raise Blocked(message) from None
     if mode == "dry-run":
         return ["Plan only; no resources were changed.",
                 "Plan: verify owned state, tenant, identity, workspace and item readbacks before any reuse.",
@@ -1268,7 +1317,8 @@ class _ArgumentParser(argparse.ArgumentParser):
 def _result_target(args):
     if not Path(args.result).is_absolute():
         raise ContractError("config, state-dir and result must be absolute paths.")
-    config, directory, result = (Path(path).resolve() for path in (args.config, args.state_dir, args.result))
+    paths = tuple(Path(path) for path in (args.config, args.state_dir, args.result))
+    config, directory, result = (path.resolve() for path in paths)
     protected = {config, directory / STATE_NAME, directory / LOCK_NAME}
     protected.update((HERE / name).resolve() for name in (
         "deploy.py", "test_deploy.py", "deployment-mcap.json", "generator.py", "fabric_assets.py",
@@ -1277,7 +1327,10 @@ def _result_target(args):
         "README.md"))
     source_path = result.is_relative_to(HERE) and result.suffix.lower() in (
         ".py", ".ipynb", ".yml", ".yaml", ".md")
-    if (result in protected or source_path or result.name.casefold() in
+    in_job_directory = any(
+        part.casefold() == JOURNAL_DIR_NAME for path in (*paths, config, directory, result) for part in path.parts
+    )
+    if (result in protected or source_path or in_job_directory or result.name.casefold() in
             (STATE_NAME.casefold(), LOCK_NAME.casefold(), CANDIDATE_NAME.casefold())
             or config in (directory / STATE_NAME, directory / LOCK_NAME)):
         raise ContractError("result and state paths must not overwrite config, source files or owned state.")
@@ -1285,8 +1338,12 @@ def _result_target(args):
 
 
 def _envelope(mode, status="blocked", diagnostics=None):
+    entries = list(diagnostics or [])
+    if (mode in ("producer-status", "stop-producer") and status != "pass"
+            and not any("termination unconfirmed" in entry.lower() for entry in entries)):
+        entries.append("Producer termination unconfirmed.")
     return {"contract_version": 1, "track": "shared", "mode": mode, "status": status,
-            "ready": False, "diagnostics": diagnostics or []}
+            "ready": False, "diagnostics": entries}
 
 
 def _raw_options(argv, name):
@@ -1302,22 +1359,21 @@ def _raw_options(argv, name):
 def _write_argument_error(argv, diagnostic):
     modes = _raw_options(argv, "--mode")
     mode = modes[0] if len(modes) == 1 else "unknown"
-    if mode not in ("dry-run", "validate-only", "deploy", "cleanup", "run-data", "resolve-candidate-ids"):
+    if mode not in ("dry-run", "validate-only", "deploy", "cleanup", "run-data", "resolve-candidate-ids",
+                    "producer-status", "stop-producer"):
         mode = "unknown"
     result = _envelope(mode, "fail", [diagnostic])
     targets = _raw_options(argv, "--result")
     configs = _raw_options(argv, "--config")
     state_dirs = _raw_options(argv, "--state-dir")
-    if len(targets) != 1 or len(configs) > 1 or len(state_dirs) > 1:
+    if (len(targets) != 1 or len(configs) != 1 or len(state_dirs) != 1
+            or any(not Path(path).is_absolute() for path in (*targets, *configs, *state_dirs))):
         print(json.dumps(result), file=sys.stderr)
         return
     target = targets[0]
-    config = configs[0] if configs else None
-    state_dir = state_dirs[0] if state_dirs else None
-    if target and Path(target).is_absolute():
+    if target:
         try:
-            candidate = argparse.Namespace(result=target, config=config or str(HERE / "__missing_config__"),
-                                           state_dir=state_dir or str(HERE / "__missing_state__"))
+            candidate = argparse.Namespace(result=target, config=configs[0], state_dir=state_dirs[0])
             _atomic_json(_result_target(candidate), result)
             return
         except (ContractError, OSError):
@@ -1328,7 +1384,8 @@ def _write_argument_error(argv, diagnostic):
 def main(argv=None):
     parser = _ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--mode", required=True, choices=("dry-run", "validate-only", "deploy", "cleanup",
-                                                          "run-data", "resolve-candidate-ids"))
+                                                          "run-data", "resolve-candidate-ids",
+                                                          "producer-status", "stop-producer"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True)
@@ -1354,7 +1411,7 @@ def main(argv=None):
         if candidate_path is not None and candidate_path.resolve() == Path(args.config).resolve():
             raise ContractError("Candidate output must not overwrite the input config.")
         try:
-            config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            config = strict_json_loads(Path(args.config).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
             raise ContractError("Config is unreadable or is not valid JSON.") from None
         diagnostics = perform(args.mode, config, args.prefix, args.state_dir, args.selected_demos, args.yes,
@@ -1363,7 +1420,7 @@ def main(argv=None):
                            diagnostics)
     except ContractError as exc:
         result = _envelope(args.mode, "fail", [str(exc)])
-    except (Blocked, TargetReadbackBlocked) as exc:
+    except (Blocked, TargetReadbackBlocked, LifecycleBlocked) as exc:
         result = _envelope(args.mode, "blocked", [str(exc), *BLOCKERS])
     except (FabricHttpError, FabricTransportError) as exc:
         result = _envelope(args.mode, "fail", [str(exc)])

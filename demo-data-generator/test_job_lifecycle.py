@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import json
 import subprocess
 import sys
@@ -8,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from job_lifecycle import LifecycleBlocked, PipelineJob
+from sales_ids import canonical_bytes
 
 
 WORKSPACE = "11111111-1111-4111-8111-111111111111"
@@ -16,12 +19,18 @@ NOTEBOOK = "33333333-3333-4333-8333-333333333333"
 TENANT = "44444444-4444-4444-8444-444444444444"
 JOB = "55555555-5555-4555-8555-555555555555"
 LOCATION = f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE}/items/{PIPELINE}/jobs/instances/{JOB}"
-PREFLIGHT = {"executionData": {"parameters": {"operation": "preflight"}}}
+CONFIG = {"data": {"run_id": "test-run"}}
+NONCE = "nonce-0123456789abcdef"
+PREFLIGHT = {"executionData": {"parameters": {
+    "operation": "preflight", "probe_id": NONCE, "runtime_evidence_json": "{}",
+    "run_config_json": json.dumps(CONFIG), "selected_demos_json": '["demo-1","demo-2"]',
+}}}
 
 
 def binding():
-    return {"run_id": "test-run", "nonce": "nonce", "tenant_id": TENANT, "prefix": "test",
-            "config_sha256": "a" * 64, "selected_demos": ["demo-1", "demo-2"],
+    return {"run_id": "test-run", "nonce": NONCE, "tenant_id": TENANT, "prefix": "test",
+            "config_sha256": hashlib.sha256(canonical_bytes(CONFIG)).hexdigest(),
+            "selected_demos": ["demo-1", "demo-2"],
             "workspace_id": WORKSPACE, "pipeline_id": PIPELINE, "notebook_id": NOTEBOOK,
             "manifest_uri": "https://example.invalid/manifest",
             "deadline_utc": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
@@ -85,7 +94,7 @@ class LifecycleTests(unittest.TestCase):
             self.job.cancel()
         self.assertEqual(len(self.client.posts), 1)
 
-        other = PipelineJob(self.temp.name, {**self.binding, "run_id": "other"}, self.client)
+        other = PipelineJob(Path(self.temp.name) / "other", self.binding, self.client)
         self.client.post_response = (202, {"Location": LOCATION.replace(PIPELINE, NOTEBOOK)}, None)
         with self.assertRaisesRegex(LifecycleBlocked, "ambiguous"):
             other.submit(PREFLIGHT)
@@ -187,6 +196,36 @@ class LifecycleTests(unittest.TestCase):
             self.job.submit(measured)
         self.assertFalse(self.job.path.exists())
         self.assertEqual(self.client.posts, [])
+
+    def test_preflight_parameters_must_match_journal_binding_before_post(self):
+        mutations = (
+            ("probe_id", "another-probe-0123456789"),
+            ("run_config_json", '{"data":{"run_id":"another-run"}}'),
+            ("run_config_json", '{"data":{"run_id":"test-run"},"seed":1}'),
+            ("run_config_json", '{"data":{"run_id":"test-run","run_id":"test-run"}}'),
+            ("run_config_json", '{"data":{"run_id":"test-run"},"seed":NaN}'),
+            ("selected_demos_json", '["demo-1"]'),
+            ("selected_demos_json", '["demo-1","demo-1","demo-2"]'),
+            ("selected_demos_json", "{bad"),
+            ("runtime_evidence_json", '{"nonce":"wrong"}'),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = copy.deepcopy(PREFLIGHT)
+                payload["executionData"]["parameters"][field] = value
+                with self.assertRaises(LifecycleBlocked):
+                    self.job.submit(payload)
+        self.assertFalse(self.job.path.exists())
+        self.assertEqual(self.client.posts, [])
+
+    def test_status_rechecks_payload_binding_under_its_lock(self):
+        self.job.submit(PREFLIGHT)
+        state = self.state()
+        state.pop("payload_binding_version")
+        self.job.path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(LifecycleBlocked, "not bound"):
+            self.job.status()
+        self.assertEqual(self.client.reads, [])
 
 
 if __name__ == "__main__":

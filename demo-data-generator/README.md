@@ -176,16 +176,23 @@ ambiguous creation. `validate-only` performs readbacks but still reports
 blocked while readiness is incomplete. `cleanup` and `run-data` are blocked;
 the notebook independently refuses `run-data`. No measured run is enabled.
 
-`job_lifecycle.py` contains local, not yet integrated, no-sales preflight
-pipeline job primitives. They persist submission intent before POST and the
-returned pipeline job identity before polling; ambiguous submissions are never
-repeated. Cancellation is journaled before requesting it and targets only
-that recorded job. A process-released lock serializes operations for one run;
-the journal survives launcher failure. Pipeline terminal status **does not**
-prove notebook child termination or reconcile in-flight deliveries. The
-primitives cannot submit `run-data`, do not provide the orchestrator's
-`producer-status` or `stop-producer` modes, and do not establish readiness.
-Windows power-loss durability is not established.
+`job_lifecycle.py` contains local no-sales preflight pipeline job primitives.
+They check the effective config hash, selected demos and probe ID against the
+run binding, then persist the payload hash and submission intent before POST.
+The returned pipeline job identity is persisted before polling; ambiguous
+submissions are never repeated. A process-released lock serializes operations
+for one run. Legacy unbound journals cannot authorize recovery. Windows
+power-loss durability is not established.
+
+`producer-status` and `stop-producer` require the original effective config and
+`--selected-demos`. When journal and producer resource binding checks succeed,
+they read the recorded no-sales preflight parent pipeline job's current status.
+Both return `blocked` and `ready: false`; `stop-producer` does **not** request
+cancellation because authenticated job and child provenance are not
+established. A terminal parent status does not prove child termination or
+reconcile in-flight deliveries, and neither mode authorizes stopping the
+independent monitor. The low-level cancellation primitive is not wired to
+these CLI modes. The primitives cannot submit `run-data` or establish readiness.
 
 The experimental notebook preflight accepts `runtime_evidence_json` separately
 from `run_config_json`, so its `effective_config_sha256` covers the latter's

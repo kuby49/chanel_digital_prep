@@ -142,6 +142,14 @@ source-schema declaration. Dry-run is local-only; other entry-point modes
 remain blocked and do not perform cloud operations. The bootstrap test was
 performed separately, not by this entry point.
 
+The orchestrator supplies a stable prefix/tenant-scoped `--state-dir`, a
+distinct per-invocation `--result` path, and an outer lock. Future deploy,
+validate, and cleanup implementations must retain ownership and recovery state
+in that stable directory across invocations and must not automatically discard
+unresolved stale state. The current entry point does not create, read, or
+remove state files; no Demo 1 state filename or legacy state format has been
+defined yet.
+
 No presenter walkthrough can be executed until the blocker is resolved and
 artifacts are deployed. Once available, use Lakehouse lineage and refresh
 history for the walkthrough. Cleanup must target only recorded demo-owned

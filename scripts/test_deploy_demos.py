@@ -29,9 +29,9 @@ track = TRACK
 behavior = config.get('behavior', {}).get(track + ':' + a.mode, {})
 start_path = pathlib.Path(a.state_dir) / 'demo-2-monitor-start.json'
 stop_job = json.loads(start_path.read_text())['job_id'] if a.mode == 'stop-monitor' and start_path.exists() else None
-event_path = pathlib.Path(a.state_dir) / ('event-' + str(time.time_ns()) + '-' + track + '-' + a.mode + '.json')
+event_path = pathlib.Path(a.result).parent / ('event-' + str(time.time_ns()) + '-' + track + '-' + a.mode + '.json')
 event_path.write_text(json.dumps({'track': track, 'mode': a.mode, 'yes': a.yes, 'selected': a.selected_demos,
-                                  'stop_job': stop_job}))
+                                  'stop_job': stop_job, 'state_dir': a.state_dir}))
 if behavior.get('delay'):
     time.sleep(behavior['delay'])
 if behavior.get('omit_result'):
@@ -81,6 +81,7 @@ class OrchestrationTests(unittest.TestCase):
             deploy.TRACKS[track] = script
         self.config = {
             "contract_version": 1, "prefix": "chanel",
+            "tenant_id": "33333333-3333-4333-8333-333333333333",
             "execution": {"max_concurrency": 4, "track_timeout_seconds": 10,
                           "verification_timeout_seconds": 15},
             "data": {"run_id": "run-1", "file_count": 2, "rows_per_file": 2,
@@ -96,7 +97,10 @@ class OrchestrationTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = deploy.main([*args, "--config", str(config_path),
                                 "--state-dir", str(self.root / "state")])
-        states = list((self.root / "state").glob("run-*")) if (self.root / "state").exists() else []
+        state_root = self.root / "state"
+        states = ([run for scoped in state_root.iterdir() if scoped.is_dir()
+                   for run in (scoped / "runs").glob("run-*") if (run / "summary.json").exists()]
+                  if state_root.exists() else [])
         latest = max(states, key=lambda state: (state / "summary.json").stat().st_mtime_ns) if states else None
         summary = json.loads((latest / "summary.json").read_text()) if latest else None
         events = [json.loads(path.read_text()) for path in sorted(latest.glob("event-*.json"))] if latest else []
@@ -107,6 +111,66 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(set(summary["phases"]["deploy"]), {"demo-1", "demo-3", "shared"})
         self.assertEqual({event["mode"] for event in events}, {"deploy"})
+
+    def test_reruns_reuse_durable_state_but_not_results(self):
+        code, _, first = self.run_cli("demo-1", "--deploy")
+        self.assertEqual(code, 0)
+        state_dir = Path(first[0]["state_dir"])
+        marker = state_dir / "shared-producer-v1.json"
+        marker.write_text('{"owned":"original"}', encoding="utf-8")
+        code, _, second = self.run_cli("demo-1", "--validate-only")
+        self.assertEqual(code, 0)
+        self.assertEqual({event["state_dir"] for event in first + second}, {str(state_dir)})
+        self.assertEqual(json.loads(marker.read_text()), {"owned": "original"})
+        self.assertEqual(len(list((state_dir / "runs").glob("run-*"))), 2)
+
+    def test_different_tenants_use_separate_state(self):
+        code, _, first = self.run_cli("demo-1", "--deploy")
+        self.assertEqual(code, 0)
+        self.config["tenant_id"] = "44444444-4444-4444-8444-444444444444"
+        code, _, second = self.run_cli("demo-1", "--deploy")
+        self.assertEqual(code, 0)
+        self.assertNotEqual(first[0]["state_dir"], second[0]["state_dir"])
+
+    def test_existing_orchestrator_lock_blocks_without_clearing_it(self):
+        state = self.root / "state" / ("chanel-" + self.config["tenant_id"])
+        state.mkdir(parents=True)
+        lock = state / ".orchestrator-v1.lock"
+        lock.write_text("other-owner", encoding="utf-8")
+        code, _, events = self.run_cli("demo-1", "--deploy")
+        self.assertEqual(code, 1)
+        self.assertEqual(events, [])
+        self.assertEqual(lock.read_text(), "other-owner")
+
+    def test_lock_excludes_other_invocations_and_releases(self):
+        state = self.root / "lock-test"
+        state.mkdir()
+        lock = state / ".orchestrator-v1.lock"
+        with deploy.deployment_lock(state):
+            self.assertTrue(lock.exists())
+            with self.assertRaisesRegex(ValueError, "locked"):
+                with deploy.deployment_lock(state):
+                    self.fail("overlapping invocation acquired the lock")
+        self.assertFalse(lock.exists())
+
+    def test_replaced_lock_is_not_removed(self):
+        state = self.root / "lock-test"
+        state.mkdir()
+        lock = state / ".orchestrator-v1.lock"
+        with self.assertRaisesRegex(ValueError, "lock changed"):
+            with deploy.deployment_lock(state):
+                lock.write_text("other-owner", encoding="utf-8")
+        self.assertEqual(lock.read_text(), "other-owner")
+
+    def test_legacy_journal_blocks_without_adoption(self):
+        legacy = self.root / "state" / "run-legacy"
+        legacy.mkdir(parents=True)
+        journal = legacy / "shared-producer-v1.json"
+        journal.write_text('{"unverified":true}', encoding="utf-8")
+        code, _, events = self.run_cli("demo-1", "--deploy")
+        self.assertEqual(code, 2)
+        self.assertEqual(events, [])
+        self.assertEqual(json.loads(journal.read_text()), {"unverified": True})
 
     def test_parallel_tracks_obey_concurrency_bound(self):
         guard = threading.Lock()
@@ -126,7 +190,7 @@ class OrchestrationTests(unittest.TestCase):
 
         with mock.patch.object(deploy, "invoke", side_effect=fake_invoke):
             outcomes = deploy.run_phase(list(deploy.TRACKS), "dry-run", self.root / "config",
-                                        "chanel", self.root, 10, ["demo-1"], 2, False)
+                                        "chanel", self.root, self.root, 10, ["demo-1"], 2, False)
         self.assertEqual(len(outcomes), 4)
         self.assertEqual(peak, 2)
 

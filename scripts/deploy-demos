@@ -3,9 +3,11 @@
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -22,6 +24,9 @@ TRACKS = {
     "shared": ROOT / "demo-data-generator" / "deploy.py",
 }
 STATUSES = {"pass", "fail", "blocked"}
+LEGACY_STATE = {"shared-producer-v1.json", ".shared-producer-v1.lock",
+                "demo-1-state.json", "demo-2-state.json", "demo-3-state.json",
+                "demo-2-monitor-start.json", "demo-2-monitor.json", "demo-2.lock"}
 
 
 def parse_selector(value):
@@ -93,10 +98,10 @@ def producer_timeout(config, selected, track_timeout):
     return duration
 
 
-def invoke(track, mode, config_path, prefix, state_dir, timeout, selected, yes=False):
+def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout, selected, yes=False):
     script = TRACKS[track]
-    result_path = state_dir / f"{track}-{mode}.json"
-    log_path = state_dir / f"{track}-{mode}.log"
+    result_path = invocation_dir / f"{track}-{mode}.json"
+    log_path = invocation_dir / f"{track}-{mode}.log"
     if not script.is_file():
         return result(track, mode, "blocked", f"Missing entry point: {script}")
     args = [sys.executable, str(script), "--mode", mode, "--config", str(config_path),
@@ -136,12 +141,47 @@ def invoke(track, mode, config_path, prefix, state_dir, timeout, selected, yes=F
         return result(track, mode, "fail", f"Invalid or missing result ({error}); inspect {log_path}")
 
 
-def run_phase(tracks, mode, config_path, prefix, state_dir, timeout, selected, concurrency, yes):
+def run_phase(tracks, mode, config_path, prefix, state_dir, invocation_dir, timeout, selected, concurrency, yes):
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {track: executor.submit(invoke, track, mode, config_path, prefix,
-                                          state_dir, timeout, selected, yes)
+                                          state_dir, invocation_dir, timeout, selected, yes)
                    for track in tracks}
         return {track: future.result() for track, future in futures.items()}
+
+
+def check_legacy_state(root):
+    candidates = [root]
+    candidates.extend(path for path in root.glob("run-*") if path.is_dir())
+    for directory in candidates:
+        for name in LEGACY_STATE:
+            path = directory / name
+            if path.exists():
+                raise ValueError(f"Legacy deployment state found at {path}; reconcile ownership and "
+                                 "move it into the scoped directory only after review")
+
+
+@contextlib.contextmanager
+def deployment_lock(state_dir):
+    path = state_dir / ".orchestrator-v1.lock"
+    nonce = uuid.uuid4().hex
+    try:
+        with path.open("x", encoding="utf-8") as file:
+            file.write(nonce)
+            file.flush()
+            os.fsync(file.fileno())
+    except FileExistsError as error:
+        raise ValueError(f"Deployment state is locked: {path}; reconcile before retrying") from error
+    except OSError as error:
+        raise ValueError(f"Cannot persist deployment lock at {path}; reconcile before retrying: {error}") from error
+    try:
+        yield
+    finally:
+        try:
+            if path.read_text(encoding="utf-8") != nonce:
+                raise ValueError(f"Deployment lock changed at {path}; reconciliation required")
+            path.unlink()
+        except OSError as error:
+            raise ValueError(f"Cannot release deployment lock at {path}; reconciliation required: {error}") from error
 
 
 def monitor_config(config):
@@ -206,7 +246,7 @@ def matching_monitor_identity(first, second):
             raise ValueError(f"monitor {key} does not match the start record")
 
 
-def stop_monitor(initial, config_path, prefix, state_dir, timeout, selected):
+def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeout, selected):
     try:
         if initial is not None:
             with (state_dir / "demo-2-monitor-start.json").open(encoding="utf-8") as file:
@@ -215,15 +255,15 @@ def stop_monitor(initial, config_path, prefix, state_dir, timeout, selected):
     except (OSError, ValueError, TypeError, KeyError) as error:
         return result("demo-2", "stop-monitor", "fail",
                       f"Start record changed or is unreadable; termination unconfirmed: {error}")
-    return invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, timeout, selected)
+    return invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, invocation_dir, timeout, selected)
 
 
-def start_monitor(config, config_path, prefix, state_dir, timeout, selected, monitor_settings):
+def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeout, selected, monitor_settings):
     phases = {}
     started = False
     initial = None
     try:
-        start = invoke("demo-2", "start-monitor", config_path, prefix, state_dir, timeout, selected)
+        start = invoke("demo-2", "start-monitor", config_path, prefix, state_dir, invocation_dir, timeout, selected)
         phases["start-monitor"] = {"demo-2": start}
         if start["status"] != "pass":
             return phases, False, None
@@ -237,7 +277,7 @@ def start_monitor(config, config_path, prefix, state_dir, timeout, selected, mon
             phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "fail",
                                                         f"Invalid monitor evidence: {error}")}
             return phases, False, None
-        status = invoke("demo-2", "monitor-status", config_path, prefix, state_dir, timeout, selected)
+        status = invoke("demo-2", "monitor-status", config_path, prefix, state_dir, invocation_dir, timeout, selected)
         phases["monitor-status"] = {"demo-2": status}
         if status["status"] != "pass":
             return phases, False, None
@@ -257,13 +297,13 @@ def start_monitor(config, config_path, prefix, state_dir, timeout, selected, mon
     finally:
         if not started:
             phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
-                                                               state_dir, timeout, selected)}
+                                                               state_dir, invocation_dir, timeout, selected)}
 
 
-def wait_monitor(initial, config, config_path, prefix, state_dir, timeout, selected, monitor_settings):
+def wait_monitor(initial, config, config_path, prefix, state_dir, invocation_dir, timeout, selected, monitor_settings):
     deadline = datetime.datetime.fromisoformat(initial["deadline_utc"].replace("Z", "+00:00"))
     remaining = max(0, math.ceil((deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
-    outcome = invoke("demo-2", "wait-monitor", config_path, prefix, state_dir,
+    outcome = invoke("demo-2", "wait-monitor", config_path, prefix, state_dir, invocation_dir,
                      remaining + timeout, selected)
     phases = {"wait-monitor": {"demo-2": outcome}}
     if outcome["status"] == "pass":
@@ -279,7 +319,7 @@ def wait_monitor(initial, config, config_path, prefix, state_dir, timeout, selec
                                                        f"Invalid terminal monitor evidence: {error}")}
     if phases["wait-monitor"]["demo-2"]["status"] != "pass":
         phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
-                                                          state_dir, timeout, selected)}
+                                                          state_dir, invocation_dir, timeout, selected)}
     return phases
 
 
@@ -306,6 +346,10 @@ def main(argv=None):
         prefix = args.prefix or config.get("prefix")
         if not isinstance(prefix, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", prefix):
             raise ValueError("prefix must contain only lowercase letters, digits and hyphens, beginning with a letter or digit")
+        try:
+            tenant_id = str(uuid.UUID(config["tenant_id"]))
+        except (KeyError, ValueError, TypeError, AttributeError) as error:
+            raise ValueError("tenant_id must be a UUID") from error
         execution = config["execution"]
         concurrency = args.concurrency if args.concurrency is not None else execution.get("max_concurrency")
         timeout = execution.get("track_timeout_seconds")
@@ -319,36 +363,49 @@ def main(argv=None):
             monitor_settings = monitor_config(config) if "demo-2" in args.selector else None
         state_root = args.state_dir.resolve()
         state_root.mkdir(parents=True, exist_ok=True)
-        state_dir = Path(tempfile.mkdtemp(prefix="run-", dir=state_root))
+        if args.mode != "dry-run":
+            check_legacy_state(state_root)
+        state_dir = state_root / f"{prefix}-{tenant_id}"
+        state_dir.mkdir(parents=True, exist_ok=True)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
-    tracks = args.selector + (["shared"] if args.mode != "cleanup" or len(args.selector) == 3 else [])
-    phases = {args.mode: run_phase(tracks, args.mode, config_path, prefix, state_dir,
-                                   timeout, args.selector, concurrency, args.yes)}
-    if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
-        phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix, state_dir,
-                                             timeout, args.selector, concurrency, False)
-        if all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values()):
-            monitor_ready = True
-            if "demo-2" in args.selector:
-                monitor_phases, monitor_ready, monitor_initial = start_monitor(
-                    config, config_path, prefix, state_dir, timeout, args.selector, monitor_settings)
-                phases.update(monitor_phases)
-            if monitor_ready:
-                phases["run-data"] = {"shared": invoke("shared", "run-data", config_path, prefix,
-                                                        state_dir, run_timeout, args.selector)}
-                if phases["run-data"]["shared"]["status"] != "pass":
-                    print("Producer outcome is not confirmed; inspect remote job state. "
-                          "A local failure or timeout does not prove termination.", file=sys.stderr)
-                elif "demo-2" in args.selector:
-                    phases.update(wait_monitor(monitor_initial, config, config_path, prefix, state_dir,
-                                               timeout, args.selector, monitor_settings))
+    try:
+        with deployment_lock(state_dir):
+            runs_dir = state_dir / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            invocation_dir = Path(tempfile.mkdtemp(prefix="run-", dir=runs_dir))
+            tracks = args.selector + (["shared"] if args.mode != "cleanup" or len(args.selector) == 3 else [])
+            phases = {args.mode: run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
+                                           timeout, args.selector, concurrency, args.yes)}
+            if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
+                phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix,
+                                                     state_dir, invocation_dir, timeout,
+                                                     args.selector, concurrency, False)
+                if all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values()):
+                    monitor_ready = True
+                    if "demo-2" in args.selector:
+                        monitor_phases, monitor_ready, monitor_initial = start_monitor(
+                            config, config_path, prefix, state_dir, invocation_dir,
+                            timeout, args.selector, monitor_settings)
+                        phases.update(monitor_phases)
+                    if monitor_ready:
+                        phases["run-data"] = {"shared": invoke("shared", "run-data", config_path, prefix,
+                                                                state_dir, invocation_dir, run_timeout, args.selector)}
+                        if phases["run-data"]["shared"]["status"] != "pass":
+                            print("Producer outcome is not confirmed; inspect remote job state. "
+                                  "A local failure or timeout does not prove termination.", file=sys.stderr)
+                        elif "demo-2" in args.selector:
+                            phases.update(wait_monitor(monitor_initial, config, config_path, prefix, state_dir,
+                                                       invocation_dir, timeout, args.selector, monitor_settings))
+    except (OSError, ValueError) as error:
+        print(f"Orchestration error: {error}", file=sys.stderr)
+        return 1
     summary = {"contract_version": 1, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                "selected_demos": args.selector, "prefix": prefix, "phases": phases}
-    (state_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (invocation_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
-    print(f"State directory: {state_dir}", file=sys.stderr)
+    print(f"Deployment state: {state_dir}; invocation: {invocation_dir}", file=sys.stderr)
     success = all(item["status"] == "pass" for phase in phases.values() for item in phase.values())
     if args.run_data and "run-data" not in phases:
         print("Producer not started: deployment, readiness or monitor checks did not pass.", file=sys.stderr)

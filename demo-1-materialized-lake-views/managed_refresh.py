@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from definition_plan import build_refresh_schedule_request
 from fresh_deploy import _persist
@@ -178,20 +178,25 @@ def _page(client, path, *, read=None):
                 seen_ids.add(identifier)
             rows.append(row)
         token, uri = body.get("continuationToken"), body.get("continuationUri")
-        if not token and not uri:
+        if token in (None, "") and uri in (None, ""):
             return rows
         if (not isinstance(token, str) or not token or len(token) > 8192
-                or not isinstance(uri, str) or token in seen_tokens
+                or not isinstance(uri, str) or len(uri) > 25000
                 or not re.fullmatch(
                     r"/v1/workspaces/[0-9a-fA-F-]+/lakehouses/[0-9a-fA-F-]+/"
                     r"jobs/refreshMaterializedLakeViews/(?:instances|schedules)", path)):
             raise CandidateBlocked("Invalid native schedule/job continuation.")
         try:
+            if re.search(r"%(?![0-9a-fA-F]{2})", token + " " + uri) or re.search(r"[\x00-\x20\x7f]", uri):
+                raise ValueError
+            token = unquote(token, errors="strict")
+            if token in seen_tokens or re.search(r"[%\x00-\x20\x7f]", token):
+                raise ValueError
             parsed = urlsplit(uri)
-            query = parse_qs(parsed.query, strict_parsing=True)
+            query = parse_qs(parsed.query, strict_parsing=True, errors="strict", max_num_fields=1)
             host = parsed.hostname or ""
-            if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
-                    or parsed.port is not None or parsed.fragment or parsed.path != path
+            if (parsed.scheme != "https" or parsed.netloc.lower() != host
+                    or parsed.fragment or parsed.path != path
                     or not (host == "api.fabric.microsoft.com"
                             or re.fullmatch(r"wabi-[a-z0-9-]+\.analysis\.windows\.net", host))
                     or query != {"continuationToken": [token]}):

@@ -481,6 +481,36 @@ class MlvPaginationTest(unittest.TestCase):
         with self.assertRaisesRegex(CandidateBlocked, "already active"):
             managed_refresh.check_idle(rows, LAKEHOUSE)
 
+    def test_decodes_raw_or_encoded_top_level_token_once(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/schedules"
+        origin = "https://api.fabric.microsoft.com"
+        uri = origin + path + "?continuationToken=a%2Bb%3D"
+        for token in ("a+b=", "a%2bb%3d"):
+            client = Mock()
+            client.request.return_value = (200, {}, {"value": [{"id": OWNER}]}, True)
+            with self.subTest(token=token), patch("managed_refresh._object_response", return_value=({}, {
+                    "value": [], "continuationToken": token, "continuationUri": uri})):
+                self.assertEqual(managed_refresh._page(client, path), [{"id": OWNER}])
+            client.request.assert_called_once_with("GET", path, continuation_token="a+b=")
+
+        for token, query in (("x%ZZ", "x%25ZZ"), ("x%FF", "x%FF"), ("x%253D", "x%253D"),
+                             ("x=", "x%3D&continuationToken=x%3D")):
+            client = Mock()
+            with self.subTest(token=token, query=query), patch("managed_refresh._object_response", return_value=({}, {
+                    "value": [], "continuationToken": token,
+                    "continuationUri": origin + path + "?continuationToken=" + query})):
+                with self.assertRaises(CandidateBlocked):
+                    managed_refresh._page(client, path)
+            client.request.assert_not_called()
+
+        first = {"value": [], "continuationToken": "a+b=", "continuationUri": uri}
+        client = Mock()
+        client.request.return_value = (200, {}, {**first, "continuationToken": "a%2Bb%3D"}, True)
+        with patch("managed_refresh._object_response", return_value=({}, first)):
+            with self.assertRaises(CandidateBlocked):
+                managed_refresh._page(client, path)
+        client.request.assert_called_once_with("GET", path, continuation_token="a+b=")
+
     def test_rejects_mismatched_malicious_and_repeated_continuations(self):
         path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/schedules"
         good = "https://api.fabric.microsoft.com" + path + "?continuationToken=token"

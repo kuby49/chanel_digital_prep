@@ -10,12 +10,13 @@ from unittest import mock
 
 import deploy
 from job_lifecycle import PipelineJob
-from sales_ids import canonical_bytes
+from generator import canonical_bytes
 from test_deploy import (LAKEHOUSE, NOTEBOOK, PIPELINE, WORKSPACE, ReadbackClient,
                          config, owned_state, run_data)
 
 
 JOB = "99999999-9999-4999-8999-999999999999"
+CHILD = "88888888-8888-4888-8888-888888888888"
 
 
 class SubmitClient:
@@ -30,19 +31,29 @@ class RecoveryClient(ReadbackClient):
         self.pipeline_status = "InProgress"
         self.returned_job_id = JOB
         self.posts = []
+        self.activities = {"value": [], "continuationToken": None}
+        self.child = {"id": CHILD, "itemId": NOTEBOOK, "jobType": "PipelineRunNotebook",
+                      "status": "InProgress"}
 
     def get(self, path, deadline=None):
         if "/jobs/instances/" in path:
             self.calls.append(("GET", path))
-            return {}, {"id": self.returned_job_id, "itemId": PIPELINE, "status": self.pipeline_status}
+            if path == f"/v1/workspaces/{WORKSPACE}/items/{NOTEBOOK}/jobs/instances/{CHILD}":
+                return {}, self.child
+            now = datetime.now(timezone.utc)
+            return {}, {"id": self.returned_job_id, "itemId": PIPELINE, "jobType": "Pipeline",
+                        "status": self.pipeline_status, "startTimeUtc": (now - timedelta(minutes=1)).isoformat(),
+                        "endTimeUtc": now.isoformat()}
         if path == f"/v1/workspaces/{WORKSPACE}":
             self.calls.append(("GET", path))
             return {}, copy.deepcopy(self.workspace)
         return super().get(path, deadline)
 
-    def request(self, *args, **kwargs):
-        self.posts.append((args, kwargs))
-        raise AssertionError("Recovery must not issue a POST")
+    def request(self, method, path, payload, timeout):
+        if (method, path) == ("POST", f"/v1/workspaces/{WORKSPACE}/datapipelines/pipelineruns/{JOB}/queryactivityruns"):
+            return 200, {}, self.activities
+        self.posts.append((method, path))
+        raise AssertionError("Recovery must not issue a mutating POST")
 
 
 class RecoveryCLITests(unittest.TestCase):
@@ -79,7 +90,8 @@ class RecoveryCLITests(unittest.TestCase):
         self.job.path.write_text(json.dumps(value), encoding="utf-8")
 
     def invoke(self, mode, document=None, selected="demo-1,demo-2"):
-        with (mock.patch.object(deploy, "azure_cli_token", return_value="token") as auth,
+        with (mock.patch.object(deploy, "STOP_CHILD_WAIT_SECONDS", 0.01),
+              mock.patch.object(deploy, "azure_cli_token", return_value="token") as auth,
               mock.patch.object(deploy, "FabricClient", return_value=self.service)):
             result = deploy.perform(mode, document or self.document, "sample", str(self.state_dir), selected)
         return result, auth
@@ -99,6 +111,38 @@ class RecoveryCLITests(unittest.TestCase):
         self.assertTrue(any("Cancellation was not requested" in entry for entry in diagnostics))
         self.assertTrue(any("termination unconfirmed" in entry for entry in diagnostics))
         self.assertEqual(self.service.posts, [])
+
+    def test_terminal_parent_can_have_a_linked_active_notebook(self):
+        self.service.pipeline_status = "Cancelled"
+        self.service.activities["value"] = [{
+            "pipelineRunId": JOB, "activityRunId": CHILD, "activityName": "RunProducer",
+            "activityType": "TridentNotebook",
+            "input": {"workspaceId": WORKSPACE, "notebookId": NOTEBOOK},
+            "output": {"result": {"runId": CHILD, "sessionId": JOB}},
+        }]
+        diagnostics, _ = self.invoke("stop-producer")
+        self.assertTrue(any(f"Linked notebook job {CHILD} has live status InProgress." in item
+                            and "wait expired" in item for item in diagnostics))
+        self.assertTrue(any("termination unconfirmed" in entry for entry in diagnostics))
+        self.assertEqual(self.service.posts, [])
+
+        self.service.child["status"] = "Completed"
+        diagnostics, _ = self.invoke("stop-producer")
+        self.assertIn(f"Linked notebook job {CHILD} has live status Completed.", diagnostics)
+        self.assertIn("Blocked: in-flight delivery reconciliation is unproven; producer termination unconfirmed.",
+                      diagnostics)
+        self.assertEqual(self.service.posts, [])
+
+        self.service.activities["continuationToken"] = "next"
+        self.service.calls.clear()
+        diagnostics, _ = self.invoke("stop-producer")
+        self.assertIn("one unambiguous producer activity", diagnostics[1])
+        self.assertFalse(any(path.endswith(CHILD) for _, path in self.service.calls))
+
+        self.service.activities["continuationToken"] = None
+        self.service.child["itemId"] = PIPELINE
+        diagnostics, _ = self.invoke("producer-status")
+        self.assertIn("scheduler did not confirm", diagnostics[1])
 
     def test_config_selection_and_manifest_mismatch_block_before_auth(self):
         changed = copy.deepcopy(self.document)

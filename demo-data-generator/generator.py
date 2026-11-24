@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -48,17 +49,9 @@ class RunConfig:
             raise ValueError("interval_seconds must be a nonnegative integer")
         if self.products > 2147483647 or self.customers > 2147483647:
             raise ValueError("dimension IDs exceed INT")
-        if self.file_count * self.rows_per_file > MAX_SALES_LINE_ID:
-            raise ValueError("sales line IDs exceed BIGINT")
+        if self.rows_per_file > MAX_SALES_LINE_ID:
+            raise ValueError("batch sales line IDs exceed BIGINT")
         date.fromisoformat(self.start_date) + timedelta(days=self.date_count - 1)
-
-
-def sales_line_id_range(config):
-    config.validate()
-    count = config.file_count * config.rows_per_file
-    digest = hashlib.sha256(b"chanel-sales-line-id-v1\0" + config.run_id.encode("ascii")).digest()
-    start = int.from_bytes(digest, "big") % (MAX_SALES_LINE_ID - count + 1) + 1
-    return start, start + count - 1
 
 
 def _source_sha256(source):
@@ -96,6 +89,31 @@ def strict_json_loads(value):
     return json.loads(value, object_pairs_hook=_unique_pairs, parse_constant=_invalid_constant)
 
 
+def canonical_bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
+
+
+def canonical_uuid(value):
+    try:
+        parsed = uuid.UUID(value)
+        return bool(parsed.int) and str(parsed) == value
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def validate_fabric_targets(targets):
+    if not isinstance(targets, dict) or not targets or any(
+        name not in ("demo-1", "demo-2", "demo-3")
+        or not isinstance(target, dict) or set(target) != {"workspace_id", "item_id", "fact"}
+        or not canonical_uuid(target["workspace_id"]) or not canonical_uuid(target["item_id"])
+        or not isinstance(target["fact"], str)
+        or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,255}", target["fact"])
+        for name, target in targets.items()
+    ):
+        raise ValueError("Invalid Fabric target binding")
+
+
 def dimensions(config):
     config.validate()
     start = date.fromisoformat(config.start_date)
@@ -126,7 +144,6 @@ def batch_bytes(config, batch_number):
     writer = csv.writer(output, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
     writer.writerow(HEADER)
     first = (batch_number - 1) * config.rows_per_file
-    first_sales_line_id, _ = sales_line_id_range(config)
     start = date.fromisoformat(config.start_date)
     total = 0
     by_date, by_category, by_region = {}, {}, {}
@@ -142,7 +159,7 @@ def batch_bytes(config, batch_number):
         price = int.from_bytes(digest[8:16], "big") % 99901 + 100
         amount = quantity * price
         timestamp = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc) + timedelta(seconds=index % 86400)
-        writer.writerow((first_sales_line_id + index, batch_id, timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        writer.writerow((offset + 1, batch_id, timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
                          customer, product, day.isoformat(), quantity, price, amount))
         total += amount
         for groups, key in ((by_date, day.isoformat()),
@@ -158,8 +175,6 @@ def batch_bytes(config, batch_number):
 
 
 def batch_metadata_matches(entry, expected):
-    from sales_ids import canonical_bytes
-
     return (isinstance(entry, dict)
             and canonical_bytes({name: entry.get(name) for name in expected}) == canonical_bytes(expected))
 
@@ -179,41 +194,34 @@ def _atomic_json(path, value):
             os.unlink(name)
 
 
-def new_manifest(config, destinations, reservation):
+def new_manifest(config, destinations):
     config.validate()
     if not destinations or len(set(destinations)) != len(destinations) or any(
         name not in ("demo-1", "demo-2", "demo-3") for name in destinations
     ):
         raise ValueError("select distinct demo destinations")
-    if not isinstance(reservation, dict):
-        raise ValueError("a durable SalesLineID reservation is required")
     return {"contract_version": 1, "run_id": config.run_id, "config": asdict(config),
-            "destinations": sorted(destinations), "sales_line_id_reservation": dict(reservation), "batches": {}}
+            "destinations": sorted(destinations), "generator_sha256": generator_source_sha256(), "batches": {}}
+
+
+def validate_run_manifest(manifest, expected):
+    if isinstance(manifest, dict) and "sales_line_id_reservation" in manifest:
+        raise ValueError("existing run uses legacy SalesLineIDs; use a new run ID")
+    identity = {key: value for key, value in expected.items() if key != "batches"}
+    if not batch_metadata_matches(manifest, identity) or not isinstance(manifest.get("batches"), dict):
+        raise ValueError("existing run identity, generator, configuration or destinations differ; use a new run ID")
 
 
 def initialize_run(root, config, destinations):
     """Create or validate a run manifest; callers must serialize access."""
-    from sales_ids import canonical_bytes, local_reservation
-
-    config.validate()
+    expected = new_manifest(config, destinations)
     run_root = Path(root) / config.run_id
     manifest_path = run_root / "manifest.json"
-    exists = manifest_path.exists()
-    if exists:
+    if manifest_path.exists():
         manifest = strict_json_loads(manifest_path.read_text(encoding="utf-8"))
-        if (not isinstance(manifest, dict) or type(manifest.get("contract_version")) is not int
-                or manifest["contract_version"] != 1 or manifest.get("run_id") != config.run_id
-                or canonical_bytes(manifest.get("config")) != canonical_bytes(asdict(config))
-                or manifest.get("destinations") != sorted(destinations)
-                or not isinstance(manifest.get("batches"), dict)):
-            raise ValueError("existing run configuration or destinations differ; use a new run ID")
+        validate_run_manifest(manifest, expected)
     elif run_root.exists() and any(path.name != ".producer.lock" for path in run_root.iterdir()):
         raise RuntimeError("run contains untracked files; manual recovery required")
-    reservation = local_reservation(root, config, destinations, require_existing=exists, require_new=not exists)
-    expected = new_manifest(config, destinations, reservation)
-    if exists:
-        if canonical_bytes(manifest.get("sales_line_id_reservation")) != canonical_bytes(reservation):
-            raise RuntimeError("run manifest reservation differs from the allocator")
     else:
         run_root.mkdir(parents=True, exist_ok=True)
         manifest = expected

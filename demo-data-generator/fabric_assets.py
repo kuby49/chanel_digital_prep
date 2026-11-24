@@ -9,8 +9,9 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 PRODUCER_MODULES = (
-    "generator.py", "delivery.py", "runner.py", "fabric_storage.py", "sales_ids.py",
+    "generator.py", "delivery.py", "runner.py", "fabric_storage.py",
     "fabric_ledger.py", "fabric_delivery.py", "fabric_runner.py", "fabric_runtime.py",
+    "synthetic_fixture.py", "target_readback.py",
 )
 
 
@@ -35,13 +36,15 @@ def _definition(content, part_path, format_name=None):
 
 
 def _bundle_cell():
-    files = {name: (HERE / name).read_bytes() for name in PRODUCER_MODULES}
+    files = {name: (HERE / name).read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+             for name in PRODUCER_MODULES}
     eventhouse = HERE.parent / "demo-2-eventhouse"
     peer_files = [eventhouse / "ingestion.py", eventhouse / "eventhouse_core.py"]
     if any(path.exists() for path in peer_files):
         if not all(path.is_file() for path in peer_files):
             raise ValueError("Both Eventhouse adapter modules are required")
-        files.update({path.name: path.read_bytes() for path in peer_files})
+        files.update({path.name: path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                      for path in peer_files})
     encoded = {name: base64.b64encode(content).decode("ascii") for name, content in files.items()}
     source = [
         "import base64 as _bundle_base64\n",

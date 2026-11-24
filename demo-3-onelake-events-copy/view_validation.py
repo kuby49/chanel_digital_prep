@@ -1,6 +1,23 @@
-"""Verify Spark's persisted amount-view definition without weakening its source."""
+"""Validate persisted Spark artifacts before Demo 3 ingestion."""
 
 import re
+
+
+def validate_copy_protocol(detail):
+    if isinstance(detail, dict):
+        reader, writer = detail.get("minReaderVersion"), detail.get("minWriterVersion")
+        if type(reader) is int and type(writer) is int:
+            if (reader, writer) == (1, 2):
+                return
+            features = detail.get("tableFeatures")
+            properties = detail.get("properties")
+            if ((reader, writer) == (3, 7) and isinstance(features, list)
+                    and len(features) == 2 and all(isinstance(item, str) for item in features)
+                    and set(features) == {"deletionVectors", "invariants"}
+                    and isinstance(properties, dict)
+                    and properties.get("delta.enableDeletionVectors") == "false"):
+                return
+    raise RuntimeError("FactSales Delta protocol is not compatible with the verified Copy connector")
 
 
 def matches_amount_view(ddl, query, view_reference, table_reference):

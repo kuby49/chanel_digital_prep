@@ -7,12 +7,11 @@ from fabric_runner import run_fabric_batches
 from fabric_storage import StorageOutcomeUnknown
 from generator import RunConfig
 from runner import Submission
-from test_fabric_ledger import MemoryStore, TEST_SCOPE, TEST_TARGETS, initialized_store
+from test_fabric_ledger import MemoryStore, TEST_TARGETS
 
 
 def run_with_scope(store, config, adapters, max_duration_seconds, max_attempts, **kwargs):
     return run_fabric_batches(store, config, adapters, max_duration_seconds, max_attempts,
-                              allocator_scope=TEST_SCOPE,
                               selected_targets={name: TEST_TARGETS[name] for name in adapters}, **kwargs)
 
 
@@ -80,7 +79,7 @@ class EventhouseAdapter(Adapter):
 
 class FabricRunnerTests(unittest.TestCase):
     def test_deadline_cadence_and_uncertain_submission_are_persisted(self):
-        store, clock = initialized_store(), FakeClock()
+        store, clock = MemoryStore(), FakeClock()
         good, uncertain = Adapter(clock), Adapter(clock, uncertain=True)
         config = RunConfig("timed", file_count=3, rows_per_file=2, interval_seconds=60)
         result = run_with_scope(store, config, {"demo-1": good, "demo-2": uncertain}, 125, 2,
@@ -101,7 +100,7 @@ class FabricRunnerTests(unittest.TestCase):
         self.assertEqual(scheduler["finished_at_utc"], clock.now.isoformat())
 
     def test_fully_verified_file_run_succeeds(self):
-        store, clock = initialized_store(), FakeClock()
+        store, clock = MemoryStore(), FakeClock()
         good = Adapter(clock)
         config = RunConfig("ok", file_count=2, rows_per_file=2, interval_seconds=1)
         result = run_with_scope(store, config, {"demo-1": good}, 10, 1,
@@ -116,6 +115,58 @@ class FabricRunnerTests(unittest.TestCase):
         self.assertEqual(delivery["submission_status"], "submitted")
         self.assertTrue(delivery["submission_result_at_utc"])
 
+    def test_cooperative_stop_during_interval_prevents_next_batch(self):
+        store, clock = MemoryStore(), FakeClock()
+        good = Adapter(clock)
+        config = RunConfig("stopped", file_count=2, rows_per_file=2, interval_seconds=60)
+        stop_at = clock.now + timedelta(seconds=5)
+        result = run_with_scope(store, config, {"demo-1": good}, 90, 1,
+                                clock=clock.clock, sleep=clock.sleep,
+                                stop_requested=lambda: clock.now >= stop_at)
+        self.assertFalse(result["verified"])
+        self.assertIn("stop requested", result["errors"][0])
+        self.assertEqual(len(good.calls), 1)
+        self.assertEqual(clock.now, stop_at)
+        raw, _ = store.read("Files/producer/runs/stopped/manifest.json")
+        manifest = json.loads(raw)
+        self.assertEqual(set(manifest["batches"]), {"1"})
+        self.assertEqual(manifest["scheduler"]["status"], "failed")
+
+    def test_stop_after_submission_leaves_delivery_for_reconciliation(self):
+        store, clock = MemoryStore(), FakeClock()
+        flag = [False]
+
+        class StopDuringSubmit(Adapter):
+            def submit(self, *args):
+                result = super().submit(*args)
+                flag[0] = True
+                return result
+
+        first, second = StopDuringSubmit(clock), Adapter(clock)
+        config = RunConfig("stop-inflight", file_count=1, rows_per_file=1)
+        result = run_with_scope(store, config, {"demo-1": first, "demo-3": second}, 10, 1,
+                                clock=clock.clock, sleep=clock.sleep,
+                                stop_requested=lambda: flag[0])
+        self.assertFalse(result["verified"])
+        self.assertEqual((len(first.calls), len(second.calls)), (1, 0))
+        raw, _ = store.read("Files/producer/runs/stop-inflight/manifest.json")
+        deliveries = json.loads(raw)["batches"]["1"]["deliveries"]
+        self.assertEqual(deliveries["demo-1"]["status"], "submitted")
+        self.assertEqual(deliveries["demo-3"]["status"], "pending")
+        self.assertTrue(any("demo-1 batch 1: submitted" in error for error in result["errors"]))
+
+    def test_stop_check_failure_prevents_submission(self):
+        store, clock = MemoryStore(), FakeClock()
+        adapter = Adapter(clock)
+
+        def unavailable():
+            raise RuntimeError("stop state unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "stop state unavailable"):
+            run_with_scope(store, RunConfig("stop-unavailable", file_count=1), {"demo-1": adapter}, 10, 1,
+                           clock=clock.clock, sleep=clock.sleep, stop_requested=unavailable)
+        self.assertEqual(adapter.calls, [])
+
     def test_unknown_manifest_write_does_not_repeat_the_state_transition(self):
         class LostResponseStore(MemoryStore):
             def replace(self, path, data, etag):
@@ -124,7 +175,7 @@ class FabricRunnerTests(unittest.TestCase):
                     raise StorageOutcomeUnknown("response lost after commit")
                 return result
 
-        store, clock = initialized_store(LostResponseStore()), FakeClock()
+        store, clock = LostResponseStore(), FakeClock()
         good = Adapter(clock)
         config = RunConfig("lost", file_count=1, rows_per_file=1)
         with self.assertRaises(StorageOutcomeUnknown):
@@ -144,7 +195,7 @@ class FabricRunnerTests(unittest.TestCase):
         ]
         for status, error_code, matched, verified, final_status, queries in cases:
             with self.subTest(status=status, error_code=error_code, matched=matched):
-                store, clock = initialized_store(), FakeClock()
+                store, clock = MemoryStore(), FakeClock()
                 adapter = EventhouseAdapter(clock, status, error_code, matched=matched)
                 config = RunConfig("eventhouse", file_count=1, rows_per_file=2)
                 result = run_with_scope(store, config, {"demo-2": adapter}, 2, 1,
@@ -159,7 +210,7 @@ class FabricRunnerTests(unittest.TestCase):
                 self.assertEqual(delivery["ingestion_outcome"]["source_id"], adapter.source_id)
 
     def test_eventhouse_rejects_mismatched_status_source(self):
-        store, clock = initialized_store(), FakeClock()
+        store, clock = MemoryStore(), FakeClock()
         adapter = EventhouseAdapter(clock, "succeeded", source_id="9eebc93c-a700-4f87-91b7-a1471c389aa2")
         config = RunConfig("wrong-source", file_count=1, rows_per_file=1)
         result = run_with_scope(store, config, {"demo-2": adapter}, 2, 1,
@@ -186,7 +237,7 @@ class FabricRunnerTests(unittest.TestCase):
                 return SimpleNamespace(status="verified", row_count=row_count, total_minor_units=total,
                                        distinct_sales_line_ids=row_count, diagnostic=None)
 
-        store, clock = initialized_store(), FakeClock()
+        store, clock = MemoryStore(), FakeClock()
         adapter = ExpiringStatus(clock)
         config = RunConfig("expiring", file_count=1, rows_per_file=1)
         result = run_with_scope(store, config, {"demo-2": adapter}, 10, 1,
@@ -196,6 +247,9 @@ class FabricRunnerTests(unittest.TestCase):
         raw, _ = store.read("Files/producer/runs/expiring/manifest.json")
         delivery = json.loads(raw)["batches"]["1"]["deliveries"]["demo-2"]
         self.assertEqual(delivery["ingestion_outcome"]["status"], "succeeded")
+        self.assertEqual(delivery["last_verification_status"], "verified")
+        self.assertEqual(delivery["last_verification_at_utc"], delivery["verified_at_utc"])
+        self.assertIsNone(delivery["verification_diagnostic"])
 
     def test_eventhouse_adapter_without_status_readback_is_rejected(self):
         class NoStatus:

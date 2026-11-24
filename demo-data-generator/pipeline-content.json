@@ -5,14 +5,15 @@
       "probe_id": {"type": "string", "defaultValue": ""},
       "runtime_evidence_json": {"type": "string", "defaultValue": "{}"},
       "run_config_json": {"type": "string"},
-      "selected_demos_json": {"type": "string"}
+      "selected_demos_json": {"type": "string"},
+      "activity_timeout": {"type": "string", "defaultValue": "0.00:15:00"}
     },
     "activities": [
       {
         "name": "RunProducer",
         "type": "TridentNotebook",
         "policy": {
-          "timeout": "0.00:15:00",
+          "timeout": {"value": "@pipeline().parameters.activity_timeout", "type": "Expression"},
           "retry": 0,
           "retryIntervalInSeconds": 30
         },

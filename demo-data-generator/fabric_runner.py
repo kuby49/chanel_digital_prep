@@ -9,7 +9,8 @@ from fabric_ledger import FabricLedger
 
 
 def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attempts, *,
-                       allocator_scope, selected_targets, clock=None, sleep=None, poll_seconds=5):
+                       selected_targets, clock=None, sleep=None, poll_seconds=5,
+                       allow_staged_pending=False, stop_requested=None):
     config.validate()
     if not adapters or any(not callable(getattr(adapter, "submit", None))
                            or not callable(getattr(adapter, "verify", None)) for adapter in adapters.values()):
@@ -23,18 +24,37 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
         raise ValueError("max_attempts must be a positive integer")
     if not isinstance(poll_seconds, (int, float)) or isinstance(poll_seconds, bool) or poll_seconds <= 0:
         raise ValueError("poll_seconds must be positive")
+    if stop_requested is not None and not callable(stop_requested):
+        raise ValueError("stop_requested must be callable")
     clock = clock or (lambda: datetime.now(timezone.utc))
     sleep = sleep or time.sleep
     now = clock()
     if now.tzinfo is None or now.utcoffset() != timedelta(0):
         raise ValueError("clock must return a UTC-aware datetime")
     errors = []
-    with FabricLedger(store, config, list(adapters), allocator_scope=allocator_scope,
-                      selected_targets=selected_targets) as ledger:
+    stopped = False
+
+    def should_stop():
+        nonlocal stopped
+        if not stopped and stop_requested is not None and stop_requested():
+            stopped = True
+            errors.append("stop requested; unresolved deliveries require reconciliation")
+        return stopped
+
+    with FabricLedger(store, config, list(adapters), selected_targets=selected_targets) as ledger:
         scheduler = ledger.manifest.get("scheduler")
         if scheduler is None:
             if ledger.manifest["batches"]:
-                raise RuntimeError("staged batches predate the scheduler; manual recovery required")
+                if (not allow_staged_pending or set(ledger.manifest["batches"]) !=
+                        {str(n) for n in range(1, config.file_count + 1)}):
+                    raise RuntimeError("staged batches predate the scheduler; manual recovery required")
+                for number in range(1, config.file_count + 1):
+                    batch = ledger.manifest["batches"][str(number)]
+                    if batch["deliveries"] != {
+                            name: {"status": "pending", "timestamp_utc": None}
+                            for name in adapters}:
+                        raise RuntimeError("staged batch has delivery state without a scheduler")
+                    ledger.staged_bytes(number)
             scheduler = {"started_at_utc": now.isoformat(), "max_duration_seconds": max_duration_seconds,
                          "max_attempts": max_attempts, "batch_started_at_utc": {},
                          "status": "running", "finished_at_utc": None}
@@ -117,6 +137,8 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                 ledger.record_observation(number, destination, "unknown", "Invalid verification outcome")
 
         for number in range(1, config.file_count + 1):
+            if should_stop():
+                break
             key = str(number)
             starts = scheduler["batch_started_at_utc"]
             if key not in starts:
@@ -129,7 +151,13 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                     if due >= deadline:
                         errors.append("deadline reached before next batch")
                         break
-                    sleep(remaining)
+                    while remaining > 0:
+                        if should_stop():
+                            break
+                        sleep(min(remaining, poll_seconds) if stop_requested else remaining)
+                        remaining = (due - clock()).total_seconds()
+                if should_stop():
+                    break
                 if clock() >= deadline:
                     errors.append("deadline reached before next batch")
                     break
@@ -141,6 +169,8 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
             ledger.stage_batch(number)
             for destination, adapter in adapters.items():
                 while clock() < deadline:
+                    if should_stop():
+                        break
                     delivery = ledger.manifest["batches"][key]["deliveries"][destination]
                     status = delivery["status"]
                     if status in ("submitted", "unknown", "submitting", "verified", "verification_failed",
@@ -172,11 +202,17 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                         ledger.record_submission(number, destination, status, operation_id, diagnostic)
                         if status == "unknown":
                             break
+                if should_stop():
+                    break
                 delivery = ledger.manifest["batches"][key]["deliveries"][destination]
                 if delivery["status"] in ("submitted", "unknown", "submitting") and clock() < deadline:
                     verify(number, destination)
+            if stopped:
+                break
 
         while clock() < deadline:
+            if should_stop():
+                break
             pending = [(int(number), destination)
                        for number, batch in ledger.manifest["batches"].items()
                        for destination, delivery in batch["deliveries"].items()
@@ -185,7 +221,7 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                 break
             sleep(min(poll_seconds, max(0, (deadline - clock()).total_seconds())))
             for number, destination in pending:
-                if clock() >= deadline:
+                if clock() >= deadline or should_stop():
                     break
                 verify(number, destination)
         final = ledger.manifest

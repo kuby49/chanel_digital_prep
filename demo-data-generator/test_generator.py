@@ -32,7 +32,7 @@ class GeneratorTests(unittest.TestCase):
             self.assertEqual(len(rows), 1000)
             self.assertEqual(meta["row_count"], 1000)
             for row in rows:
-                ids.add(row["SalesLineID"])
+                ids.add((row["BatchID"], row["SalesLineID"]))
                 customers.add(row["CustomerID"])
                 products.add(row["ProductID"])
                 dates.add(row["Date"])
@@ -49,6 +49,7 @@ class GeneratorTests(unittest.TestCase):
             rows = list(csv.DictReader(io.StringIO(payload.decode())))
             self.assertEqual(tuple(rows[0]), HEADER)
             self.assertEqual(len(rows), 12)
+            self.assertEqual([int(row["SalesLineID"]) for row in rows], list(range(1, 13)))
             self.assertEqual(meta["batch_class"], "measured")
             self.assertEqual(sum(int(r["SalesAmountMinorUnits"]) for r in rows), meta["sales_amount_minor_units"])
             self.assertEqual(sum(meta["amount_by_date"].values()), meta["sales_amount_minor_units"])
@@ -58,8 +59,9 @@ class GeneratorTests(unittest.TestCase):
                 self.assertEqual(int(row["SalesAmountMinorUnits"]), int(row["Quantity"]) * int(row["UnitPriceMinorUnits"]))
                 self.assertEqual(row["BatchID"], meta["batch_id"])
                 self.assertTrue(row["SaleTimestamp"].endswith("Z"))
-                self.assertNotIn(row["SalesLineID"], all_ids)
-                all_ids.add(row["SalesLineID"])
+                key = (row["BatchID"], row["SalesLineID"])
+                self.assertNotIn(key, all_ids)
+                all_ids.add(key)
                 customers.add(int(row["CustomerID"]))
                 products.add(int(row["ProductID"]))
                 dates.add(row["Date"])
@@ -73,6 +75,7 @@ class GeneratorTests(unittest.TestCase):
             entry = stage_batch(root, config, 1, ["demo-1", "demo-3"])
             manifest = json.loads((Path(root) / "abc" / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["contract_version"], 1)
+            self.assertNotIn("sales_line_id_reservation", manifest)
             self.assertEqual(manifest["batches"]["1"]["batch_class"], "measured")
             self.assertEqual(entry, stage_batch(root, config, 1, ["demo-3", "demo-1"]))
             with self.assertRaises(ValueError):
@@ -147,9 +150,12 @@ class GeneratorTests(unittest.TestCase):
         for cell in notebook["cells"]:
             compile("".join(cell["source"]), "notebook", "exec")
         self.assertEqual(set(pipeline["properties"]["parameters"]),
-                         {"operation", "probe_id", "runtime_evidence_json", "run_config_json", "selected_demos_json"})
+                         {"operation", "probe_id", "runtime_evidence_json", "run_config_json",
+                          "selected_demos_json", "activity_timeout"})
         self.assertEqual(set(pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]),
                          {"operation", "probe_id", "runtime_evidence_json", "run_config_json", "selected_demos_json"})
+        self.assertEqual(pipeline["properties"]["activities"][0]["policy"]["timeout"],
+                         {"value": "@pipeline().parameters.activity_timeout", "type": "Expression"})
 
     def test_deployment_assets_bind_actual_workspace_and_lakehouse(self):
         workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -174,19 +180,31 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pipeline_definition("not-an-id", notebook_id)
 
-    def test_notebook_bundle_loads_the_exact_generator_and_allocator(self):
+    def test_notebook_bundle_loads_the_exact_generator(self):
         definition = notebook_definition("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                                          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                                          "producer_staging")
         notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
         bundle = "".join(notebook["cells"][1]["source"])
-        script = bundle + "\nimport generator, sales_ids, fabric_ledger\nprint(generator.generator_source_sha256())\n"
+        script = bundle + "\nimport generator, fabric_ledger\nprint(generator.generator_source_sha256())\n"
         with tempfile.TemporaryDirectory() as directory:
             environment = dict(os.environ, TEMP=directory, TMP=directory, PYTHONDONTWRITEBYTECODE="1")
             completed = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True,
                                        env=environment, timeout=30, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), generator_source_sha256())
+
+    def test_notebook_bundle_is_stable_across_checkout_line_endings(self):
+        args = ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "producer_staging")
+        expected = notebook_definition(*args)
+        read_bytes = Path.read_bytes
+
+        def windows_checkout(path):
+            return read_bytes(path).replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+        with patch.object(Path, "read_bytes", windows_checkout):
+            self.assertEqual(notebook_definition(*args), expected)
 
     def test_preflight_probe_persists_identity_without_the_token(self):
         notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
@@ -298,6 +316,7 @@ class GeneratorTests(unittest.TestCase):
             exec("".join(notebook["cells"][1]["source"]), scope)
             token_by_audience["kusto"] = mismatch
             utils.runtime.context["currentRunId"] = "do-not-emit-secret"
+            utils.runtime.context["currentNotebookId"] = "do-not-emit-secret"
             scope["selected_demos_json"] = '["demo-1","demo-3","demo-2"]'
             exec("".join(notebook["cells"][1]["source"]), scope)
         class UnguardedStore(MemoryStore):
@@ -306,6 +325,7 @@ class GeneratorTests(unittest.TestCase):
 
         token_by_audience["kusto"] = token
         utils.runtime.context["currentRunId"] = other
+        utils.runtime.context["currentNotebookId"] = notebook_id
         with patch.dict(sys.modules, {"azure": SimpleNamespace(), "azure.kusto": SimpleNamespace(),
                                      "azure.kusto.data": fake_data}), patch("fabric_storage.OneLakeStore", return_value=UnguardedStore()):
             exec("".join(notebook["cells"][1]["source"]), scope)

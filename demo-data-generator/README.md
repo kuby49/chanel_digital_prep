@@ -13,114 +13,20 @@ for new data. Every manifest records contract version 1 and a fixed batch class
 (`measured`, `bootstrap`, or `negative-test`). Classification alone does not
 create malformed data.
 
-## SalesLineID reservations
+## SalesLineID and replay
 
-`SalesLineID` is a positive signed BIGINT and the logical fact key across
-retained runs, not merely within one run. Every run, including producer-created
-bootstrap runs, must reserve its full inclusive range before staging or delivery.
-`batch_bytes()` alone only calculates candidate bytes; it does not reserve keys.
+`SalesLineID` is a positive signed BIGINT, consecutive from 1 to `row_count`
+within each batch. Sales IDs may repeat across batches and runs;
+`(BatchID, SalesLineID)` is the fact and replay key. Replaying a batch uses the
+same bytes and keys. No global allocator or reservation fields are used.
 
-The Fabric registry is the single deployment-scoped object at
-`https://onelake.blob.fabric.microsoft.com/<producer-workspace-id>/<staging-lakehouse-id>/Files/producer/allocations/sales-line-id-v1.json`.
-Its exact v1 shape is:
-
-```json
-{
-  "version": 1,
-  "scope": {
-    "version": 1,
-    "kind": "fabric",
-    "owner": "chanel_digital_prep/demo-data-generator",
-    "tenant_id": "<canonical-uuid>",
-    "producer_workspace_id": "<canonical-uuid>",
-    "staging_lakehouse_id": "<canonical-uuid>"
-  },
-  "allocator_id": "<sha256>",
-  "target_bindings": {
-    "demo-2": {"workspace_id": "<canonical-uuid>", "item_id": "<canonical-uuid>", "fact": "FactSales"}
-  },
-  "retained_ranges": [{"source": "<inventory-identifier>", "start": "1", "end": "5"}],
-  "reservations": {
-    "<run-id>": {
-      "reservation": {
-        "version": 1, "allocator_id": "<sha256>", "run_id": "<run-id>", "batch_class": "measured",
-        "start": "<decimal>", "end": "<decimal>", "count": "<decimal>",
-        "generator_sha256": "<sha256>", "fingerprint": "<sha256>"
-      },
-      "binding": {
-        "config": {
-          "run_id": "<run-id>", "batch_class": "measured", "start_date": "2024-01-01", "seed": 42,
-          "date_count": 365, "products": 20, "customers": 100, "file_count": 10,
-          "rows_per_file": 1000, "interval_seconds": 60
-        },
-        "selected_demos": ["demo-2"],
-        "targets": {
-          "demo-2": {"workspace_id": "<canonical-uuid>", "item_id": "<canonical-uuid>", "fact": "FactSales"}
-        },
-        "generator_sha256": "<sha256>"
-      }
-    }
-  },
-  "integrity_sha256": "<sha256>"
-}
-```
-
-The manifest adds `sales_line_id_reservation`, exactly equal to its registry
-record's `reservation`. The `config` is `dataclasses.asdict(RunConfig(...))`;
-external `product_count` and `customer_count` map to `products` and
-`customers`. Start, end and count are canonical decimal strings; a reservation
-has `count = file_count * rows_per_file` and `end = start + count - 1`.
-Existing retained ranges can include signed BIGINT values and must be a
-non-overlapping union across all retained destinations.
-
-For each logical run, `start` is `1 + int.from_bytes(SHA256(
-b"chanel-sales-line-id-v1\0" + run_id.encode("ascii")), "big") %
-(9223372036854775807 - count + 1)`. It is only a candidate: the registry
-rejects collisions and overflow rather than assuming a hash is unique. All
-batches use consecutive IDs within the reserved range.
-
-All hashes are lowercase SHA-256 hex. Canonical JSON means UTF-8 bytes from
-`json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-allow_nan=False)` with no trailing newline. `allocator_id` hashes `scope`;
-`fingerprint` hashes `{"allocator_id": allocator_id, "binding": binding}`;
-`integrity_sha256` hashes the entire registry excluding that field. Registry
-storage is canonical JSON plus one LF. `generator_sha256` hashes `generator.py`
-after strict UTF-8 decoding and replacing CRLF and lone CR with LF, with no
-other normalization. A process refuses staging if that source changed after it
-was imported.
-
-The allocator validates the registry and checks the selected target bindings,
-retained ranges and all prior reservations. A separate exclusive
-`Files/producer/allocations/sales-line-id-v1.lock` serializes Fabric producer
-runs; its bytes and ETag are rechecked before staging or a manifest transition.
-The allocator conditionally replaces the
-registry using its ETag, retries definite conflicts, and reads back the exact
-record after a successful or ambiguous write. A rejected conditional operation
-is never treated as success. Ambiguous writes retain the allocator and affected
-run locks;
-missing or corrupt registries, mismatched bindings, a manifest without its
-reservation, and a reservation without its manifest all require explicit
-reconciliation. If conditional enforcement is rejected or uncertain, halt all
-writers and reconcile the entire registry against retained facts before
-restarting. A checksum is not an ownership signature.
-
-The scope remains stable when a subset of demos is selected. Adding a target
-requires a separately authorized onboarding process that preserves existing
-bindings, inventories all retained facts under quiesced writers, updates the
-same registry conditionally, and proves no other allocator or writer can bypass
-it. This process, runtime target-to-adapter identity and fresh authorization
-are **not yet implemented or verified**. No live registry has been initialized.
-The previously observed Demo 2 bootstrap had IDs 1–5; its point-in-time inventory
-alone does not establish a safe baseline. Demo 1's header-only bootstrap had no
-keys. The independent verifier must read the authoritative registry, compare
-scope, binding and manifest, verify IDs fall in range and check other retained
-fact batches for collisions.
-
-Local staging uses a separate root-scoped `.sales-line-id-v1.json` registry and
-an exclusive `.sales-line-id-v1.lock`; it is not the Fabric authority. Local
-registry writes use file synchronization and atomic replacement, with directory
-synchronization on non-Windows systems. Power-loss durability on Windows and
-concurrent external writers have not been established.
+The manifest binds the run configuration, destination selection and generator
+source digest (`generator_sha256`, SHA-256 over UTF-8 with LF line endings),
+plus physical target bindings for Fabric staging. Legacy manifests with
+reserved global IDs are left untouched; use a new run ID rather than replaying
+legacy files under the revised identity scheme. Fabric also persists a per-run
+initialization marker before the manifest so losing the manifest cannot
+silently restart that run.
 
 ## Staging and delivery
 
@@ -166,17 +72,75 @@ interrupt a blocking call. It does not establish a hard run deadline or
 guarantee one-minute cadence. The Demo 2 verification controller must run
 independently, persist its own outcomes and enforce its own deadlines.
 
+## Isolated Demo 2 synthetic staging
+
+The opt-in notebook operation `synthetic-stage` stages exactly two five-row
+`bootstrap` batches for a reserved `demo2synthetic_<12 lowercase hex>` run ID.
+It requires the selected destination to be only `demo-2`, an exact
+`SyntheticFactSales` target binding, a canonical configuration digest in a
+separate bound `runtime_evidence_json` request, and matching pipeline notebook,
+Lakehouse, tenant and runtime token identities. Staging uses the ordinary
+`Files/producer/runs/<run_id>/manifest.json` path and conditional per-run
+ledger; same-run replay must match the immutable configuration and bytes.
+Both delivery records remain `pending`. This operation does **not** submit
+ingestion, prove target ownership, authorize a measured run or make the
+producer `ready`.
+
+The separately gated `synthetic-auth` notebook operation accepts the same
+bound bootstrap configuration with a matching `kusto` endpoint request. It
+generates exactly one row with batch ID
+`demo2synthetic_auth_<12 lowercase hex>_0001` and uses the ordinary
+single-attempt Eventhouse adapter and conditional ledger under a **different**
+run directory. It will not start if that authorization-probe manifest already
+exists. Terminal SDK success plus exact KQL row/total verification are required;
+an unknown or failed submission is retained in the distinct manifest for
+manual reconciliation, never resubmitted. This operation must run only after
+the independent target ownership and read-only runtime preflight gates pass.
+It does not stage or modify the monitored two-batch manifest.
+
+After independent verification of that authorization probe, the separate
+`synthetic-deliver` operation requires its exact one-row `bootstrap` manifest,
+source ID, terminal ingestion success and verified KQL totals in the same
+isolated target. Only then may it initialize or resume the two-batch monitored
+manifest. A previously staged manifest is accepted only when both deterministic
+files and all delivery records are still wholly pending; any prior delivery
+state without a scheduler blocks reconciliation. The monitored run uses one
+submission attempt per batch and retains unknown outcomes for manual recovery.
+The operation does not enable the normal `run-data` path or measured readiness.
+
+The synthetic-target `preflight` branch reads its Kusto database, fact schema
+and CSV mapping, and peeks one message on each ingestion status queue without
+consuming or disclosing message contents. It does not create the usual storage
+sentinel; its conditional-storage check reports `not-run`. The returned
+`producer-runtime-preflight` observation remains `blocked` and
+`effective-ingestion-authorization` remains `unverified`; a verified queue
+peek only establishes queue read access. Bind any observation to the exact
+published notebook definition and completed parent and child job before
+using it as evidence. Never stage or ingest into an unverified target.
+
 ## Fabric deployment and current limits
 
 `deploy.py` accepts the shared v1 `--mode`, `--config`, `--prefix`,
 `--state-dir`, and `--result` arguments. `dry-run` is a local plan. Deployment
 uses an owned-resource journal, verifies tenant and principal, publishes the
 pinned `environment.yml`, and refuses to adopt unknown resources or retry an
-ambiguous creation. `validate-only` performs readbacks but still reports
-blocked while readiness is incomplete. `cleanup` and `run-data` are blocked;
-the notebook independently refuses `run-data`. No measured run is enabled.
+ambiguous creation. `validate-only` can report ready after checking owned
+definitions, selected target metadata and direct workspace write roles;
+this is an admission check, not proof of actual notebook runtime identity or
+delivery. `cleanup` remains blocked. The
+`run-data` launcher requires fresh passing producer and selected-destination
+validators before submitting; when Demo 2 is selected it also requires the
+bound monitor to be running with enough time left for execution and
+verification.
 
-`job_lifecycle.py` contains local no-sales preflight pipeline job primitives.
+The notebook checks its actual runtime identity, producer and destination
+bindings, direct workspace write roles and run bounds before staging. A caller
+using the Fabric Jobs API directly must independently ensure the selected
+destinations and monitor are ready: the notebook does not perform the CLI's
+local validator and monitor checks. The MCAP definitions were updated and
+independently read back for the bounded customer run.
+
+`job_lifecycle.py` contains no-sales preflight and measured pipeline job primitives.
 They check the effective config hash, selected demos and probe ID against the
 run binding, then persist the payload hash and submission intent before POST.
 The returned pipeline job identity is persisted before polling; ambiguous
@@ -186,13 +150,33 @@ power-loss durability is not established.
 
 `producer-status` and `stop-producer` require the original effective config and
 `--selected-demos`. When journal and producer resource binding checks succeed,
-they read the recorded no-sales preflight parent pipeline job's current status.
-Both return `blocked` and `ready: false`; `stop-producer` does **not** request
-cancellation because authenticated job and child provenance are not
-established. A terminal parent status does not prove child termination or
-reconcile in-flight deliveries, and neither mode authorizes stopping the
-independent monitor. The low-level cancellation primitive is not wired to
-these CLI modes. The primitives cannot submit `run-data` or establish readiness.
+they read the recorded parent pipeline job's current status.
+The activity query can identify its exact `RunProducer` notebook child; a
+separate notebook scheduler read confirms that candidate's job status.
+Missing, ambiguous or paginated activity results do not prove the child stopped.
+When stopping and the parent is terminal but its linked child remains active,
+the controller polls that same parent/activity/child chain for up to 120 seconds.
+A timeout or a changed identity leaves termination unconfirmed; an activity
+reporting success is not a reason to cancel a lagging child.
+Both return `blocked` and `ready: false`; neither requests cancellation.
+For a journaled measured run, `stop-producer` writes a run- and
+configuration-bound cooperative stop marker and waits up to 120 seconds for
+the exact parent and child. The notebook checks the marker between operations,
+but cannot interrupt a blocking SDK call or undo an in-flight delivery.
+Read the manifest and reconcile unknown delivery outcomes before retrying.
+A terminal parent alone does not prove child termination, and neither mode
+stops the independent monitor or proves downstream fact ingestion.
+
+For pipeline Spark high concurrency, enable
+[`highConcurrency.notebookPipelineRunEnabled`](https://learn.microsoft.com/en-us/rest/api/fabric/spark/workspace-settings/update-spark-settings)
+in the producer workspace Spark settings. The in-notebook Spark flag alone
+does not determine launch mode. In MCAP an isolated no-sales run reported
+`output.result.highConcurrencyModeStatus.sessionSource: created`; its parent
+and exact notebook job separately reached `Completed`. While the activity was
+active it did not expose a child job ID, and the child scheduler
+remained `InProgress` after the parent completed. No cancellation was sent.
+Do not cancel the shared Livy session or treat high concurrency as proof of
+delivery, writer exclusion, or safe stopping.
 
 The experimental notebook preflight accepts `runtime_evidence_json` separately
 from `run_config_json`, so its `effective_config_sha256` covers the latter's
@@ -200,12 +184,11 @@ complete canonical JSON without including the probe nonce. It emits only
 runtime observations in its notebook exit value and always reports `blocked`.
 The observed job and caller-supplied definition and resource identities are
 not independently authenticated, and neither queue access nor effective
-ingestion authorization is proven. The updated notebook and pipeline
-definitions have not been deployed or verified in Fabric.
+ingestion authorization is proven by this historical preflight alone.
 
 The effective configuration may carry selected-only `shared.target_bindings`
 entries of `{workspace_id, item_id, fact}`. These are candidate bindings,
-not evidence of target ownership, permissions, allocator safety or monitor
+not evidence of target ownership, permissions, delivery safety or monitor
 liveness. When `validate-only` receives `--selected-demos`, it requires exactly
 those candidates and reads each workspace and typed target item with the CLI
 principal. It checks Demo 2's KQL database, Eventhouse parent and configured
@@ -220,9 +203,10 @@ pagination is not implemented. Missing or mismatched bindings block validation.
 
 These are point-in-time metadata and configuration checks only. Demo 1 and
 Demo 2 fact identities, table schemas or contents, the landing-to-fact linkage,
-owner provenance, the actual notebook principal's access and a complete,
-quiesced retained-key inventory remain unverified. A successful read is not a
-readiness decision; `validate-only` remains blocked.
+owner provenance and the actual notebook principal's access remain unverified.
+A successful target read alone is not a readiness decision; `validate-only`
+also checks owned definitions and direct write roles. Actual runtime identity,
+permissions and target checks still run inside the notebook before staging.
 
 For a fresh deployment, `deploy.py --mode resolve-candidate-ids` accepts the
 normal v1 arguments, reads and validates the owned `shared-producer-v1.json`

@@ -261,6 +261,16 @@ class TransportTest(unittest.TestCase):
             self.assertEqual(sent.full_url, FABRIC_ORIGIN + WS)
             self.assertEqual(sent.get_header("Authorization"), f"Bearer {token}")
             self.assertEqual(sent.get_header("X-ms-fabric-skill"), "spark-cli")
+            reply.status = 200
+            for path in (
+                f"{WS}/{WORKSPACE}/roleAssignments",
+                f"{LH}/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances",
+            ):
+                with self.subTest(path=path):
+                    self.assertEqual(client.request("GET", path), (200, {}, {"ok": True}, True))
+                    self.assertEqual(send.call_args.args[0].full_url, FABRIC_ORIGIN + path)
+            with self.assertRaisesRegex(ValueError, "Invalid Fabric"):
+                client.request("GET", WS + "?outside=guard")
 
 
 if __name__ == "__main__":

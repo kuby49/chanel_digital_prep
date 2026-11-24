@@ -4,8 +4,8 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from generator import RunConfig, _atomic_json, batch_bytes, batch_metadata_matches, strict_json_loads
-from sales_ids import canonical_bytes, local_reservation
+from generator import (RunConfig, _atomic_json, batch_bytes, batch_metadata_matches,
+                       new_manifest, strict_json_loads, validate_run_manifest)
 
 
 def _load(root, run_id, batch_number, destination):
@@ -20,9 +20,7 @@ def _load(root, run_id, batch_number, destination):
     config = RunConfig(**manifest["config"])
     if config.run_id != run_id:
         raise ValueError("manifest configuration has a different run ID")
-    reservation = local_reservation(root, config, manifest["destinations"], require_existing=True)
-    if canonical_bytes(manifest.get("sales_line_id_reservation")) != canonical_bytes(reservation):
-        raise RuntimeError("run manifest reservation differs from the allocator")
+    validate_run_manifest(manifest, new_manifest(config, manifest["destinations"]))
     batch = manifest["batches"][str(batch_number)]
     _, expected = batch_bytes(config, batch_number)
     if not batch_metadata_matches(batch, expected):

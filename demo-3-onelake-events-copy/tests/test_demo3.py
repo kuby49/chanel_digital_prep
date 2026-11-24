@@ -11,6 +11,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import delivery_runtime
+import guarded_notebook
+import audit
+
 spec = importlib.util.spec_from_file_location("demo3_activator", ROOT / "activator.py")
 activator = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(activator)
@@ -20,9 +25,6 @@ spec.loader.exec_module(reconcile)
 spec = importlib.util.spec_from_file_location("demo3_batch_gate", ROOT / "batch_gate.py")
 batch_gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(batch_gate)
-spec = importlib.util.spec_from_file_location("demo3_audit", ROOT / "audit.py")
-audit = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(audit)
 spec = importlib.util.spec_from_file_location("demo3_setup", ROOT / "setup_notebook.py")
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
@@ -51,7 +53,7 @@ class EventTests(unittest.TestCase):
     def test_definition_has_connected_disabled_rule_and_dynamic_parameters(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
         sample = {**self.event, "source": f"/tenants/{ids[0]}/workspaces/{ids[1]}/items/{ids[2]}"}
-        entities = activator.build_definition(*ids, sample)
+        entities = activator.build_definition(*ids, sample, run_id="run")
         by_type = {entity["type"]: entity for entity in entities if entity["type"] != "timeSeriesView-v1"}
         source = by_type["realTimeHubSource-v1"]
         self.assertEqual(source["payload"]["connection"]["artifactId"], ids[2])
@@ -75,11 +77,11 @@ class EventTests(unittest.TestCase):
     def test_sample_is_required_and_invalid_ids_rejected(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
         with self.assertRaises(ValueError):
-            activator.build_definition(*ids, {})
+            activator.build_definition(*ids, {}, run_id="run")
         with self.assertRaises(ValueError):
-            activator.build_definition("not-a-guid", *ids[1:], self.event)
+            activator.build_definition("not-a-guid", *ids[1:], self.event, run_id="run")
         with self.assertRaises(ValueError):
-            activator.build_definition(*ids, {**self.event, "source": "/other-lakehouse"})
+            activator.build_definition(*ids, {**self.event, "source": "/other-lakehouse"}, run_id="run")
 
 
 class EntrypointTests(unittest.TestCase):
@@ -115,6 +117,11 @@ class EntrypointTests(unittest.TestCase):
                 self.assertFalse(payload["ready"])
                 self.assertEqual(payload["status"], "pass" if mode == "dry-run" else "blocked")
                 self.assertEqual(proc.returncode, 0 if mode == "dry-run" else 1)
+                if mode == "deploy":
+                    diagnostics = " ".join(payload["diagnostics"])
+                    self.assertIn("no-missed-notification assumption is unmeasured", diagnostics)
+                    self.assertIn("missed-notification recovery is not a prerequisite", diagnostics)
+                    self.assertIn("safe stopping", diagnostics)
 
     def test_cleanup_requires_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -130,6 +137,22 @@ class EntrypointTests(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["status"], "fail")
+
+
+class GuardSparkTests(unittest.TestCase):
+    def test_onelake_endpoint_normalizes_https_and_rejects_other_hosts(self):
+        producer_path = str(ROOT.parent / "demo-data-generator")
+        sys.path.insert(0, producer_path)
+        self.addCleanup(sys.path.remove, producer_path)
+        self.addCleanup(sys.modules.pop, "generator", None)
+        import guard_spark
+
+        self.assertEqual(guard_spark.onelake_endpoint(
+            "https://onelake.dfs.fabric.microsoft.com/"), "onelake.dfs.fabric.microsoft.com")
+        self.assertEqual(guard_spark.onelake_endpoint("onelake.dfs.fabric.microsoft.com"),
+                         "onelake.dfs.fabric.microsoft.com")
+        with self.assertRaises(RuntimeError):
+            guard_spark.onelake_endpoint("https://other.invalid/")
 
 
 class TargetCandidateTests(unittest.TestCase):
@@ -315,6 +338,13 @@ class SetupNotebookTests(unittest.TestCase):
         self.assertFalse(view_validation.matches_amount_view(
             ddl.replace("/ 100", "/ 10"), query, view, table))
 
+    def test_incompatible_fact_protocol_is_rejected(self):
+        view_validation.validate_copy_protocol({"minReaderVersion": 1, "minWriterVersion": 2})
+        for detail in ({"minReaderVersion": 3, "minWriterVersion": 7}, {},
+                       {"minReaderVersion": True, "minWriterVersion": 2}):
+            with self.subTest(detail=detail), self.assertRaises(RuntimeError):
+                view_validation.validate_copy_protocol(detail)
+
 
 class ConditionalStore:
     class Conflict(RuntimeError):
@@ -367,7 +397,7 @@ class AuditTests(unittest.TestCase):
             "origin": "event", "event_id": "event-1",
             "batch_id": "run_0001", "source_subject": "/Files/incoming/sales/sales_run_0001.csv",
             "sha256": "a" * 64, "row_count": 2, "sales_amount_minor_units": 42,
-            "first_sales_line_id": 11, "last_sales_line_id": 12,
+            "first_sales_line_id": 1, "last_sales_line_id": 2,
             "amount_by_date": {"2024-01-01": 42},
             "amount_by_product_category": {"Beauty": 42},
             "amount_by_customer_region": {"Europe": 42},
@@ -378,8 +408,8 @@ class AuditTests(unittest.TestCase):
             "files_read": 1, "rows_read": 2, "rows_copied": 2,
         }
         self.proof = {
-            "row_count": 2, "distinct_sales_line_ids": 2, "first_sales_line_id": 11,
-            "last_sales_line_id": 12, "sales_amount_minor_units": 42,
+            "row_count": 2, "distinct_sales_line_ids": 2, "first_sales_line_id": 1,
+            "last_sales_line_id": 2, "sales_amount_minor_units": 42,
             "orphan_rows": 0, "row_difference_count": 0,
             **{name: self.evidence[name] for name in audit.GROUPS},
         }
@@ -393,6 +423,7 @@ class AuditTests(unittest.TestCase):
         self.audit.copy_succeeded(token, self.evidence["batch_id"], attempt, self.copy_result)
         with self.assertRaises(audit.AuditError):
             self.audit.complete(token, self.evidence["batch_id"], {**self.proof, "row_difference_count": 1})
+
         self.audit.complete(token, self.evidence["batch_id"], self.proof)
         self.audit.release(token, self.evidence["batch_id"])
 
@@ -411,6 +442,11 @@ class AuditTests(unittest.TestCase):
         self.audit.copy_intent(next_token, "run_0002")
         with self.assertRaises(audit.AuditError):
             self.audit.release(next_token, "run_0001")
+
+    def test_batch_keys_must_start_at_one(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        with self.assertRaises(audit.AuditError):
+            self.audit.begin(token, {**self.evidence, "first_sales_line_id": 11, "last_sales_line_id": 12})
 
     def test_uncertain_or_inflight_copy_keeps_lock_and_blocks_replay(self):
         token = self.audit.acquire(self.job, self.evidence["batch_id"])
@@ -470,11 +506,11 @@ class ReconciliationTests(unittest.TestCase):
         manifest = {"contract_version": 1, "batches": {
             "1": entry, "2": {"batch_class": "bootstrap"},
             "3": {"batch_class": "negative-test"}}}
-        observed = {"duplicate_sales_line_ids": 0, "orphan_rows": 0,
+        observed = {"duplicate_batch_sales_line_ids": 0, "orphan_rows": 0,
                     "batches": {"run_0001": dict(entry)}}
         self.assertEqual(reconcile.reconcile(manifest, observed), [])
         observed["batches"]["run_0001"]["amount_by_date"] = {"2024-01-01": 41}
-        observed["duplicate_sales_line_ids"] = 1
+        observed["duplicate_batch_sales_line_ids"] = 1
         self.assertEqual(len(reconcile.reconcile(manifest, observed)), 2)
         observed["batches"]["unexpected"] = {}
         self.assertTrue(any("unexpected" in error for error in reconcile.reconcile(manifest, observed)))
@@ -483,7 +519,7 @@ class ReconciliationTests(unittest.TestCase):
         entry = {"batch_id": "run_0001", "batch_class": "measured", "row_count": 1,
                  "sales_amount_minor_units": 42, **{name: {"x": 42} for name in reconcile.GROUPS}}
         manifest = {"contract_version": 1, "batches": {"1": entry}}
-        observed = {"duplicate_sales_line_ids": 0, "orphan_rows": 0, "batches": {}}
+        observed = {"duplicate_batch_sales_line_ids": 0, "orphan_rows": 0, "batches": {}}
         self.assertTrue(any("missing" in error for error in reconcile.reconcile(manifest, observed)))
         observed["batches"]["run_0001"] = {**entry, "row_count": True}
         self.assertTrue(any("integer" in error for error in reconcile.reconcile(manifest, observed)))
@@ -523,6 +559,7 @@ class ReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             entry = producer.stage_batch(directory, config, 1, ["demo-3"])
             manifest = json.loads((Path(directory) / "integration" / "manifest.json").read_text(encoding="utf-8"))
+            manifest.pop("sales_line_id_reservation", None)
             source_bytes = (Path(directory) / "integration" / entry["filename"]).read_bytes()
             payload = source_bytes.decode("utf-8")
             manifest["batches"]["1"]["deliveries"]["demo-3"]["status"] = "submitting"
@@ -531,6 +568,9 @@ class ReconciliationTests(unittest.TestCase):
             def validate(document=manifest, source=source_bytes, path=subject, **kwargs):
                 return batch_gate.validate_batch(
                     producer, config, json.dumps(document).encode("utf-8"), path, source, **kwargs)
+
+            with self.assertRaisesRegex(ValueError, "fingerprint"):
+                validate(document={**manifest, "generator_sha256": "0" * 64}, event_id="event-1")
 
             for status in ("submitting", "submitted", "unknown", "verified"):
                 manifest["batches"]["1"]["deliveries"]["demo-3"]["status"] = status
@@ -542,6 +582,70 @@ class ReconciliationTests(unittest.TestCase):
             writer = batch_audit.acquire(job, result["batch_id"])
             self.assertEqual(batch_audit.begin(writer, result), "copy-required")
             batch_audit.release(writer, result["batch_id"])
+            storage = ConditionalStore(workspace, lakehouse)
+            authority = ConditionalStore(str(uuid.uuid4()), str(uuid.uuid4()))
+            batch_audit = audit.BatchAudit(storage, workspace, lakehouse)
+            guarded = delivery_runtime.GuardedDelivery(producer, config, authority, batch_audit)
+            authority.create(delivery_runtime.manifest_path(config), json.dumps(manifest).encode("utf-8"))
+            storage.create(subject[1:], source_bytes)
+            copies = []
+
+            def run_guarded_pipeline(path, event_id, origin, remaining):
+                prepared = guarded.prepare(job, path, event_id or None, origin)
+                self.assertGreater(remaining, 0)
+                self.assertEqual(prepared["filename"], entry["filename"])
+                copies.append(prepared["filename"])
+                guarded.finish(job, prepared, {
+                    "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+                    "files_read": 1, "rows_read": entry["row_count"], "rows_copied": entry["row_count"],
+                }, lambda _: {
+                    "row_count": result["row_count"], "distinct_sales_line_ids": result["row_count"],
+                    "orphan_rows": 0, "row_difference_count": 0,
+                    **{key: result[key] for key in (*audit.GROUPS, "first_sales_line_id",
+                                                    "last_sales_line_id", "sales_amount_minor_units")},
+                })
+
+            guarded.reconcile(run_guarded_pipeline, timeout_seconds=2, poll_seconds=1,
+                              event_grace_seconds=0)
+            duplicate = guarded.prepare(str(uuid.uuid4()), subject, "late-event", "event")
+            self.assertEqual(duplicate["decision"], "already-completed")
+            guarded.reconcile(run_guarded_pipeline, timeout_seconds=2, poll_seconds=1,
+                              event_grace_seconds=0)
+            self.assertEqual(copies, [entry["filename"]])
+            self.assertEqual(batch_audit.batch_state(result), "completed")
+
+            uncertain_store = ConditionalStore(workspace, lakehouse)
+            uncertain_store.create(subject[1:], source_bytes)
+            uncertain = delivery_runtime.GuardedDelivery(
+                producer, config, authority, audit.BatchAudit(uncertain_store, workspace, lakehouse))
+            submissions = []
+
+            def lost_response(path, event_id, origin, remaining):
+                submissions.append(path)
+                raise TimeoutError("no response from job submission")
+
+            with self.assertRaisesRegex(TimeoutError, "no response"):
+                uncertain.reconcile(lost_response, timeout_seconds=2, poll_seconds=1,
+                                    event_grace_seconds=0)
+            with self.assertRaises(ConditionalStore.Conflict):
+                uncertain.reconcile(lost_response, timeout_seconds=2, poll_seconds=1,
+                                    event_grace_seconds=0)
+            self.assertEqual(submissions, [subject])
+
+            empty = ConditionalStore(workspace, lakehouse)
+            waiting = delivery_runtime.GuardedDelivery(
+                producer, config, authority, audit.BatchAudit(empty, workspace, lakehouse))
+            times = iter((0, 0, 0, 0, 2))
+            with self.assertRaises(TimeoutError):
+                waiting.reconcile(run_guarded_pipeline, timeout_seconds=2, poll_seconds=1,
+                                  event_grace_seconds=0, clock=lambda: next(times), sleep=lambda _: None)
+            self.assertEqual(copies, [entry["filename"]])
+
+            notebook_candidate = guarded_notebook.build_notebook(
+                producer_path.parent, dict(manifest["config"]), workspace, lakehouse, "DemoLakehouse",
+                authority.workspace_id, authority.lakehouse_id)
+            for cell in notebook_candidate["cells"]:
+                compile("".join(cell["source"]), "guarded-notebook", "exec")
             self.assertEqual(validate(origin="recovery")["event_id"], None)
             for path in (subject + ".tmp", subject.replace("/sales/", "/sales/../"),
                          subject.replace("_0001.csv", "_1.csv"),
@@ -559,8 +663,6 @@ class ReconciliationTests(unittest.TestCase):
                 validate()
             for path, value in (
                 (("config", "seed"), 999),
-                (("sales_line_id_reservation", "generator_sha256"), "0" * 64),
-                (("sales_line_id_reservation", "allocator_id"), "invalid"),
                 (("batches", "1", "row_count"), True),
                 (("batches", "1", "amount_by_date"), {"2024-01-01": 0}),
                 (("batches", "1", "deliveries", "demo-3", "status"), "pending"),
@@ -590,15 +692,16 @@ class ReconciliationTests(unittest.TestCase):
                 amount = int(row["SalesAmountMinorUnits"])
                 total += amount
                 count += 1
-                duplicates += row["SalesLineID"] in seen
-                seen.add(row["SalesLineID"])
+                key = (row["BatchID"], row["SalesLineID"])
+                duplicates += key in seen
+                seen.add(key)
                 orphans += row["Date"] not in dates or row["ProductID"] not in products or row["CustomerID"] not in customers
                 groups["amount_by_date"][row["Date"]] += amount
                 groups["amount_by_product_category"][products[row["ProductID"]]] += amount
                 groups["amount_by_customer_region"][customers[row["CustomerID"]]] += amount
             result = {"row_count": count, "sales_amount_minor_units": total,
                       **{name: dict(values) for name, values in groups.items()}}
-            observed = {"duplicate_sales_line_ids": duplicates, "orphan_rows": orphans,
+            observed = {"duplicate_batch_sales_line_ids": duplicates, "orphan_rows": orphans,
                         "batches": {entry["batch_id"]: result}}
             self.assertEqual(reconcile.reconcile(manifest, observed), [])
 

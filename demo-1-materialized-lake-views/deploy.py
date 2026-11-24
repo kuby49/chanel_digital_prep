@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from definition_plan import effective_verification_timeout_seconds
+from customer_validation import validate_customer
 from ownership import (
     CANDIDATE_FILE, LOCK_FILE, STATE_FILE, CandidateBlocked, resolve_target_candidate,
 )
@@ -65,9 +66,13 @@ def main():
             resolve_target_candidate(config, args.prefix, args.state_dir, args.result)
             result["status"] = "pass"
             result["diagnostics"].append(
-                "Local ownership candidate only; live identity, access, and readiness "
+                "Provisional ownership candidate only; runtime access and readiness "
                 "are not established."
             )
+        elif args.mode == "validate-only":
+            result["diagnostics"].extend(validate_customer(config, args.prefix, args.state_dir))
+            result["status"] = "pass"
+            result["ready"] = True
         else:
             result["diagnostics"].append(
                 "Demo 1 readiness remains blocked: header-only bootstrap MLV definitions "
@@ -75,6 +80,11 @@ def main():
                 "configured-environment schedule and runtime validation, and measured-data "
                 "verification are not implemented."
             )
+            if args.mode == "deploy":
+                result["diagnostics"].append(
+                    "No resources were created: no verified workspace creation provenance "
+                    "source is configured for the ownership journal."
+                )
             if args.mode == "cleanup":
                 result["diagnostics"].append(
                     "Cleanup is unavailable because resource-scoped cleanup is not implemented."

@@ -1,7 +1,6 @@
 """Durable, fail-closed primitives for a single owned Fabric pipeline job.
 
-These primitives do not establish readiness or discover notebook child jobs.
-They must not be used to start a measured run until those gates are implemented.
+The measured caller must supply a fresh admission check and reconcile deliveries.
 """
 
 import hashlib
@@ -15,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from fabric_runtime import MAX_ACTIVITY_SECONDS, STARTUP_HEADROOM_SECONDS
 from generator import strict_json_loads
 
 
@@ -137,6 +137,27 @@ def _journal_time(value):
         raise LifecycleBlocked("Owned job journal timestamp is invalid; termination unconfirmed.") from None
 
 
+def _service_time(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.utcoffset() not in (None, timedelta(0)):
+            raise ValueError
+        return parsed.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        raise LifecycleBlocked("Pipeline readback lacks a valid UTC activity window.") from None
+
+
+def activity_timeout(max_duration_seconds):
+    if (type(max_duration_seconds) is not int or max_duration_seconds <= 0
+            or max_duration_seconds + STARTUP_HEADROOM_SECONDS > MAX_ACTIVITY_SECONDS):
+        raise LifecycleBlocked("Producer duration exceeds the supported pipeline activity timeout.")
+    total = max_duration_seconds + STARTUP_HEADROOM_SECONDS
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{days}.{hours:02}:{minutes:02}:{seconds:02}"
+
+
 class PipelineJob:
     """Journal submission/cancellation and read the exact pipeline job.
 
@@ -245,17 +266,20 @@ class PipelineJob:
             raise LifecycleBlocked("Only explicitly selected no-sales preflight jobs are supported.")
         parameters = parameters["parameters"]
         keys = {"operation", "probe_id", "runtime_evidence_json", "run_config_json", "selected_demos_json"}
+        operation = parameters.get("operation")
+        if operation == "run-data":
+            keys.add("activity_timeout")
         if (set(parameters) != keys or any(not isinstance(value, str) for value in parameters.values())
-                or parameters["operation"] != "preflight"
+                or operation not in ("preflight", "run-data")
                 or not re.fullmatch(r"[a-z0-9][a-z0-9-]{15,63}", parameters["probe_id"])
                 or parameters["probe_id"] != self.binding["nonce"]):
-            raise LifecycleBlocked("Only bound, uniquely identified no-sales preflight jobs are supported.")
+            raise LifecycleBlocked("Only bound no-sales preflight or measured run jobs are supported.")
         try:
             config = strict_json_loads(parameters["run_config_json"])
             selected = strict_json_loads(parameters["selected_demos_json"])
             request = strict_json_loads(parameters["runtime_evidence_json"])
         except (ValueError, RecursionError):
-            raise LifecycleBlocked("Preflight parameters contain invalid JSON.") from None
+            raise LifecycleBlocked("Pipeline parameters contain invalid JSON.") from None
         if (not isinstance(config, dict) or not isinstance(config.get("data"), dict)
                 or config["data"].get("run_id") != self.binding["run_id"]
                 or hashlib.sha256(_canonical(config)).hexdigest() != self.binding["config_sha256"]
@@ -263,7 +287,7 @@ class PipelineJob:
                 or len(set(selected)) != len(selected)
                 or sorted(selected) != self.binding["selected_demos"]
                 or not isinstance(request, dict)):
-            raise LifecycleBlocked("Preflight parameters differ from the immutable job binding.")
+            raise LifecycleBlocked("Pipeline parameters differ from the immutable job binding.")
         if request:
             producer = request.get("producer")
             if (request.get("nonce") != self.binding["nonce"] or request.get("run_id") != self.binding["run_id"]
@@ -271,8 +295,30 @@ class PipelineJob:
                     or producer.get("workspace_id") != self.binding["workspace_id"]
                     or producer.get("notebook_id") != self.binding["notebook_id"]):
                 raise LifecycleBlocked("Runtime evidence request differs from the immutable job binding.")
+        if operation == "run-data":
+            shared = config.get("shared")
+            producer = request.get("producer")
+            fields = {"nonce", "run_id", "config_sha256", "tenant_id", "identity_id", "producer"}
+            if (set(request) != fields or not isinstance(shared, dict)
+                    or not isinstance(producer, dict)
+                    or set(producer) != {"workspace_id", "staging_lakehouse_id", "notebook_id"}
+                    or request["config_sha256"] != self.binding["config_sha256"]
+                    or request["identity_id"] != shared.get("identity_id")
+                    or producer["workspace_id"] != shared.get("workspace_id")
+                    or producer["staging_lakehouse_id"] != shared.get("staging_lakehouse_id")
+                    or (shared.get("producer_notebook_id") is not None
+                        and producer["notebook_id"] != shared["producer_notebook_id"])
+                    or parameters["activity_timeout"] != activity_timeout(config["data"].get("max_duration_seconds"))):
+                raise LifecycleBlocked("Measured pipeline parameters differ from the immutable job binding.")
+            lakehouse = _uuid(producer["staging_lakehouse_id"])
+            _uuid(request["identity_id"])
+            expected_uri = (f"https://onelake.blob.fabric.microsoft.com/{self.binding['workspace_id']}/{lakehouse}/"
+                            f"Files/producer/runs/{self.binding['run_id']}/manifest.json")
+            if self.binding["manifest_uri"] != expected_uri:
+                raise LifecycleBlocked("Measured manifest URI differs from the owned producer binding.")
+        return operation
 
-    def submit(self, payload):
+    def submit(self, payload, *, admission=None):
         """Submit once; an uncertain POST or failed journal write is never retried."""
         with _lock(self.lock_path):
             if self.path.exists():
@@ -280,10 +326,17 @@ class PipelineJob:
                 if state["phase"] == "submitting":
                     raise LifecycleBlocked("Submission outcome unknown; reconcile without retrying.")
                 raise LifecycleBlocked("Run already submitted; resume its exact owned job instead.")
-            self._validate_payload(payload)
+            operation = self._validate_payload(payload)
             if datetime.now(timezone.utc) >= datetime.fromisoformat(
                     self.binding["deadline_utc"].replace("Z", "+00:00")):
                 raise LifecycleBlocked("Run deadline already expired; no job was submitted.")
+            if operation == "run-data":
+                if not callable(admission):
+                    raise LifecycleBlocked("Measured submission requires fresh producer and destination admission.")
+                admission()
+                if datetime.now(timezone.utc) >= datetime.fromisoformat(
+                        self.binding["deadline_utc"].replace("Z", "+00:00")):
+                    raise LifecycleBlocked("Run deadline expired during admission; no job was submitted.")
             state = {"version": 1, "payload_binding_version": 1, "binding": self.binding, "phase": "submitting",
                      "payload_sha256": hashlib.sha256(_canonical(payload)).hexdigest(),
                      "intent_at_utc": _utc()}
@@ -309,6 +362,12 @@ class PipelineJob:
             _write(self.path, state)
             return job_id
 
+    def matches_payload(self, payload):
+        with _lock(self.lock_path):
+            state = self._read()
+            self._validate_payload(payload)
+            return state["payload_sha256"] == hashlib.sha256(_canonical(payload)).hexdigest()
+
     def _job_path(self, state):
         job = _uuid(state.get("job_id"))
         workspace, item = self.binding["workspace_id"], self.binding["pipeline_id"]
@@ -316,7 +375,7 @@ class PipelineJob:
             raise LifecycleBlocked("Persisted pipeline identity differs from submission; termination unconfirmed.")
         return f"/v1/workspaces/{workspace}/items/{item}/jobs/instances/{job}"
 
-    def _status(self, state, deadline):
+    def _parent(self, state, deadline):
         try:
             not_before = datetime.fromisoformat(state["poll_not_before_utc"].replace("Z", "+00:00"))
             if not_before.utcoffset() is None or not_before.utcoffset().total_seconds() != 0:
@@ -328,18 +387,103 @@ class PipelineJob:
         _, body = self.client.get(self._job_path(state), deadline)
         if (not isinstance(body, dict) or body.get("id") != state.get("job_id")
                 or body.get("itemId") != self.binding["pipeline_id"]
+                or not isinstance(body.get("status"), str)
                 or body.get("status") not in ACTIVE | TERMINAL):
             raise LifecycleBlocked("Exact owned pipeline status is unproven; termination unconfirmed.")
-        return body["status"]
+        return body
 
-    def status_detail(self, timeout=30):
+    def _status(self, state, deadline):
+        return self._parent(state, deadline)["status"]
+
+    def status_detail(self, timeout=30, *, include_notebook=False, wait_for_terminal_child=False):
         with _lock(self.lock_path):
             state = self._read()
             if state["phase"] == "submitting":
                 raise LifecycleBlocked("Submission outcome unknown; termination unconfirmed.")
             if state.get("payload_binding_version") != 1:
                 raise LifecycleBlocked("Legacy job parameters were not bound to the journal; termination unconfirmed.")
-            return {"job_id": state["job_id"], "status": self._status(state, self.monotonic() + timeout)}
+            deadline = self.monotonic() + timeout
+            parent = self._parent(state, deadline)
+            snapshot = {"job_id": state["job_id"], "status": parent["status"]}
+            if include_notebook:
+                try:
+                    snapshot["notebook"] = self._notebook_detail(parent, deadline)
+                except LifecycleBlocked as exc:
+                    snapshot["notebook_diagnostic"] = str(exc)
+                if (wait_for_terminal_child and parent["status"] in TERMINAL - {"Deduped"}
+                        and snapshot.get("notebook", {}).get("status") in ACTIVE):
+                    child_id = snapshot["notebook"]["job_id"]
+                    parent_status = parent["status"]
+                    while snapshot["notebook"]["status"] in ACTIVE:
+                        remaining = deadline - self.monotonic()
+                        if remaining <= 0:
+                            snapshot["notebook_diagnostic"] = (
+                                "Bounded wait expired while the linked notebook remained active.")
+                            break
+                        self.sleep(min(5, remaining))
+                        if self.monotonic() >= deadline:
+                            snapshot["notebook_diagnostic"] = (
+                                "Bounded wait expired while the linked notebook remained active.")
+                            break
+                        parent = self._parent(state, deadline)
+                        if parent["status"] != parent_status:
+                            raise LifecycleBlocked("Parent terminal state changed; termination unconfirmed.")
+                        notebook = self._notebook_detail(parent, deadline)
+                        if notebook["job_id"] != child_id:
+                            raise LifecycleBlocked("Linked notebook identity changed; termination unconfirmed.")
+                        snapshot.update(status=parent["status"], notebook=notebook)
+            return snapshot
+
+    def _notebook_detail(self, parent, deadline):
+        if parent.get("jobType") != "Pipeline" or parent["status"] in ("NotStarted", "Deduped"):
+            raise LifecycleBlocked("Pipeline scheduler readback cannot establish notebook linkage.")
+        start = _service_time(parent.get("startTimeUtc"))
+        end = (_service_time(parent.get("endTimeUtc")) if parent["status"] in TERMINAL
+               else datetime.now(timezone.utc))
+        if end < start or end - start > timedelta(days=1):
+            raise LifecycleBlocked("Pipeline activity window is invalid or exceeds one day.")
+        base = f"/v1/workspaces/{self.binding['workspace_id']}"
+        job_id = parent["id"]
+        margin = timedelta(minutes=3)
+        payload = {"filters": [],
+                   "lastUpdatedAfter": (start - margin).isoformat().replace("+00:00", "Z"),
+                   "lastUpdatedBefore": (end + margin).isoformat().replace("+00:00", "Z")}
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise LifecycleBlocked("Notebook activity readback deadline expired.")
+        code, headers, body = self.client.request(
+            "POST", f"{base}/datapipelines/pipelineruns/{job_id}/queryactivityruns", payload,
+            timeout=min(30, remaining))
+        paged = any(k.lower() in ("x-ms-continuation-token", "continuationtoken", "link")
+                    and v for k, v in headers.items())
+        if isinstance(body, dict):
+            paged = paged or bool(body.get("continuationToken") or body.get("continuationUri"))
+            body = body.get("value")
+        if code != 200 or paged or not isinstance(body, list) or len(body) != 1:
+            raise LifecycleBlocked("Pipeline activity query did not yield one unambiguous producer activity.")
+        activity = body[0]
+        inputs = activity.get("input") if isinstance(activity, dict) else None
+        output = activity.get("output") if isinstance(activity, dict) else None
+        workspace, notebook = self.binding["workspace_id"], self.binding["notebook_id"]
+        if (not isinstance(inputs, dict) or not isinstance(output, dict)
+                or activity.get("pipelineRunId") != job_id or activity.get("activityName") != "RunProducer"
+                or activity.get("activityType") != "TridentNotebook"
+                or activity.get("retryAttempt") not in (None, 0)
+                or inputs.get("workspaceId") != workspace or inputs.get("notebookId") != notebook):
+            raise LifecycleBlocked("Pipeline activity does not bind the exact producer notebook.")
+        result = output.get("result")
+        if not isinstance(result, dict) or not result.get("runId"):
+            raise LifecycleBlocked("Pipeline activity does not yet expose a notebook job ID.")
+        child = _uuid(result["runId"])
+        if child != activity.get("activityRunId") or child == job_id:
+            raise LifecycleBlocked("Notebook job ID does not match the observed activity identity.")
+        _, body = self.client.get(f"{base}/items/{notebook}/jobs/instances/{child}", deadline)
+        if (not isinstance(body, dict) or body.get("id") != child
+                or body.get("itemId") != notebook or body.get("jobType") != "PipelineRunNotebook"
+                or not isinstance(body.get("status"), str)
+                or body.get("status") not in (ACTIVE | TERMINAL) - {"Deduped"}):
+            raise LifecycleBlocked("Notebook scheduler did not confirm the linked job identity or status.")
+        return {"job_id": child, "status": body["status"]}
 
     def status(self, timeout=30):
         return self.status_detail(timeout)["status"]

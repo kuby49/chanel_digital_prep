@@ -7,8 +7,7 @@ from urllib import error, parse, request
 
 from fabric_delivery import _landing
 from fabric_runtime import _kusto_endpoint
-from generator import strict_json_loads
-from sales_ids import AllocationError, validate_fabric_targets
+from generator import strict_json_loads, validate_fabric_targets
 
 
 class TargetReadbackBlocked(RuntimeError):
@@ -39,8 +38,8 @@ class OneLakeTableClient:
 
     def list_tables(self, candidate, deadline):
         try:
-            candidate = validate_fabric_targets({"demo-3": candidate})["demo-3"]
-        except AllocationError:
+            validate_fabric_targets({"demo-3": candidate})
+        except ValueError:
             raise TargetReadbackBlocked("demo-3 Delta metadata target is invalid.") from None
         schema, _ = _fact_parts(candidate)
         remaining = deadline - self._clock()
@@ -79,8 +78,9 @@ def selected_candidates(config, selected):
     if not isinstance(shared, dict):
         raise TargetReadbackBlocked("Selected targets require shared.target_bindings.")
     try:
-        targets = validate_fabric_targets(shared.get("target_bindings"))
-    except AllocationError:
+        targets = shared.get("target_bindings")
+        validate_fabric_targets(targets)
+    except ValueError:
         raise TargetReadbackBlocked("Selected target candidates are missing or invalid.") from None
     if set(targets) != set(selected):
         raise TargetReadbackBlocked("Target candidates must match exactly the selected demos.")
@@ -183,10 +183,9 @@ def read_selected_targets(config, selected, clients, *, table_client=None, timeo
             props = _database_adapter(config, candidate, typed)
             parent_id = props.get("parentEventhouseItemId")
             try:
-                # Reuse the canonical UUID validation used for allocator candidates.
                 validate_fabric_targets({name: {"workspace_id": workspace_id, "item_id": parent_id,
                                                "fact": candidate["fact"]}})
-            except AllocationError:
+            except ValueError:
                 raise TargetReadbackBlocked("demo-2 Eventhouse parent identity is invalid.") from None
             _, parent = client.get(f"/v1/workspaces/{workspace_id}/items/{parent_id}", deadline)
             if not _item_matches(parent, workspace_id, parent_id, "Eventhouse"):
@@ -203,6 +202,6 @@ def read_selected_targets(config, selected, clients, *, table_client=None, timeo
             detail = "fact identity remains unverified"
         observations.append(f"{name}: CLI-principal workspace and {item_type} item identities and "
                             f"configured adapter item metadata matched live readbacks; {detail}; "
-                            "landing-to-fact linkage, ownership, runtime permissions and allocator safety "
+                            "landing-to-fact linkage, ownership, runtime permissions and delivery safety "
                             "remain unverified.")
     return observations

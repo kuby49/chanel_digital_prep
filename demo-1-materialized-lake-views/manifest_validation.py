@@ -58,6 +58,7 @@ def validate_manifest(manifest):
         diagnostics.append("manifest batches must be an object keyed by batch number")
         return diagnostics
 
+    seen_batch_ids = set()
     for key, batch in batches.items():
         if not isinstance(key, str) or not key.isdecimal():
             diagnostics.append(f"batch key {key!r} must be a decimal batch number")
@@ -74,6 +75,13 @@ def validate_manifest(manifest):
             diagnostics.append(
                 f"batch {key} batch_class must be measured, bootstrap, or negative-test"
             )
+        batch_id = batch.get("batch_id")
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            diagnostics.append(f"batch {key} batch_id must be a nonempty string")
+        elif batch_id in seen_batch_ids:
+            diagnostics.append(f"batch {key} batch_id must be unique within the manifest")
+        else:
+            seen_batch_ids.add(batch_id)
         if (
             not isinstance(batch.get("batch_number"), int)
             or isinstance(batch.get("batch_number"), bool)

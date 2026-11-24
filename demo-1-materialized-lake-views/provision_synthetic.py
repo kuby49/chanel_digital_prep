@@ -77,7 +77,7 @@ class FabricClient:
         time.sleep(delay)
 
     def request(self, method, path, body=None):
-        if not re.fullmatch(r"/v1/[a-z0-9/-]+", path):
+        if not re.fullmatch(r"/v1/[A-Za-z0-9/-]+", path):
             raise ValueError("Invalid Fabric control-plane path")
         payload = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json",

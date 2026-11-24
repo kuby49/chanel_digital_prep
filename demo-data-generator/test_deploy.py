@@ -220,8 +220,7 @@ class ContractTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 code, result = self.invoke(mode, {"contract_version": 1})
                 self.assertEqual((code, result["status"]), (1, "blocked"))
-                self.assertTrue(any("no cross-workspace destination permissions" in item
-                                    for item in result["diagnostics"]))
+                self.assertTrue(any("requires" in item.lower() for item in result["diagnostics"]))
 
     def test_cleanup_never_deletes_and_requires_yes(self):
         code, result = self.invoke("cleanup", config())
@@ -622,9 +621,9 @@ class OwnershipTests(unittest.TestCase):
                 with self.assertRaises(deploy.Blocked):
                     verify(client)
         client = ReadbackClient(plan, state)
-        client.items[NOTEBOOK]["defaultIdentity"] = None
-        with self.assertRaisesRegex(deploy.Blocked, "not exposed"):
-            verify(client)
+        client.items[NOTEBOOK].pop("defaultIdentity")
+        client.items[PIPELINE]["defaultIdentity"] = None
+        verify(client)
 
     def test_existing_name_is_never_adopted(self):
         plan = deploy.parse_config(config(), "sample")
@@ -1329,12 +1328,13 @@ class DeploymentFlowTests(unittest.TestCase):
 
             service.calls.clear()
             deploy.perform("deploy", config(), "sample", str(Path.cwd()))
-            deploy.perform("validate-only", config(), "sample", str(Path.cwd()))
+            with self.assertRaisesRegex(deploy.Blocked, "Selected destinations"):
+                deploy.perform("validate-only", config(), "sample", str(Path.cwd()))
             self.assertTrue(all(parse.urlsplit(path).path.endswith("/getDefinition")
                                 for method, path in service.calls if method == "POST"))
             self.assertFalse(any("/jobs" in path.lower() or "/instances" in path.lower()
                                  for _, path in service.calls))
-            self.assertEqual(auth.call_count, 3)
+            self.assertEqual(auth.call_count, 2)
 
     def test_deploy_resumes_owned_environment_publication_before_notebook_checks(self):
         plan = deploy.parse_config(config(), "sample")

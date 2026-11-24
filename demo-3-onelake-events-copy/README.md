@@ -1,14 +1,27 @@
 # Demo 3: OneLake events and Copy
 
-**Status: blocked for production ingestion.** An isolated MCAP preflight
+**Status: bounded customer-run admission verified; production ingestion remains blocked.**
+With `demo-3.customer_preflight: true`, read-only `validate-only` checks the
+original customer binding and the existing run-specific resources. It does not
+claim the new file was delivered or that the ten-file acceptance run passed.
+An isolated MCAP preflight
 workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
 stopped probe Activator exist. They do not constitute a deployable production
-pipeline. The entry point remains fail-closed; `dry-run` only validates the
-local contract.
+pipeline. The narrowly scoped customer preflight is read-only; `dry-run`
+only validates the local contract.
+
+## User-directed event-delivery assumption
+
+For this demonstration, assume notifications are not missed, as directed by the
+user. This is a working assumption, not measured evidence or a service
+guarantee; implementing or proving missed-notification recovery is not a
+readiness prerequisite. Monitor the actual event-to-Copy run and report any
+visibly failed notification or Copy honestly. Retain normal Copy correctness,
+duplicate-retry safety, target-row validation and safe stopping.
 
 ## Contract
 
-`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. A v1 result reports `track: demo-3`; `ready` remains false. Deploy, validation and cleanup currently return `blocked` and make no Fabric requests; cleanup never deletes anything.
+`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. The explicit customer preflight can report `ready: true` for its bound run after live checks. Other deployment, validation and cleanup paths remain blocked; cleanup never deletes anything.
 
 `resolve-target-candidate` is local-only. It reads a confirmed
 `demo-3-state.json` under an exclusive `demo-3-state.lock` and creates a fresh
@@ -47,10 +60,31 @@ in coordinated-run totals; `bootstrap` and `negative-test` are separate.
 | Operation | Documented API or capability | Required proof before deployment |
 |---|---|---|
 | Connection | A Lakehouse OAuth2 connection was created in the Fabric UI, read back via API, and used by a two-row Copy probe. The public [create-connection request](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/create-connection) lists OAuth2 as a credential type but does not define OAuth2 in its create-credentials union. | Automate a supported connection path or explicitly require the UI-created connection; verify identity and access in each environment. Never store credentials. |
-| Pipeline | A non-sales probe used the event subject as a dynamic exact filename and Upserted two rows; its successful event-triggered job read one file. A top-level `keyColumns` property was accepted in a definition but failed at runtime; `upsertSettings.keys` worked. | Implement a guarded production Copy, explicit sales mappings, `SalesLineID` upsert, and runtime validation. The probe has no production-safe filename guard and is not crash-recovery proof. |
-| Activator | A restricted non-sales `FileCreated` event invoked a parameter-only pipeline. `___subject` and `___id` matched source and activation history in that probe. A later event-triggered dynamic Copy captured the subject and ID after a six-minute warm-up. `activator.py` builds a disabled candidate. | Verify the actual production source and bindings and completed-file readiness. An event published after a 30-second warm-up appeared in source history but produced no activation or job within 300 seconds. A single six-minute success is not a readiness guarantee; definition readback or a Running label alone is insufficient. |
-| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. A synthetic audit-journal probe exercised state transitions and duplicate recognition against OneLake. `audit.py` is not installed in a pipeline. | Wire and verify per-file audit, reconcile missed events and uncertain writes, prove safe serialization/exclusive writers, bounded retries, duplicate delivery, and write-then-crash recovery. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
+| Pipeline | A non-sales probe used the event subject as a dynamic exact filename and Upserted two rows; its successful event-triggered job read one file. A top-level `keyColumns` property was accepted in a definition but failed at runtime; `upsertSettings.keys` worked for the probe. An earlier target Copy failed before writing because its Delta protocol's `appendOnly` writer feature was unsupported (`dataWritten=0`). A new isolated table with deletion vectors disabled passed the direct protocol gate. The first synthetic Copy read one file and reported three rows; VerifyCopy initially rejected an HTTPS-prefixed OneLake endpoint. Fix `dfc89b7c2431369c4e3116c743e920ddda1a3cfc` normalized the endpoint, and a verification-only continuation completed batch `recoveryprobea9bbae81_0001` and its audit without another Copy. A second manually supplied synthetic job (`13f2398f-7599-465a-b1c2-2fc8b8ef5b85`) completed guarded Copy and audit; this was not an Activator-delivery test. Duplicate batch 1 job `eb2f7cb3-d8e4-4093-a510-82e35ab60bb6` ran PrepareCopy only and did not run Copy. Independent target notebook `7be33833-f22c-4fbd-8d5f-92c47c324a32` verified six rows, six unique `(BatchID, SalesLineID)` pairs, IDs 1–3 per batch, exact regenerated contents and dimension totals. | Composite-key Upsert and duplicate replay are proven for the two isolated synthetic batches only. Actual Activator delivery, measured readiness, and actual Spark session reuse remain unverified; do not imply otherwise. The user's no-missed-notification assumption does not waive monitoring or safe-stop checks. Do not downgrade existing table protocols. |
+| Activator | A restricted non-sales `FileCreated` event invoked a parameter-only pipeline. `___subject` and `___id` matched source and activation history in that probe. A later event-triggered dynamic Copy captured the subject and ID after a six-minute warm-up. `activator.py` builds a disabled candidate. | Apply the user-directed no-missed-notification assumption for this demo only; do not require missed-notification recovery to be implemented or proven. Monitor actual event-to-Copy runs and report any visible failure honestly. The historical event with no activation/job within 300 seconds remains recorded; a single six-minute success is not readiness. Definition readback or a Running label alone is insufficient. |
+| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. The synthetic two-batch run completed per-file audits; its duplicate batch-1 job ran PrepareCopy only, and the independent target notebook verified both batches. `audit.py` is not installed in a pipeline. | Duplicate replay is verified only for this isolated two-batch run. Measured readiness still requires safe serialization/exclusive-writer evidence, bounded retries, uncertain-write recovery, safe stopping and data correctness. Retain monitoring of actual pipeline/Copy outcomes. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
 | Query surface | Setup verified dimensions and the fact schema. A non-destructive SQL metadata refresh using actual lowercase Delta paths exposed all four tables; the Spark amount view is not exposed as a SQL view. A separate probe had stale SQL results for over 900 seconds until a targeted, non-recreating refresh. | Verify joined queries, DECIMAL(18,2) results, exact totals and visibility with valid sales data. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
+
+The earlier incompatible fact table had deletion vectors enabled and Delta
+reader 3/writer 7; the Copy connector rejected its `appendOnly` writer feature
+before writing data. A separately created empty table with deletion vectors
+disabled read back reader 1/writer 2. Setup now requests this compatible
+protocol for new tables and fails closed on an incompatible existing table;
+it never downgrades or replaces that table. The first synthetic Copy against
+the new table read one file and reported three rows copied. VerifyCopy
+initially failed because the guard rejected an HTTPS-prefixed OneLake endpoint;
+commit `dfc89b7c2431369c4e3116c743e920ddda1a3cfc` normalizes the endpoint, and
+a verification-only continuation completed batch `recoveryprobea9bbae81_0001`
+and its audit without another Copy. A second manually supplied synthetic job
+completed guarded Copy and audit. A duplicate batch-1 job ran PrepareCopy only
+and did not run Copy. Independent target notebook
+`7be33833-f22c-4fbd-8d5f-92c47c324a32` verified six rows, six unique
+`(BatchID, SalesLineID)` pairs with IDs 1–3 in each batch, exact regenerated
+contents and dimension totals. This proves composite-key handling and replay
+idempotency for these two isolated synthetic batches only; it does not prove
+Activator delivery, measured readiness or actual Spark session reuse. The
+user-directed no-missed-notification assumption is not a platform guarantee
+and does not waive monitoring, correctness or safe-stop checks.
 
 On 2026-11-23, read-only MCAP cloud `supportedConnectionTypes` returned one
 `Lakehouse` type with creation method `Lakehouse.Contents`, optional Boolean
@@ -135,8 +169,10 @@ were conditionally removed only after confirming no Copy had been sent.
 compares measured batches only. The query export must contain `batches` keyed by
 batch ID, with each value holding `row_count`, `sales_amount_minor_units` and
 the three group dictionaries above. It must also include integer
-`duplicate_sales_line_ids` and `orphan_rows`. The query itself must restrict its
-results and global duplicate/orphan checks to the measured run. Missing or extra
+`duplicate_batch_sales_line_ids` and `orphan_rows`. The query itself must restrict its
+results and duplicate/orphan checks to the measured run. Count duplicates of the
+pair `(BatchID, SalesLineID)`, not `SalesLineID` alone: every batch starts at ID 1,
+and replay reuses the same IDs in that batch. Missing or extra
 batches, non-integer values, and mismatches fail. This check does not prove
 delivery, checksums, event execution, pipeline success, CSV row validity, or
 query provenance; collect those independently.

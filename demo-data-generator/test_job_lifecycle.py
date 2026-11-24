@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from job_lifecycle import LifecycleBlocked, PipelineJob
-from sales_ids import canonical_bytes
+from job_lifecycle import LifecycleBlocked, PipelineJob, activity_timeout
+from generator import canonical_bytes
 
 
 WORKSPACE = "11111111-1111-4111-8111-111111111111"
@@ -197,6 +197,47 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.job.path.exists())
         self.assertEqual(self.client.posts, [])
 
+    def test_measured_submission_requires_fresh_admission_before_one_post(self):
+        lakehouse = "77777777-7777-4777-8777-777777777777"
+        identity = "88888888-8888-4888-8888-888888888888"
+        document = {"data": {"run_id": "test-run", "max_duration_seconds": 1800},
+                    "shared": {"workspace_id": WORKSPACE, "staging_lakehouse_id": lakehouse,
+                               "identity_id": identity}}
+        measured_binding = dict(self.binding, config_sha256=hashlib.sha256(canonical_bytes(document)).hexdigest(),
+                                manifest_uri=f"https://onelake.blob.fabric.microsoft.com/{WORKSPACE}/{lakehouse}/"
+                                             "Files/producer/runs/test-run/manifest.json")
+        runtime = {"nonce": NONCE, "run_id": "test-run", "config_sha256": measured_binding["config_sha256"],
+                   "tenant_id": TENANT, "identity_id": identity,
+                   "producer": {"workspace_id": WORKSPACE, "staging_lakehouse_id": lakehouse,
+                                "notebook_id": NOTEBOOK}}
+        payload = {"executionData": {"parameters": {
+            "operation": "run-data", "probe_id": NONCE, "runtime_evidence_json": json.dumps(runtime),
+            "run_config_json": json.dumps(document), "selected_demos_json": '["demo-1","demo-2"]',
+            "activity_timeout": activity_timeout(1800),
+        }}}
+        job = PipelineJob(self.temp.name, measured_binding, self.client)
+        with self.assertRaisesRegex(LifecycleBlocked, "fresh producer and destination admission"):
+            job.submit(payload)
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            job.submit(payload, admission=lambda: (_ for _ in ()).throw(RuntimeError("not ready")))
+        self.assertFalse(job.path.exists())
+        self.assertEqual(self.client.posts, [])
+        checked = []
+        self.client.on_post = lambda: self.assertEqual(checked, ["fresh"])
+        self.assertEqual(job.submit(payload, admission=lambda: checked.append("fresh")), JOB)
+        self.assertTrue(job.matches_payload(payload))
+        with self.assertRaisesRegex(LifecycleBlocked, "already submitted"):
+            job.submit(payload, admission=lambda: checked.append("again"))
+        self.assertEqual((checked, len(self.client.posts)), (["fresh"], 1))
+
+    def test_activity_timeout_includes_startup_headroom_and_is_bounded(self):
+        self.assertEqual(activity_timeout(1800), "0.00:45:00")
+        self.assertEqual(activity_timeout(24 * 3600), "1.00:15:00")
+        for duration in (0, True, 7 * 86400 - 899):
+            with self.subTest(duration=duration):
+                with self.assertRaises(LifecycleBlocked):
+                    activity_timeout(duration)
+
     def test_preflight_parameters_must_match_journal_binding_before_post(self):
         mutations = (
             ("probe_id", "another-probe-0123456789"),
@@ -226,6 +267,52 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(LifecycleBlocked, "not bound"):
             self.job.status()
         self.assertEqual(self.client.reads, [])
+
+    def test_terminal_parent_waits_for_same_child_without_cancelling(self):
+        self.job.submit(PREFLIGHT)
+        ticks = [0]
+        self.job.monotonic = lambda: ticks[0]
+        self.job.sleep = lambda seconds: ticks.__setitem__(0, ticks[0] + seconds)
+        parent = {"id": JOB, "status": "Completed"}
+        child = "66666666-6666-4666-8666-666666666666"
+        with (patch.object(self.job, "_parent", return_value=parent) as read_parent,
+              patch.object(self.job, "_notebook_detail", side_effect=[
+                  {"job_id": child, "status": "InProgress"},
+                  {"job_id": child, "status": "Completed"},
+              ]) as read_child):
+            snapshot = self.job.status_detail(timeout=10, include_notebook=True,
+                                              wait_for_terminal_child=True)
+        self.assertEqual(snapshot["notebook"], {"job_id": child, "status": "Completed"})
+        self.assertEqual((read_parent.call_count, read_child.call_count), (2, 2))
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_terminal_child_wait_timeout_and_identity_change_fail_closed(self):
+        self.job.submit(PREFLIGHT)
+        ticks = [0]
+        self.job.monotonic = lambda: ticks[0]
+        self.job.sleep = lambda seconds: ticks.__setitem__(0, ticks[0] + seconds)
+        parent = {"id": JOB, "status": "Completed"}
+        child = "66666666-6666-4666-8666-666666666666"
+        with (patch.object(self.job, "_parent", return_value=parent),
+              patch.object(self.job, "_notebook_detail", return_value={"job_id": child, "status": "InProgress"})):
+            snapshot = self.job.status_detail(timeout=5, include_notebook=True,
+                                              wait_for_terminal_child=True)
+        self.assertEqual(snapshot["notebook"]["status"], "InProgress")
+        self.assertIn("wait expired", snapshot["notebook_diagnostic"])
+        ticks[0] = 0
+        with (patch.object(self.job, "_parent", return_value=parent),
+              patch.object(self.job, "_notebook_detail", side_effect=[
+                  {"job_id": child, "status": "InProgress"},
+                  {"job_id": NOTEBOOK, "status": "Completed"},
+              ])):
+            with self.assertRaisesRegex(LifecycleBlocked, "identity changed"):
+                self.job.status_detail(timeout=10, include_notebook=True, wait_for_terminal_child=True)
+        ticks[0] = 0
+        with (patch.object(self.job, "_parent", side_effect=[parent, {"id": JOB, "status": "Failed"}]),
+              patch.object(self.job, "_notebook_detail", return_value={"job_id": child, "status": "InProgress"})):
+            with self.assertRaisesRegex(LifecycleBlocked, "Parent terminal state changed"):
+                self.job.status_detail(timeout=10, include_notebook=True, wait_for_terminal_child=True)
+        self.assertEqual(len(self.client.posts), 1)
 
 
 if __name__ == "__main__":

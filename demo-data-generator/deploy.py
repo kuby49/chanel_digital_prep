@@ -20,22 +20,30 @@ readiness requirements can be demonstrated.
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error, parse, request
 
-from generator import RunConfig, strict_json_loads
-from job_lifecycle import JOURNAL_DIR_NAME, LifecycleBlocked, PipelineJob
-from sales_ids import canonical_bytes
+from fabric_ledger import _validate_ingestion_outcome
+from fabric_runtime import require_write_roles, run_config
+from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
+from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
+                       strict_json_loads, validate_run_manifest)
+from job_lifecycle import (JOURNAL_DIR_NAME, STARTUP_HEADROOM_SECONDS, LifecycleBlocked, PipelineJob,
+                           activity_timeout)
 from target_readback import OneLakeTableClient, TargetReadbackBlocked, read_selected_targets, selected_candidates
 
 
@@ -77,6 +85,12 @@ BLOCKERS = (
     "Blocked: this entrypoint has not verified producer staging, destination transport or file-event finalization.",
     "Blocked: this entrypoint cannot yet establish fresh readiness from runtime identity and pipeline-binding evidence.",
 )
+TRACK_SCRIPTS = {
+    "demo-1": HERE.parent / "demo-1-materialized-lake-views" / "deploy.py",
+    "demo-2": HERE.parent / "demo-2-eventhouse" / "deploy.py",
+    "demo-3": HERE.parent / "demo-3-onelake-events-copy" / "deploy.py",
+    "shared": HERE / "deploy.py",
+}
 
 
 class ContractError(Exception):
@@ -268,6 +282,12 @@ def _validate_run(config, selected_demos):
         raise ContractError("max_duration_seconds must exceed the final scheduled batch offset.")
     if data["currency"] != "USD":
         raise ContractError("producer currently supports USD only.")
+    if data.get("batch_class", "measured") != "measured":
+        raise ContractError("run-data requires measured batches.")
+    try:
+        activity_timeout(duration)
+    except LifecycleBlocked as exc:
+        raise ContractError(str(exc)) from None
     return selected
 
 
@@ -832,10 +852,8 @@ def _verify_item(client, state, plan, kind, principal_type):
         raise Blocked("Owned item state lacks the exact live description needed for reuse.")
     if live.get("description") != record["description"]:
         raise Blocked("Live item description does not match owned state.")
-    if kind in ("notebook", "pipeline") or (kind == "environment_item" and live.get("defaultIdentity") is not None):
-        identity = live.get("defaultIdentity")
-        if identity is None:
-            raise Blocked("Live item default identity is not exposed; runtime identity must be independently verified.")
+    if kind in ("notebook", "pipeline", "environment_item") and live.get("defaultIdentity") is not None:
+        identity = live["defaultIdentity"]
         if (not isinstance(identity, dict) or not _same_uuid(identity.get("id"), plan["identity_id"])
                 or identity.get("type") != principal_type):
             raise Blocked("Live item default identity does not match the configured principal.")
@@ -1184,6 +1202,407 @@ def _check_assets(plan):
     return spec
 
 
+STOP_CHILD_WAIT_SECONDS = 120
+
+
+def _track_timeout(config):
+    execution = config.get("execution", {})
+    if not isinstance(execution, dict):
+        raise ContractError("execution must be a configuration object.")
+    timeout = execution.get("track_timeout_seconds", 1800)
+    if type(timeout) is not int or timeout < 1:
+        raise ContractError("execution.track_timeout_seconds must be a positive integer.")
+    return timeout
+
+
+def _monitor_contract():
+    path = HERE.parent / "scripts" / "monitor_contract.py"
+    if not path.is_file():
+        raise Blocked("The shared Demo 2 monitor contract is unavailable; no job was started.")
+    try:
+        spec = importlib.util.spec_from_file_location("producer_monitor_contract", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("monitor contract loader unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (ImportError, OSError):
+        raise Blocked("The shared Demo 2 monitor contract could not be loaded; no job was started.") from None
+
+
+def _config_snapshot(path, expected):
+    try:
+        actual = strict_json_loads(path.read_text(encoding="utf-8"))
+        if canonical_bytes(actual) != canonical_bytes(expected):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        raise Blocked("Effective configuration changed during admission; no job was started.") from None
+
+
+def _invoke_fresh(track, mode, config_path, prefix, state_dir, directory, timeout, selected):
+    script = TRACK_SCRIPTS[track]
+    if not script.is_file():
+        raise Blocked(f"{track} entry point is unavailable; no job was started.")
+    result_path = directory / f"{track}-{mode}.json"
+    args = [sys.executable, str(script), "--mode", mode, "--config", str(config_path),
+            "--prefix", prefix, "--state-dir", str(state_dir), "--result", str(result_path)]
+    if track == "shared" or mode == "monitor-status":
+        args += ["--selected-demos", ",".join(selected)]
+    try:
+        completed = subprocess.run(args, cwd=HERE.parent, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise Blocked(f"{track} {mode} timed out; no job was started.") from None
+    except OSError:
+        raise Blocked(f"{track} {mode} could not be invoked; no job was started.") from None
+    try:
+        raw = result_path.read_bytes()
+        if len(raw) > 1024 * 1024:
+            raise ValueError
+        result = strict_json_loads(raw.decode("utf-8"))
+        if (not isinstance(result, dict) or set(result) !=
+                {"contract_version", "track", "mode", "status", "ready", "diagnostics"}
+                or type(result["contract_version"]) is not int or result["contract_version"] != 1
+                or result["track"] != track or result["mode"] != mode
+                or result["status"] not in ("pass", "fail", "blocked")
+                or type(result["ready"]) is not bool or not isinstance(result["diagnostics"], list)
+                or any(not isinstance(item, str) for item in result["diagnostics"])
+                or (completed.returncode == 0) != (result["status"] == "pass")):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        raise Blocked(f"{track} {mode} returned an invalid result; no job was started.") from None
+    if result["status"] != "pass" or not result["ready"]:
+        diagnostics = result["diagnostics"]
+        reason = " ".join(item[:500] for item in diagnostics[:20]) if diagnostics else "readiness was not established"
+        if len(diagnostics) > 20:
+            reason += " Additional diagnostics omitted."
+        raise Blocked(f"{track} {mode} is not ready: {reason} No job was started.")
+    return result
+
+
+def _fresh_admission(config, config_path, prefix, state_dir, directory, selected, token_ready):
+    timeout = _track_timeout(config)
+    helper = _monitor_contract()
+    demo2_scope = None
+    try:
+        scopes = {track: helper.deployment_scope(config, track, prefix, state_dir) for track in selected}
+        demo2_scope = scopes.get("demo-2")
+    except (ValueError, OSError, TypeError) as exc:
+        raise Blocked(f"Demo deployment scope is invalid: {exc} No job was started.") from None
+    _config_snapshot(config_path, config)
+    tracks = [*selected, "shared"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tracks)) as executor:
+        futures = []
+        for track in tracks:
+            track_prefix, track_state = scopes.get(track, (prefix, state_dir))
+            futures.append(executor.submit(_invoke_fresh, track, "validate-only", config_path,
+                                           track_prefix, track_state, directory, timeout, selected))
+        for future in futures:
+            future.result()
+    _config_snapshot(config_path, config)
+    token_ready()
+    if demo2_scope is not None:
+        track_prefix, track_state = demo2_scope
+        _invoke_fresh("demo-2", "monitor-status", config_path, track_prefix, track_state,
+                      directory, timeout, selected)
+        try:
+            manifest_uri, duration = helper.monitor_config(config)
+            binding = helper.monitor_binding(config)
+            start = helper.monitor_evidence(Path(track_state) / "demo-2-monitor-start.json",
+                                            config["data"]["run_id"], manifest_uri, duration, "start", binding)
+            current = helper.monitor_evidence(Path(track_state) / "demo-2-monitor.json",
+                                              config["data"]["run_id"], manifest_uri, duration, "running", binding)
+            helper.matching_monitor_identity(start, current)
+            deadline = datetime.fromisoformat(current["deadline_utc"].replace("Z", "+00:00"))
+            verification = config["demo-2"].get("verification_timeout_seconds")
+            if verification is None:
+                verification = config["execution"].get("verification_timeout_seconds")
+            if type(verification) is not int or verification < 1:
+                raise ValueError("invalid verification timeout")
+            required = config["data"]["max_duration_seconds"] + STARTUP_HEADROOM_SECONDS + \
+                STOP_CHILD_WAIT_SECONDS + verification
+            if deadline <= datetime.now(timezone.utc) + timedelta(seconds=required):
+                raise ValueError("monitor deadline does not cover producer execution and verification")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            raise Blocked(f"Demo 2 running monitor is not bound to this run: {exc} No job was started.") from None
+    _config_snapshot(config_path, config)
+
+
+def _measured_payload(config, binding, identity_id, lakehouse_id):
+    runtime = {"nonce": binding["nonce"], "run_id": binding["run_id"],
+               "config_sha256": binding["config_sha256"], "tenant_id": binding["tenant_id"],
+               "identity_id": identity_id,
+               "producer": {"workspace_id": binding["workspace_id"], "staging_lakehouse_id": lakehouse_id,
+                            "notebook_id": binding["notebook_id"]}}
+    return {"executionData": {"parameters": {
+        "operation": "run-data", "probe_id": binding["nonce"],
+        "runtime_evidence_json": canonical_bytes(runtime).decode("utf-8"),
+        "run_config_json": canonical_bytes(config).decode("utf-8"),
+        "selected_demos_json": canonical_bytes(binding["selected_demos"]).decode("utf-8"),
+        "activity_timeout": activity_timeout(config["data"]["max_duration_seconds"]),
+    }}}
+
+
+def _manifest_summary(store, config, selected):
+    run, _ = run_config(config)
+    targets = selected_candidates(config, selected)
+    path = f"Files/producer/runs/{run.run_id}/manifest.json"
+    try:
+        raw, _ = store.read(path)
+    except FileNotFoundError:
+        return False, ["Producer manifest is not yet available."]
+    try:
+        manifest = strict_json_loads(raw.decode("utf-8"))
+        expected = new_manifest(run, selected)
+        expected["target_bindings"] = targets
+        validate_run_manifest(manifest, expected)
+    except (UnicodeError, ValueError, TypeError, RecursionError):
+        raise Blocked("Producer manifest identity or configuration does not match the run.") from None
+    batches = manifest["batches"]
+    if set(batches) - {str(number) for number in range(1, run.file_count + 1)}:
+        raise Blocked("Producer manifest contains unexpected batches.")
+    diagnostics = []
+    all_verified = len(batches) == run.file_count
+    for number in range(1, run.file_count + 1):
+        batch = batches.get(str(number))
+        if batch is None:
+            diagnostics.append(f"Batch {number}: not staged.")
+            all_verified = False
+            continue
+        _, expected_batch = batch_bytes(run, number)
+        if not batch_metadata_matches(batch, expected_batch):
+            raise Blocked(f"Producer batch {number} metadata differs from deterministic input.")
+        staged, _ = store.read(f"Files/producer/runs/{run.run_id}/{expected_batch['filename']}")
+        if hashlib.sha256(staged).hexdigest() != expected_batch["sha256"]:
+            raise Blocked(f"Producer batch {number} staged checksum differs.")
+        deliveries = batch.get("deliveries")
+        if not isinstance(deliveries, dict) or set(deliveries) != set(selected):
+            raise Blocked(f"Producer batch {number} delivery targets differ from the run.")
+        for destination in selected:
+            delivery = deliveries[destination]
+            if not isinstance(delivery, dict) or not isinstance(delivery.get("status"), str):
+                raise Blocked(f"Producer batch {number} has an invalid {destination} delivery.")
+            status = delivery["status"]
+            operation = delivery.get("operation_id")
+            detail = f"{batch['batch_id']} {destination}: {status}"
+            if isinstance(operation, str):
+                detail += f", source={operation[:256]}"
+            if destination == "demo-2" and isinstance(delivery.get("ingestion_outcome"), dict):
+                detail += f", ingestion={delivery['ingestion_outcome'].get('status')}"
+            diagnostics.append(detail + ".")
+            if status != "verified":
+                all_verified = False
+                continue
+            values = ("verified_row_count", "verified_total_minor_units", "verified_distinct_sales_line_ids")
+            try:
+                verified_at = datetime.fromisoformat(delivery["verified_at_utc"].replace("Z", "+00:00"))
+                valid_time = verified_at.tzinfo is not None and verified_at.utcoffset() == timedelta(0)
+            except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+                valid_time = False
+            if (any(type(delivery.get(name)) is not int for name in values)
+                    or delivery.get("verified_row_count") != expected_batch["row_count"]
+                    or delivery.get("verified_total_minor_units") != expected_batch["sales_amount_minor_units"]
+                    or delivery.get("verified_distinct_sales_line_ids") != expected_batch["row_count"]
+                    or not valid_time):
+                raise Blocked(f"Producer batch {number} has invalid {destination} verification evidence.")
+            if destination == "demo-2":
+                try:
+                    _validate_ingestion_outcome(delivery.get("ingestion_outcome"), operation)
+                except ValueError:
+                    raise Blocked(f"Producer batch {number} has invalid Eventhouse ingestion evidence.") from None
+                if delivery["ingestion_outcome"]["status"] != "succeeded":
+                    raise Blocked(f"Producer batch {number} lacks successful Eventhouse ingestion.")
+    scheduler = manifest.get("scheduler")
+    result = scheduler.get("result") if isinstance(scheduler, dict) else None
+    if (not isinstance(scheduler, dict) or scheduler.get("status") != "completed"
+            or not isinstance(result, dict) or result.get("verified") is not True or result.get("errors") != []):
+        all_verified = False
+        diagnostics.insert(0, "Producer scheduler has not reported a verified completion.")
+    return all_verified, diagnostics
+
+
+def _wait_for_measured(job, job_id, config, selected, plan, lakehouse_id):
+    deadline_utc = datetime.fromisoformat(job.binding["deadline_utc"].replace("Z", "+00:00"))
+    deadline = time.monotonic() + max(0, (deadline_utc - datetime.now(timezone.utc)).total_seconds())
+    refresh_at = time.monotonic() + 300
+    parent_terminal_at = None
+    parent_terminal_status = None
+    observed_child = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if parent_terminal_at is not None:
+            child_remaining = parent_terminal_at + STOP_CHILD_WAIT_SECONDS - time.monotonic()
+            if child_remaining <= 0:
+                raise Blocked(f"Producer job {job_id} is {parent_terminal_status}, but its exact notebook termination "
+                              "is unconfirmed; reconcile before retrying.")
+            remaining = min(remaining, child_remaining)
+        if time.monotonic() >= refresh_at:
+            job.client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
+            refresh_at = time.monotonic() + 300
+        try:
+            snapshot = job.status_detail(timeout=min(30, max(0.01, remaining)),
+                                         include_notebook=True)
+        except LifecycleBlocked as exc:
+            if "initial polling delay has not elapsed" not in str(exc):
+                raise Blocked(f"Producer job {job_id} status is unconfirmed: {exc}") from None
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+            continue
+        except (FabricHttpError, FabricTransportError) as exc:
+            raise Blocked(f"Producer job {job_id} status is unconfirmed: {exc}") from None
+        child = snapshot.get("notebook")
+        if child:
+            if observed_child is not None and child["job_id"] != observed_child:
+                raise Blocked(f"Producer job {job_id} linked notebook identity changed; termination is unconfirmed.")
+            observed_child = child["job_id"]
+        if parent_terminal_status is not None and snapshot["status"] != parent_terminal_status:
+            raise Blocked(f"Producer job {job_id} terminal status changed; termination is unconfirmed.")
+        if snapshot["status"] in ("Completed", "Failed", "Cancelled", "Deduped"):
+            if parent_terminal_at is None:
+                parent_terminal_at = time.monotonic()
+                parent_terminal_status = snapshot["status"]
+            if child and child["status"] in ("Completed", "Failed", "Cancelled"):
+                storage_token = azure_cli_token(plan["tenant_id"], plan["identity_id"], resource=STORAGE_RESOURCE)
+                store = OneLakeStore(job.binding["workspace_id"], lakehouse_id, lambda: storage_token)
+                verified, diagnostics = _manifest_summary(store, config, selected)
+                identities = (f"Pipeline job {job_id}: {snapshot['status']}; notebook job "
+                              f"{child['job_id']}: {child['status']}.")
+                if snapshot["status"] != "Completed" or child["status"] != "Completed" or not verified:
+                    raise Blocked(identities + " Delivery is not fully verified; reconcile the manifest. "
+                                  + " ".join(diagnostics[:20]))
+                return [identities, "Producer delivery is verified; file landing does not prove downstream facts.",
+                        *diagnostics]
+        wait = deadline - time.monotonic()
+        if parent_terminal_at is not None:
+            wait = min(wait, parent_terminal_at + STOP_CHILD_WAIT_SECONDS - time.monotonic())
+        time.sleep(min(5, max(0, wait)))
+    raise Blocked(f"Producer job {job_id} exceeded the bounded wait; termination is unconfirmed.")
+
+
+def _run_measured(config, plan, state_dir, selected_demos):
+    selected = _validate_run(config, selected_demos)
+    if any(not plan[field] for field in ("tenant_id", "capacity_id", "identity_id")):
+        raise Blocked("Producer tenant, capacity and identity are required; no job was started.")
+    if not Path(state_dir).is_absolute() or not Path(state_dir).is_dir():
+        raise Blocked("An existing absolute producer state directory is required; no job was started.")
+    selected_candidates(config, selected)
+    state = load_owned_state(StateStore(state_dir), plan)
+    if state is None or state.get("pending") or any(kind not in state["resources"] for kind in KINDS):
+        raise Blocked("The owned producer deployment is incomplete; no job was started.")
+    resources = state["resources"]
+    workspace_id = resources["workspace"]["id"]
+    lakehouse_id = resources["staging_lakehouse"]["id"]
+    shared = config["shared"]
+    if (shared.get("workspace_id") != workspace_id or shared.get("staging_lakehouse_id") != lakehouse_id
+            or shared.get("identity_id") != plan["identity_id"]):
+        raise Blocked("Effective producer IDs differ from owned state; no job was started.")
+    root = f"https://onelake.blob.fabric.microsoft.com/{workspace_id}/{lakehouse_id}/Files/producer/runs"
+    location = shared.get("run_state_location")
+    if location is not None and (not isinstance(location, str) or location.rstrip("/") != root):
+        raise Blocked("Configured producer state location differs from owned staging; no job was started.")
+    timeout = _track_timeout(config)
+    duration = config["data"]["max_duration_seconds"]
+    total = timeout * (2 if "demo-2" in selected else 1) + duration + STARTUP_HEADROOM_SECONDS + STOP_CHILD_WAIT_SECONDS
+    try:
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=total)
+    except OverflowError:
+        raise ContractError("The bounded producer deadline is too large.") from None
+    binding = {"run_id": config["data"]["run_id"], "nonce": "run-" + uuid.uuid4().hex,
+               "tenant_id": plan["tenant_id"], "prefix": plan["prefix"],
+               "config_sha256": hashlib.sha256(canonical_bytes(config)).hexdigest(),
+               "selected_demos": sorted(selected), "workspace_id": workspace_id,
+               "pipeline_id": resources["pipeline"]["id"], "notebook_id": resources["notebook"]["id"],
+               "manifest_uri": f"{root}/{config['data']['run_id']}/manifest.json",
+               "deadline_utc": deadline.isoformat()}
+    job = PipelineJob(state_dir, binding, None)
+    payload = _measured_payload(config, binding, plan["identity_id"], lakehouse_id)
+    with tempfile.TemporaryDirectory(prefix="producer-admission-") as directory:
+        directory = Path(directory)
+        config_path = directory / "effective-config.json"
+        config_path.write_bytes(canonical_bytes(config))
+
+        def token_ready():
+            live_state = load_owned_state(StateStore(state_dir), plan)
+            if live_state is None or live_state.get("pending") or live_state["resources"] != resources:
+                raise Blocked("Owned producer state changed during admission; no job was started.")
+            job.client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
+
+        try:
+            job_id = job.submit(payload, admission=lambda: _fresh_admission(
+                config, config_path, plan["prefix"], state_dir, directory, selected, token_ready))
+        except (FabricHttpError, FabricTransportError, OSError) as exc:
+            if job.path.exists():
+                raise Blocked("Producer submission outcome may be unknown; reconcile its journal before retrying.") from None
+            raise Blocked(f"Producer admission failed before submission: {exc}") from None
+    print(f"Producer pipeline job {job_id} submitted; inspect its journal before any retry.", file=sys.stderr,
+          flush=True)
+    try:
+        return _wait_for_measured(job, job_id, config, selected, plan, lakehouse_id)
+    except (StorageError, OSError) as exc:
+        raise Blocked(f"Producer job {job_id} delivery or termination remains unconfirmed: {exc}") from None
+
+
+def _write_stop_request(store, binding):
+    marker = canonical_bytes({"version": 1, "run_id": binding["run_id"], "nonce": binding["nonce"],
+                              "config_sha256": binding["config_sha256"]})
+    path = f"Files/producer/runs/{binding['run_id']}/stop.json"
+    try:
+        try:
+            store.create(path, marker)
+        except (StorageConflict, StorageOutcomeUnknown):
+            pass
+        actual, _ = store.read(path)
+    except (FileNotFoundError, StorageError):
+        raise Blocked("Cooperative stop request outcome is unconfirmed; reconcile before retrying.") from None
+    if actual != marker:
+        raise Blocked("A different cooperative stop request exists; reconcile before proceeding.")
+
+
+def _recover_measured(mode, job, config, selected, plan, lakehouse_id):
+    snapshot = job.status_detail(include_notebook=True)
+    child = snapshot.get("notebook")
+    terminal = snapshot["status"] in ("Completed", "Failed", "Cancelled", "Deduped") and child is not None \
+        and child["status"] in ("Completed", "Failed", "Cancelled")
+    store = None
+    action = "No cancellation was requested."
+    if mode == "stop-producer" and not terminal:
+        storage_token = azure_cli_token(plan["tenant_id"], plan["identity_id"], resource=STORAGE_RESOURCE)
+        store = OneLakeStore(job.binding["workspace_id"], lakehouse_id, lambda: storage_token)
+        _write_stop_request(store, job.binding)
+        action = "A cooperative stop was requested; blocking calls and in-flight deliveries are not interrupted."
+        deadline = time.monotonic() + STOP_CHILD_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            snapshot = job.status_detail(timeout=min(30, max(0.01, deadline - time.monotonic())),
+                                         include_notebook=True)
+            child = snapshot.get("notebook")
+            terminal = snapshot["status"] in ("Completed", "Failed", "Cancelled", "Deduped") \
+                and child is not None and child["status"] in ("Completed", "Failed", "Cancelled")
+            if terminal:
+                break
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
+    observations = [f"Recorded pipeline job {snapshot['job_id']} has live status {snapshot['status']}."]
+    if child:
+        observations.append(f"Linked notebook job {child['job_id']} has live status {child['status']}.")
+    else:
+        observations.append("Notebook linkage unconfirmed: " + snapshot.get("notebook_diagnostic", "not observed"))
+    observations.append(action)
+    if not terminal:
+        observations.append("Producer termination unconfirmed; in-flight deliveries require reconciliation.")
+        return observations
+    try:
+        if store is None:
+            storage_token = azure_cli_token(plan["tenant_id"], plan["identity_id"], resource=STORAGE_RESOURCE)
+            store = OneLakeStore(job.binding["workspace_id"], lakehouse_id, lambda: storage_token)
+        verified, diagnostics = _manifest_summary(store, config, selected)
+    except (StorageError, OSError, Blocked, ContractError) as exc:
+        observations.append("Producer termination confirmed; delivery reconciliation is unconfirmed: " + str(exc))
+        return observations
+    observations.append("Producer termination confirmed; " +
+                        ("recorded deliveries are verified." if verified else "in-flight deliveries require reconciliation."))
+    return [*observations, *diagnostics]
+
+
 def _recover_pipeline(mode, config, plan, state_dir, selected_demos):
     selected = _validate_run(config, selected_demos)
     if any(not plan[field] for field in ("tenant_id", "capacity_id", "identity_id")):
@@ -1212,15 +1631,35 @@ def _recover_pipeline(mode, config, plan, state_dir, selected_demos):
         client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
         principal_type = _workspace_principal(client, state, plan)
         _verify_item(client, state, plan, "pipeline", principal_type)
+        _verify_item(client, state, plan, "notebook", principal_type)
         job.client = client
-        snapshot = job.status_detail()
+        try:
+            measured = job.matches_payload(_measured_payload(config, job.binding, plan["identity_id"], lakehouse_id))
+        except LifecycleBlocked:
+            measured = False
+        if measured:
+            return _recover_measured(mode, job, config, selected, plan, lakehouse_id)
+        snapshot = job.status_detail(
+            timeout=STOP_CHILD_WAIT_SECONDS if mode == "stop-producer" else 30,
+            include_notebook=True, wait_for_terminal_child=mode == "stop-producer")
     except (FabricHttpError, FabricTransportError) as exc:
         raise Blocked(f"{exc} Termination unconfirmed.") from None
-    action = ("Cancellation was not requested because job and child provenance are not yet authenticated."
+    notebook = snapshot.get("notebook")
+    observation = (
+        f"Linked notebook job {notebook['job_id']} has live status {notebook['status']}."
+        if notebook else f"Notebook linkage unconfirmed: {snapshot['notebook_diagnostic']}"
+    )
+    if notebook and snapshot.get("notebook_diagnostic"):
+        observation += " " + snapshot["notebook_diagnostic"]
+    action = ("Cancellation was not requested because complete stop safety is not yet verified."
               if mode == "stop-producer" else "No cancellation was requested.")
-    return [f"Recorded pipeline job {snapshot['job_id']} has live status {snapshot['status']}.",
-            action,
-            "Blocked: notebook-child termination and in-flight delivery reconciliation are unproven; termination unconfirmed."]
+    blocker = ("Blocked: in-flight delivery reconciliation is unproven; producer termination unconfirmed."
+               if notebook and all(job["status"] in ("Completed", "Failed", "Cancelled")
+                                   for job in (snapshot, notebook))
+               else "Blocked: notebook-child termination and in-flight delivery reconciliation are unproven; "
+                    "termination unconfirmed.")
+    return [f"Recorded pipeline job {snapshot['job_id']} has live status {snapshot['status']}.", observation,
+            action, blocker]
 
 
 def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, candidate_path=None):
@@ -1228,8 +1667,7 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
     if mode == "cleanup" and not yes:
         raise ContractError("cleanup requires --yes.")
     if mode == "run-data":
-        _validate_run(config, selected_demos)
-        return ["Blocked: fresh readiness for the shared producer and every selected destination is not implemented; no job was started.", *BLOCKERS]
+        return _run_measured(config, plan, state_dir, selected_demos)
     if mode in ("producer-status", "stop-producer"):
         try:
             return _recover_pipeline(mode, config, plan, state_dir, selected_demos)
@@ -1253,31 +1691,44 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
     if not plan["names"]["workspace"]:
         missing.append("shared.workspace_name")
     if missing:
+        if mode == "validate-only":
+            raise Blocked("Deployment/readback requires " + ", ".join(missing) + ".")
         return ["Blocked: deployment/readback requires " + ", ".join(missing) + ".", *BLOCKERS]
     store = StateStore(state_dir)
     if mode == "validate-only":
-        selected = _selected_demos(selected_demos) if selected_demos is not None else None
-        if selected is not None:
-            selected_candidates(config, selected)
+        if selected_demos is None:
+            raise Blocked("Selected destinations are required for producer readiness.")
+        selected = _validate_run(config, selected_demos)
+        targets = selected_candidates(config, selected)
         state = load_owned_state(store, plan)
         if state is None:
-            return ["Blocked: no owned producer deployment state exists.", *BLOCKERS]
+            raise Blocked("No owned producer deployment state exists.")
         if state.get("pending"):
-            return ["Blocked: deployment has a pending operation; reconcile or resume it before validation.", *BLOCKERS]
+            raise Blocked("Deployment has a pending operation; reconcile or resume it before validation.")
+        if any(kind not in state["resources"] for kind in KINDS):
+            raise Blocked("Owned deployment state does not yet contain all producer resources.")
+        shared = config["shared"]
+        if (shared.get("workspace_id") != state["resources"].get("workspace", {}).get("id")
+                or shared.get("staging_lakehouse_id") != state["resources"].get("staging_lakehouse", {}).get("id")
+                or shared.get("identity_id") != plan["identity_id"]):
+            raise Blocked("Effective producer IDs differ from owned state.")
         token = azure_cli_token(plan["tenant_id"], plan["identity_id"])
         client = FabricClient(token)
         _verify_all(client, state, plan)
-        observations = []
-        if selected is not None:
-            clients = {name: client for name in selected}
-            if "demo-2" in selected:
-                clients["demo-2"] = FabricClient(token, skill="eventhouse-cli")
-            table_client = None
-            if "demo-3" in selected:
-                storage_token = azure_cli_token(plan["tenant_id"], plan["identity_id"], resource=STORAGE_RESOURCE)
-                table_client = OneLakeTableClient(storage_token)
-            observations = read_selected_targets(config, selected, clients, table_client=table_client)
-        return ["Owned workspace, item metadata, published Environment libraries and local definitions were read back successfully; runtime readiness remains unproven.", *observations, *BLOCKERS]
+        clients = {name: client for name in selected}
+        if "demo-2" in selected:
+            clients["demo-2"] = FabricClient(token, skill="eventhouse-cli")
+        table_client = None
+        if "demo-3" in selected:
+            storage_token = azure_cli_token(plan["tenant_id"], plan["identity_id"], resource=STORAGE_RESOURCE)
+            table_client = OneLakeTableClient(storage_token)
+        observations = read_selected_targets(config, selected, clients, table_client=table_client)
+        try:
+            require_write_roles(client, config, selected, targets, shared["workspace_id"], plan["identity_id"])
+        except (ValueError, RuntimeError) as exc:
+            raise Blocked(f"Producer write-role preflight failed: {exc}") from None
+        return ["Producer definitions, selected target metadata and direct write roles verified. "
+                "The notebook checks its actual runtime identity and access before writing.", *observations]
     if mode != "deploy":
         raise ContractError("Unsupported mode.")
     with store.lock():
@@ -1347,10 +1798,11 @@ def _result_target(args):
 def _envelope(mode, status="blocked", diagnostics=None):
     entries = list(diagnostics or [])
     if (mode in ("producer-status", "stop-producer") and status != "pass"
-            and not any("termination unconfirmed" in entry.lower() for entry in entries)):
+            and not any("termination unconfirmed" in entry.lower() or "producer termination confirmed" in entry.lower()
+                        for entry in entries)):
         entries.append("Producer termination unconfirmed.")
     return {"contract_version": 1, "track": "shared", "mode": mode, "status": status,
-            "ready": False, "diagnostics": entries}
+            "ready": mode == "validate-only" and status == "pass", "diagnostics": entries}
 
 
 def _raw_options(argv, name):
@@ -1423,7 +1875,7 @@ def main(argv=None):
             raise ContractError("Config is unreadable or is not valid JSON.") from None
         diagnostics = perform(args.mode, config, args.prefix, args.state_dir, args.selected_demos, args.yes,
                               candidate_path=candidate_path)
-        result = _envelope(args.mode, "pass" if args.mode in ("dry-run", "resolve-candidate-ids") else "blocked",
+        result = _envelope(args.mode, "pass" if args.mode in ("dry-run", "resolve-candidate-ids", "run-data", "validate-only") else "blocked",
                            diagnostics)
     except ContractError as exc:
         result = _envelope(args.mode, "fail", [str(exc)])

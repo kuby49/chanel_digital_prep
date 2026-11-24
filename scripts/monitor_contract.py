@@ -28,26 +28,32 @@ def strict_json(path):
         return json.load(file, object_pairs_hook=object_pairs, parse_constant=invalid_constant)
 
 
-def demo2_deployment_scope(config, prefix, state_dir):
+def deployment_scope(config, track, prefix, state_dir):
     if not isinstance(config, dict):
         raise ValueError("configuration must be an object")
-    settings = config.get("demo-2")
+    if track not in ("demo-1", "demo-2", "demo-3"):
+        raise ValueError("invalid demo deployment scope")
+    settings = config.get(track)
     if settings is None:
         settings = {}
     if not isinstance(settings, dict):
-        raise ValueError("demo-2 must be an object")
+        raise ValueError(f"{track} must be an object")
     owner_prefix = settings.get("deployment_prefix")
     owner_dir = settings.get("deployment_state_dir")
     if owner_prefix is None and owner_dir is None:
         return prefix, Path(state_dir)
     if not isinstance(owner_prefix, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", owner_prefix):
-        raise ValueError("demo-2.deployment_prefix must be a safe prefix and paired with deployment_state_dir")
+        raise ValueError(f"{track}.deployment_prefix must be a safe prefix and paired with deployment_state_dir")
     if not isinstance(owner_dir, str) or not owner_dir.strip():
-        raise ValueError("demo-2.deployment_state_dir must be an existing absolute directory")
+        raise ValueError(f"{track}.deployment_state_dir must be an existing absolute directory")
     directory = Path(owner_dir)
     if not directory.is_absolute() or not directory.is_dir():
-        raise ValueError("demo-2.deployment_state_dir must be an existing absolute directory")
+        raise ValueError(f"{track}.deployment_state_dir must be an existing absolute directory")
     return owner_prefix, directory.resolve()
+
+
+def demo2_deployment_scope(config, prefix, state_dir):
+    return deployment_scope(config, "demo-2", prefix, state_dir)
 
 
 def monitor_config(config):

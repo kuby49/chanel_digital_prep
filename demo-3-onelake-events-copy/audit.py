@@ -108,8 +108,8 @@ def _batch(evidence, landing_directory):
         raise AuditError("invalid batch checksum")
     count, total = batch["row_count"], batch["sales_amount_minor_units"]
     first, last = batch["first_sales_line_id"], batch["last_sales_line_id"]
-    if (not _integer(count, 1) or not _integer(total, 1) or not _integer(first, 1)
-            or not _integer(last, 1) or last > _MAX_ID or last - first + 1 != count):
+    if (not _integer(count, 1) or not _integer(total, 1) or type(first) is not int or first != 1
+            or not _integer(last, 1) or last > _MAX_ID or last != count):
         raise AuditError("invalid batch counts, amount, or key range")
     for name in GROUPS:
         groups = batch[name]
@@ -256,7 +256,8 @@ class BatchAudit:
             "rows_read", "rows_copied", "confirmed_at_utc"
         }:
             raise AuditError("invalid Copy result")
-        _uuid(result["activity_run_id"])
+        if result["activity_run_id"] is not None:
+            _uuid(result["activity_run_id"])
         _timestamp(result["confirmed_at_utc"])
         if (result["status"] != "Succeeded" or result["pipeline_run_id"] != attempt["pipeline_run_id"]
                 or type(result["files_read"]) is not int or result["files_read"] != 1
@@ -287,6 +288,16 @@ class BatchAudit:
         record["observations"].append(observation)
         self._checked_write(self._path(batch["batch_id"]), record, etag)
         return "already-completed" if record["state"] == "completed" else "copy-required"
+
+    def batch_state(self, evidence):
+        batch = _batch(evidence, self.landing_directory)
+        try:
+            record, _ = self._record(batch["batch_id"])
+        except FileNotFoundError:
+            return None
+        if record["batch"] != batch:
+            raise AuditError("existing batch identity or contents differ")
+        return record["state"]
 
     def copy_intent(self, token, batch_id):
         self._lock(token, batch_id)

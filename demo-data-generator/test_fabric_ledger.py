@@ -5,13 +5,6 @@ from urllib.error import HTTPError
 from fabric_ledger import FabricLedger
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import RunConfig
-from sales_ids import LOCK_PATH, OWNER, REGISTRY_PATH, registry_bytes
-
-
-TEST_SCOPE = {"version": 1, "kind": "fabric", "owner": OWNER,
-              "tenant_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-              "producer_workspace_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-              "staging_lakehouse_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
 TEST_TARGETS = {
     "demo-1": {"workspace_id": "11111111-1111-4111-8111-111111111111",
                "item_id": "44444444-4444-4444-8444-444444444444", "fact": "silver.fact"},
@@ -80,8 +73,6 @@ class MemoryStore:
         self.files = {}
         self.version = 0
         self.unknown_create_suffix = None
-        self.workspace_id = TEST_SCOPE["producer_workspace_id"]
-        self.lakehouse_id = TEST_SCOPE["staging_lakehouse_id"]
 
     def _etag(self):
         self.version += 1
@@ -115,20 +106,13 @@ class MemoryStore:
         del self.files[path]
 
 
-def initialized_store(store=None, retained=None):
-    store = store or MemoryStore()
-    store.create(REGISTRY_PATH, registry_bytes(TEST_SCOPE, TEST_TARGETS, retained or []))
-    return store
-
-
 def ledger_for(store, config, destinations):
-    return FabricLedger(store, config, destinations, allocator_scope=TEST_SCOPE,
-                        selected_targets={name: TEST_TARGETS[name] for name in destinations})
+    return FabricLedger(store, config, destinations, selected_targets={name: TEST_TARGETS[name] for name in destinations})
 
 
 class FabricLedgerTests(unittest.TestCase):
     def setUp(self):
-        self.store = initialized_store()
+        self.store = MemoryStore()
         self.config = RunConfig("run-1", file_count=1, rows_per_file=3)
 
     def test_resume_reconciles_without_resubmitting_and_checks_evidence(self):
@@ -188,7 +172,6 @@ class FabricLedgerTests(unittest.TestCase):
                 pass
         # An operator may release the exact lock only after confirming the old writer stopped.
         self.store.delete(lock, self.store.files[lock][1])
-        self.store.delete(LOCK_PATH, self.store.files[LOCK_PATH][1])
         with ledger_for(self.store, self.config, ["demo-1"]) as recovered:
             entry = recovered.stage_batch(1)
             self.assertEqual(entry["row_count"], 3)
@@ -204,11 +187,31 @@ class FabricLedgerTests(unittest.TestCase):
                 ledger.stage_batch(1)
         self.assertIn(lock, self.store.files)
         self.store.delete(lock, self.store.files[lock][1])
-        self.store.delete(LOCK_PATH, self.store.files[LOCK_PATH][1])
         with self.assertRaises(ValueError):
             with ledger_for(self.store, RunConfig("run-1", rows_per_file=4), ["demo-3"]):
                 pass
         self.assertNotIn(lock, self.store.files)
+
+    def test_runs_do_not_share_a_lock_and_removed_manifest_cannot_restart_a_run(self):
+        with ledger_for(self.store, self.config, ["demo-1"]) as first:
+            batch = first.stage_batch(1)
+            with ledger_for(self.store, RunConfig("run-2", file_count=1, rows_per_file=3), ["demo-1"]) as other:
+                self.assertNotEqual(other.stage_batch(1)["batch_id"], batch["batch_id"])
+                self.assertNotIn("sales_line_id_reservation", other.manifest)
+            path = first.manifest_path
+            etag = self.store.read(path)[1]
+        self.store.delete(path, etag)
+        with self.assertRaisesRegex(RuntimeError, "initialized run has no manifest"):
+            with ledger_for(self.store, self.config, ["demo-1"]):
+                self.fail("the existing run must not restart")
+
+    def test_replaced_run_lock_blocks_staging(self):
+        with self.assertRaisesRegex(RuntimeError, "writer lock changed"):
+            with ledger_for(self.store, self.config, ["demo-1"]) as ledger:
+                raw, etag = self.store.read(ledger.lock_path)
+                self.store.replace(ledger.lock_path, raw, etag)
+                ledger.stage_batch(1)
+        self.assertIn(ledger.lock_path, self.store.files)
 
     def test_failed_verification_is_persisted_and_cannot_be_retried(self):
         with ledger_for(self.store, self.config, ["demo-2"]) as ledger:

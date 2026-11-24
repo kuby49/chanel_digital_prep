@@ -113,6 +113,20 @@
     "sentinel_absent_on_independent_readback": true,
     "scope": "No sales data generated or delivered."
   },
+  "pipeline_high_concurrency_probe": {
+    "probe_id": "hcprobe-5c8ca6101d7c4bc29366165f5804b761",
+    "notebook_pipeline_run_enabled_before": false,
+    "notebook_pipeline_run_enabled_after": true,
+    "other_spark_settings_unchanged": true,
+    "parent_job_id": "6c8b2993-d2cc-49c0-a5f7-3551723c1314",
+    "child_job_id": "0135f4b8-3296-4b04-9f0c-f819a782ac72",
+    "high_concurrency_mode_status": {"sessionSource": "created", "sessionTag": null},
+    "parent_scheduler_status": "Completed",
+    "child_scheduler_status": "Completed",
+    "active_activity_exposed_child_id": false,
+    "cancellation_requested": false,
+    "scope": "No-sales preflight only. The child scheduler still reported InProgress after the parent and activity completed, before converging to Completed."
+  },
   "monitor_sentinel": {
     "path": "Files/preflight/producer-monitor-heartbeat-v1.txt",
     "sha256": "aea6faa895eae3072bb28cfacf732a93cfd9968fc8d2c6d2675f415278d6fd55",

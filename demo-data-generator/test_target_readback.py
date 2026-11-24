@@ -4,8 +4,9 @@ import io
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
-from urllib import error, parse
+from urllib import error, parse, request
 
 import deploy
 from fabric_runtime import RuntimeFabricClient, prepare_measured, stop_requested
@@ -395,6 +396,77 @@ class MeasuredRuntimeTests(unittest.TestCase):
         self.assertEqual(parse.parse_qs(parse.urlsplit(req.full_url).query), {"continuationToken": ["next/token"]})
         self.assertEqual((req.get_header("Authorization"), req.get_header("X-ms-fabric-skill"), timeout),
                          ("Bearer runtime-token", "spark-cli", 30))
+
+    def test_runtime_mlv_token_decodes_once_and_stays_on_original_origin(self):
+        path = (f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}"
+                "/jobs/refreshMaterializedLakeViews/instances?status=Completed")
+        uri = ("https://wabi-west-us3-a-primary-redirect.analysis.windows.net" + path
+               + "&continuationToken=a%3D")
+        opener = Opener(Response(body={"value": [1], "continuationToken": "a%3D", "continuationUri": uri}),
+                        Response(body={"value": [2]}))
+        client = RuntimeFabricClient(lambda: "runtime-token", opener=opener, clock=lambda: 5)
+        self.assertEqual(client.list_all(path), [1, 2])
+        self.assertEqual(opener.requests[1][0].full_url,
+                         "https://api.fabric.microsoft.com" + path + "&continuationToken=a%3D")
+
+    def test_runtime_workspace_role_token_decodes_once(self):
+        path = f"/v1/workspaces/{WORKSPACE}/roleAssignments"
+        opener = Opener(Response(body={"value": [1], "continuationToken": "a%2B"}),
+                        Response(body={"value": [2]}))
+        client = RuntimeFabricClient(lambda: "runtime-token", opener=opener, clock=lambda: 5)
+        self.assertEqual(client.list_all(path), [1, 2])
+        self.assertEqual(opener.requests[1][0].full_url,
+                         "https://api.fabric.microsoft.com" + path + "?continuationToken=a%2B")
+
+    def test_runtime_mlv_rejects_unsafe_or_inconsistent_continuations(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances"
+        origin = "https://wabi-west-us3-a-primary-redirect.analysis.windows.net"
+        for uri, token in (
+            (origin + path + "?continuationToken=a", "b"),
+            (origin + path + "?continuationToken=a&continuationToken=a", "a"),
+            (origin + path + "?continuationToken=a&other=x", "a"),
+            (origin + path + "/other?continuationToken=a", "a"),
+            (origin + path + "?continuationToken=a#fragment", "a"),
+            (origin.replace("https://", "https://user@") + path + "?continuationToken=a", "a"),
+            (origin + ":443" + path + "?continuationToken=a", "a"),
+            ("https://attacker.invalid" + path + "?continuationToken=a", "a"),
+            (origin.replace("https://", "http://") + path + "?continuationToken=a", "a"),
+            ("", "a"),
+            ([], "a"),
+            (None, "a%invalid"),
+            (None, "a%00"),
+        ):
+            with self.subTest(uri=uri, token=token):
+                opener = Opener(Response(body={"value": [], "continuationToken": token, "continuationUri": uri}))
+                client = RuntimeFabricClient(lambda: "runtime-token", opener=opener, clock=lambda: 5)
+                with self.assertRaises(RuntimeError):
+                    client.list_all(path)
+                self.assertEqual(len(opener.requests), 1)
+
+    def test_runtime_rejects_repeated_decoded_token(self):
+        path = f"/v1/workspaces/{WORKSPACE}/roleAssignments"
+        opener = Opener(Response(body={"value": [], "continuationToken": "a%3D"}),
+                        Response(body={"value": [], "continuationToken": "a="}))
+        client = RuntimeFabricClient(lambda: "runtime-token", opener=opener, clock=lambda: 5)
+        with self.assertRaisesRegex(RuntimeError, "continuation is invalid"):
+            client.list_all(path)
+        self.assertEqual(len(opener.requests), 2)
+
+    def test_runtime_bodyless_post_and_patch_have_no_form_content_type(self):
+        for method in ("POST", "PATCH"):
+            with self.subTest(method=method):
+                opener = Opener(Response(202), Response(202))
+                client = RuntimeFabricClient(lambda: "runtime-token", opener=opener, clock=lambda: 5)
+                client.request(method, f"/v1/workspaces/{WORKSPACE}")
+                client.request(method, f"/v1/workspaces/{WORKSPACE}", {"example": 1})
+                handler = request.HTTPHandler()
+                handler.add_parent(SimpleNamespace(addheaders=[]))
+                bodyless = handler.do_request_(opener.requests[0][0])
+                with_json = handler.do_request_(opener.requests[1][0])
+                self.assertIsNone(bodyless.data)
+                self.assertIsNone(bodyless.get_header("Content-type"))
+                self.assertEqual(json.loads(with_json.data), {"example": 1})
+                self.assertEqual(with_json.get_header("Content-type"), "application/json")
 
     def test_runtime_mutations_are_bounded_authenticated_and_never_automatically_retried(self):
         from urllib.error import URLError

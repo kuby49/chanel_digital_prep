@@ -65,8 +65,6 @@ class RuntimeFabricClient:
         if payload is not None:
             data = canonical_bytes(payload)
             headers["Content-Type"] = "application/json"
-        elif method in ("POST", "PATCH"):
-            data = b""
         req = request.Request("https://api.fabric.microsoft.com" + path, data=data, headers=headers, method=method)
         try:
             with self.opener.open(req, timeout=timeout) as response:
@@ -101,26 +99,54 @@ class RuntimeFabricClient:
         deadline = self._clock() + 120
         values, seen = [], set()
         next_path = path
+        original = parse.urlsplit(path)
+        mlv_history = re.fullmatch(
+            r"/v1/workspaces/[a-f0-9-]{36}/lakehouses/[a-f0-9-]{36}"
+            r"/jobs/refreshMaterializedLakeViews/instances", original.path)
+        original_query = parse.parse_qsl(original.query, keep_blank_values=True)
         for _ in range(100):
             _, page = self.get(next_path, deadline)
             if not isinstance(page, dict) or not isinstance(page.get("value"), list):
-                raise RuntimeError("Runtime workspace role listing is invalid")
+                raise RuntimeError("Runtime Fabric listing is invalid")
             values.extend(page["value"])
             if len(values) > 10000:
-                raise RuntimeError("Runtime workspace role listing is too large")
+                raise RuntimeError("Runtime Fabric listing is too large")
             token = page.get("continuationToken")
             uri = page.get("continuationUri")
             token = None if token == "null" else token
             uri = None if uri == "null" else uri
             if not token:
                 if uri:
-                    raise RuntimeError("Runtime workspace role continuation is incomplete")
+                    raise RuntimeError("Runtime Fabric continuation is incomplete")
                 return values
-            if not isinstance(token, str) or token in seen:
-                raise RuntimeError("Runtime workspace role continuation is invalid")
-            seen.add(token)
-            next_path = path + ("&" if "?" in path else "?") + parse.urlencode({"continuationToken": token})
-        raise RuntimeError("Runtime workspace role listing exceeded its page limit")
+            if not isinstance(token, str) or re.search(r"%(?![0-9a-fA-F]{2})", token):
+                raise RuntimeError("Runtime Fabric continuation is invalid")
+            try:
+                decoded = parse.unquote(token, encoding="utf-8", errors="strict")
+            except UnicodeError:
+                raise RuntimeError("Runtime Fabric continuation is invalid") from None
+            if (not decoded or decoded in seen
+                    or any(ord(char) < 32 or ord(char) == 127 for char in decoded)):
+                raise RuntimeError("Runtime Fabric continuation is invalid")
+            if mlv_history and uri is not None:
+                if (not isinstance(uri, str) or "\\" in uri
+                        or any(ord(char) < 32 or ord(char) == 127 for char in uri)):
+                    raise RuntimeError("Runtime MLV continuation URI is invalid")
+                continuation = parse.urlsplit(uri)
+                query = parse.parse_qsl(continuation.query, keep_blank_values=True)
+                tokens = [value for key, value in query if key == "continuationToken"]
+                if (continuation.scheme != "https"
+                        or not (continuation.netloc == "api.fabric.microsoft.com"
+                                or re.fullmatch(r"wabi-[a-z0-9-]+\.analysis\.windows\.net",
+                                                continuation.netloc))
+                        or continuation.fragment or continuation.path != original.path
+                        or len({key for key, _ in query}) != len(query)
+                        or any(pair not in original_query for pair in query if pair[0] != "continuationToken")
+                        or len(tokens) != 1 or tokens[0] != decoded):
+                    raise RuntimeError("Runtime MLV continuation URI or token differs")
+            seen.add(decoded)
+            next_path = path + ("&" if "?" in path else "?") + parse.urlencode({"continuationToken": decoded})
+        raise RuntimeError("Runtime Fabric listing exceeded its page limit")
 
 
 def _uuid(value):

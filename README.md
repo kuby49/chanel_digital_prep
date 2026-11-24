@@ -24,13 +24,15 @@ Lakehouse was created for the new producer. Post-fence checks found no new
 owned Copy work or known unresolved ingestion; these point-in-time checks and
 the fence do not exclude uncoordinated writers. Subsequent local runtime
 pagination and bodyless-request fixes have not yet been published to the Fabric
-notebook.
+notebook. A replacement producer notebook and pipeline have been created in
+the new workspace; the pipeline defaults to blocked until its new profile and
+destination access are verified.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
 run requires a separately confirmed schedule and updated profile.
 The first-cycle Demo 3 rule was also disabled and read back. A requested
-capacity restart and retry remain pending: unrelated mirrored catalogs have
-periodic sync enabled on the shared capacity, so their interruption must be
-coordinated before suspension. The capacity was left running.
+capacity restart was completed after the user accepted interruption of the
+shared capacity, and it was subsequently scaled to F32. The capacity was
+read back Active at F32; the requested live retry remains incomplete.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer

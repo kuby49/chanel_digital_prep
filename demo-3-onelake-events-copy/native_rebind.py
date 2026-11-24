@@ -519,7 +519,8 @@ class NativeRebind:
         notebook_start, notebook_end = _when(exact.get("startTimeUtc")), _when(exact.get("endTimeUtc"))
         if (exact.get("id") != activity_id or exact.get("status") != "Completed"
                 or exact.get("jobType") != "PipelineRunNotebook" or notebook_end < notebook_start
-                or notebook_start < start - timedelta(minutes=1) or notebook_end > end + timedelta(minutes=1)):
+                or notebook_start < start - timedelta(minutes=1)
+                or notebook_start > end + timedelta(minutes=1)):
             raise CandidateBlocked("Exact activity-linked notebook job is not confirmed.")
         return {"pipeline_job_id": job_id, "activity_run_id": activity_id, "notebook_job_id": activity_id,
                 "activity_status": "Succeeded", "notebook_job_status": "Completed"}

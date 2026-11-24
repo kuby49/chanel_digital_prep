@@ -123,11 +123,13 @@ come from an independent target query, including the symmetric multiset
 difference against all nine source columns, unique key range, orphan count, and
 grouped totals. The implementation does not perform that query, recover stale
 locks, or fence writers that ignore the lock. A lost response or crash requires
-reconciliation; never automatically remove a stale lock. The storage probe
-used the interactive preflight principal, not the pipeline identity, and did
-not inject response loss or a crash. A separate isolated journal probe used
-synthetic Copy and query evidence to exercise the journal against OneLake; it
-performed no Copy or target query and conditionally removed its test records.
+reconciliation; never automatically remove a stale lock. Isolated journal
+probes used the interactive preflight principal, not the pipeline identity,
+and synthetic Copy and query evidence. A client wrapper simulated losing the
+response after real lock creation and Copy-intent writes; both retained the
+lock and rejected a competing writer. The probes did not interrupt the network,
+crash a process, perform Copy, or query the target. Their known test objects
+were conditionally removed only after confirming no Copy had been sent.
 
 `python demo-3-onelake-events-copy/reconcile.py --manifest <manifest.json> --query-export <results.json>`
 compares measured batches only. The query export must contain `batches` keyed by

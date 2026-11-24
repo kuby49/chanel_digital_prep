@@ -497,8 +497,8 @@ class ReconciliationTests(unittest.TestCase):
         import csv
         import io
         from collections import defaultdict
-        producer_path = Path(os.environ.get(
-            "DEMO3_PRODUCER_PATH", ROOT.parent / "demo-data-generator" / "generator.py")).resolve()
+        producer_path = Path(os.environ.get("DEMO3_PRODUCER_PATH") or
+                             ROOT.parent / "demo-data-generator" / "generator.py").resolve()
         sys.path.insert(0, str(producer_path.parent))
         self.addCleanup(sys.path.remove, str(producer_path.parent))
         producer_spec = importlib.util.spec_from_file_location("producer_fixture", producer_path)

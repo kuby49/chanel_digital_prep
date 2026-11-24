@@ -63,6 +63,11 @@ def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample)
     tenant_id, workspace_id, lakehouse_id, pipeline_id = map(
         _id, (tenant_id, workspace_id, lakehouse_id, pipeline_id)
     )
+    expected_source = (
+        f"/tenants/{tenant_id}/workspaces/{workspace_id}/items/{lakehouse_id}"
+    )
+    if sample.get("source") != expected_source:
+        raise ValueError("event source does not match the selected Lakehouse")
     container, source, event, rule, action, step1, step2, step3, step4 = (
         str(uuid.uuid4()) for _ in range(9)
     )
@@ -85,8 +90,8 @@ def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample)
             _string("fabricJobConnectionDocumentId", action),
             {"name": "additionalInformation", "type": "array", "values": []},
             {"name": "parameters", "type": "array", "values": [
-                _parameter("sourceSubject", "subject"),
-                _parameter("eventId", "id"),
+                _parameter("sourceSubject", "___subject"),
+                _parameter("eventId", "___id"),
             ]},
         ],
     }

@@ -1,13 +1,34 @@
 # Demo 3: OneLake events and Copy
 
-**Status: blocked; not deployed.** This directory provides an offline candidate
-Activator builder and a fail-closed orchestrator entry point, not a working
-ingestion deployment. No connections, pipeline, rule, tables or resources have
-been created or verified. `dry-run` only validates the local contract.
+**Status: blocked for production ingestion.** An isolated MCAP preflight
+workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
+stopped probe Activator exist. They do not constitute a deployable production
+pipeline. The entry point remains fail-closed; `dry-run` only validates the
+local contract.
 
 ## Contract
 
-`python deploy.py --mode {dry-run,validate-only,deploy,cleanup} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. A v1 result reports `track: demo-3`; `ready` is false until a live deployment and all prerequisites are verified. Non-dry-run modes currently return `blocked` and make no Fabric requests; cleanup also never deletes anything.
+`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. A v1 result reports `track: demo-3`; `ready` remains false. Deploy, validation and cleanup currently return `blocked` and make no Fabric requests; cleanup never deletes anything.
+
+`resolve-target-candidate` is local-only. It reads a confirmed
+`demo-3-state.json` under an exclusive `demo-3-state.lock` and creates a fresh
+`demo-3-target-candidate.json` beside the result without overwriting an existing
+file. Missing, invalid, pending, uncertain or conflicting ownership blocks the
+operation; a stale lock is never cleared automatically. A successful candidate is
+not proof of live ownership, access, inventory, exclusive writing or readiness.
+The current deployment stub does not create an ownership journal or adopt the
+preflight resources.
+
+The journal must identify contract version, track, tenant, prefix, an owner ID
+and marker `<prefix>-demo3-<owner-id>`, plus empty `pending_operations` and
+`uncertain_operations` arrays. Confirmed `workspace` and `lakehouse` records
+must carry canonical nonzero IDs, item type, `created_by_owner`,
+`create_intent_id`, and matching independent `readback` identity and owner
+marker. The Lakehouse and its readback must name the owned workspace. A confirmed
+`fact` record must bind that workspace and Lakehouse to the exact physical name
+`dbo.factsales`. The journal must be written by a future deployment/recovery
+workflow only after independently establishing creation and readback; it must
+not be fabricated from the preflight observations.
 
 The shared producer's v1 CSV has the header
 `SalesLineID,BatchID,SaleTimestamp,CustomerID,ProductID,Date,Quantity,UnitPriceMinorUnits,SalesAmountMinorUnits`.
@@ -25,11 +46,11 @@ in coordinated-run totals; `bootstrap` and `negative-test` are separate.
 
 | Operation | Documented API or capability | Required proof before deployment |
 |---|---|---|
-| Connection | [`POST /v1/connections`](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/create-connection), delegated `Connection.ReadWrite.All`; users and permitted service principals supported | Discover the Lakehouse-specific connection creation method, parameters and supported credential type. Test and read back a demo-owned connection. Never store credentials in config or evidence. |
-| Pipeline | [Item definitions](https://learn.microsoft.com/en-us/fabric/data-factory/pipeline-rest-api-capabilities), `pipeline-content.json` in Base64 | Implement and read back the exact connector JSON and explicit mappings. [Lakehouse Copy](https://learn.microsoft.com/en-us/fabric/data-factory/connector-lakehouse-copy-activity) documents exact `folderPath`/`fileName`, `DelimitedText`, and `Upsert` with `keyColumns`; feature documentation is not proof of the pipeline JSON or tenant runtime behavior. |
-| Activator | [Reflex item definition](https://learn.microsoft.com/en-us/fabric/real-time-hub/consume-events-activator-rest-api), `ReflexEntities.json` | Capture an actual event and verify the binding, filters, source identity, region, deployed readback and invocation using a pipeline job and activity run. `activator.py` constructs a **disabled, untested candidate** only. Reference `subject` and `id` are documented event fields, but their resolution as pipeline parameters must be verified. |
-| Audit, recovery, serialization | No implementation yet | A durable per-file audit is insufficient by itself. Verify Copy upsert keyed by `SalesLineID` after a successful write followed by a failed audit commit and on duplicate events. Implement a durable single-writer mechanism or prove a supported safe concurrency strategy, including crash recovery and bounded retries. Do not equate activity concurrency with cross-run serialization. |
-| Completion | [Job Scheduler and activity runs](https://learn.microsoft.com/en-us/fabric/data-factory/pipeline-rest-api-capabilities) | Capture event, pipeline and activity timestamps, file identity, count and totals; validate replay, malformed CSV, joins, and visibility before marking ready. |
+| Connection | A Lakehouse OAuth2 connection was created in the Fabric UI, read back via API, and used by a two-row Copy probe. The public [create-connection request](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/create-connection) lists OAuth2 as a credential type but does not define OAuth2 in its create-credentials union. | Automate a supported connection path or explicitly require the UI-created connection; verify identity and access in each environment. Never store credentials. |
+| Pipeline | A UI-authored probe copied an exact file and replayed the same two rows with `LakehouseTableSink` `upsertSettings.keys`. A top-level `keyColumns` property was accepted in a definition but failed at runtime. | Implement parameterized exact-file Copy, explicit sales mappings, `SalesLineID` upsert, and runtime validation. The two-row probe is not a production pipeline or crash-recovery proof. |
+| Activator | A restricted non-sales OneLake `FileCreated` event invoked a parameter-only pipeline. The observed Activator event fields `___subject` and `___id` produced the same subject and event ID in source history, activation history and pipeline activities. `activator.py` builds a disabled candidate with these bindings. | Verify the actual production source and bindings in its environment, and verify completed-file readiness. One preflight event appeared in source history without an activation during reconfiguration; definition readback or a Running label alone is insufficient. |
+| Audit, recovery, serialization | No production implementation yet. | Persist per-file audit, reconcile missed events and uncertain writes, prove safe serialization/exclusive writers, bounded retries, duplicate delivery, and write-then-crash recovery. Pipeline activity concurrency alone is not cross-run serialization. |
+| Query surface | Setup verified dimensions and the fact schema. A non-destructive SQL metadata refresh using actual lowercase Delta paths exposed all four tables; the Spark amount view is not exposed as a SQL view. | Verify joined queries, DECIMAL(18,2) results, exact totals and visibility with valid sales data. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
 
 On 2026-11-23, read-only MCAP cloud `supportedConnectionTypes` returned one
 `Lakehouse` type with creation method `Lakehouse.Contents`, optional Boolean
@@ -43,10 +64,12 @@ or `Connection.ReadWrite.All` permits metadata listing; creation requires
 `Connection.ReadWrite.All` and appropriate Fabric permissions.
 
 OneLake's documented [`FileCreated`](https://learn.microsoft.com/en-us/fabric/real-time-hub/explore-fabric-onelake-events)
-can mean create **or update**; rename is a different event. A move of a staged
-file may therefore not fire this subscription. Validate the actual producer
-operation and completed-file readiness from captured events; do not infer either
-from the filename or definition upload. Event filters use case-insensitive
+can mean create **or update**; rename is a different event. The current producer
+conditionally PUTs the complete CSV to its final Blob path; a preflight PUT
+emitted `FileCreated` with `data.api=PutBlob`, and a later GET confirmed its
+bytes. This does not prove that the bytes were readable at event delivery.
+An existing-file replay performs no new PUT and cannot rely on another event.
+Event filters use case-insensitive
 `subject` prefix and suffix comparisons; the pipeline must additionally reject
 anything except a direct immutable `sales_<run>_<batch>.csv` child and safely
 extract an exact file name. It must not read a wildcard or whole folder.
@@ -57,14 +80,16 @@ On deployment, use `activator-cli` authoring guidance, validate source and
 captured fields, include its telemetry header on Fabric calls, handle 202 LROs
 and 429 retries, and read back the definitions. Do not enable the rule until
 the readiness and safe-write gates pass. Obtain approval before cross-workspace
-permissions or chargeable resources; no UI fallback without an approved exception.
+permissions or chargeable resources. The user approved the UI connection
+creation as a course correction; do not silently substitute another connection.
 
 ## Local checks
 
 Run `python -m unittest discover -s demo-3-onelake-events-copy/tests -v` from the repository root.
-The synthetic events in these tests exercise local structure only and are not
-evidence of Fabric behavior. No live presenter walkthrough or cleanup is
-available until deployment is implemented and approved.
+The synthetic events in these tests exercise local structure only. Set
+`DEMO3_PRODUCER_PATH` to the shared producer's `generator.py` to also test the
+actual producer manifest and notebook packaging. No live presenter walkthrough
+or automated cleanup is available until deployment is implemented and approved.
 
 `python demo-3-onelake-events-copy/reconcile.py --manifest <manifest.json> --query-export <results.json>`
 compares measured batches only. The query export must contain `batches` keyed by

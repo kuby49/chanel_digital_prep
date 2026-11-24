@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import os
@@ -16,6 +17,15 @@ spec.loader.exec_module(activator)
 spec = importlib.util.spec_from_file_location("demo3_reconcile", ROOT / "reconcile.py")
 reconcile = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reconcile)
+spec = importlib.util.spec_from_file_location("demo3_setup", ROOT / "setup_notebook.py")
+setup = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(setup)
+spec = importlib.util.spec_from_file_location("demo3_view_validation", ROOT / "view_validation.py")
+view_validation = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(view_validation)
+spec = importlib.util.spec_from_file_location("demo3_deploy", ROOT / "deploy.py")
+deploy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(deploy)
 
 
 class EventTests(unittest.TestCase):
@@ -34,7 +44,8 @@ class EventTests(unittest.TestCase):
 
     def test_definition_has_connected_disabled_rule_and_dynamic_parameters(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
-        entities = activator.build_definition(*ids, self.event)
+        sample = {**self.event, "source": f"/tenants/{ids[0]}/workspaces/{ids[1]}/items/{ids[2]}"}
+        entities = activator.build_definition(*ids, sample)
         by_type = {entity["type"]: entity for entity in entities if entity["type"] != "timeSeriesView-v1"}
         source = by_type["realTimeHubSource-v1"]
         self.assertEqual(source["payload"]["connection"]["artifactId"], ids[2])
@@ -53,7 +64,7 @@ class EventTests(unittest.TestCase):
         self.assertEqual(action_id, by_type["fabricItemAction-v1"]["uniqueIdentifier"])
         params = next(x["values"] for x in binding if x["name"] == "parameters")
         self.assertEqual([p["arguments"][2]["values"][0]["arguments"][0]["value"] for p in params],
-                         ["subject", "id"])
+                         ["___subject", "___id"])
 
     def test_sample_is_required_and_invalid_ids_rejected(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
@@ -61,9 +72,25 @@ class EventTests(unittest.TestCase):
             activator.build_definition(*ids, {})
         with self.assertRaises(ValueError):
             activator.build_definition("not-a-guid", *ids[1:], self.event)
+        with self.assertRaises(ValueError):
+            activator.build_definition(*ids, {**self.event, "source": "/other-lakehouse"})
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_verification_timeout_precedence_and_validation(self):
+        self.assertEqual(deploy.verification_timeout({"demo-3": {}}), 900)
+        self.assertEqual(deploy.verification_timeout(
+            {"execution": {"verification_timeout_seconds": 25}, "demo-3": {}}), 25)
+        self.assertEqual(deploy.verification_timeout(
+            {"execution": {"verification_timeout_seconds": 25},
+             "demo-3": {"verification_timeout_seconds": 12}}), 12)
+        for invalid in (0, -1, True, None, 1.5, "12"):
+            for section in ("execution", "demo-3"):
+                config = {"demo-3": {}, "execution": {}}
+                config[section]["verification_timeout_seconds"] = invalid
+                with self.subTest(section=section, invalid=invalid), self.assertRaises(ValueError):
+                    deploy.verification_timeout(config)
+
     def test_contract_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -99,6 +126,190 @@ class EntrypointTests(unittest.TestCase):
             self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["status"], "fail")
 
 
+class TargetCandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.tenant = str(uuid.uuid4())
+        self.owner = str(uuid.uuid4())
+        self.workspace = str(uuid.uuid4())
+        self.lakehouse = str(uuid.uuid4())
+        self.marker = f"chanel-demo3-{self.owner}"
+        self.config = {"contract_version": 1, "tenant_id": self.tenant, "demo-3": {}}
+        self.journal = {
+            "contract_version": 1, "track": "demo-3", "tenant_id": self.tenant,
+            "prefix": "chanel", "owner": {"id": self.owner, "marker": self.marker},
+            "pending_operations": [], "uncertain_operations": [],
+            "workspace": {
+                "id": self.workspace, "type": "Workspace", "status": "confirmed",
+                "created_by_owner": self.owner, "create_intent_id": str(uuid.uuid4()),
+                "readback": {"id": self.workspace, "type": "Workspace", "owner_marker": self.marker},
+            },
+            "lakehouse": {
+                "id": self.lakehouse, "type": "Lakehouse", "status": "confirmed",
+                "workspace_id": self.workspace, "created_by_owner": self.owner,
+                "create_intent_id": str(uuid.uuid4()),
+                "readback": {"id": self.lakehouse, "type": "Lakehouse",
+                             "workspace_id": self.workspace, "owner_marker": self.marker},
+            },
+            "fact": {"status": "confirmed", "workspace_id": self.workspace,
+                     "item_id": self.lakehouse, "name": "dbo.factsales"},
+        }
+
+    def run_resolver(self, journal=None, config=None, result_name="result.json"):
+        config_path = self.root / "config.json"
+        config_path.write_text(json.dumps(config or self.config), encoding="utf-8")
+        if journal is not None:
+            (self.root / deploy.STATE_FILE).write_text(json.dumps(journal), encoding="utf-8")
+        result = self.root / result_name
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "deploy.py"), "--mode", "resolve-target-candidate",
+             "--config", str(config_path), "--prefix", "chanel", "--state-dir", str(self.root),
+             "--result", str(result)],
+            capture_output=True, text=True, check=False,
+        )
+        return proc, json.loads(result.read_text(encoding="utf-8"))
+
+    def test_confirmed_journal_emits_one_candidate_without_claiming_readiness(self):
+        proc, result = self.run_resolver(self.journal)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual((result["status"], result["ready"]), ("pass", False))
+        candidate_path = self.root / deploy.CANDIDATE_FILE
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        self.assertEqual(candidate, {
+            "contract_version": 1, "track": "demo-3", "tenant_id": self.tenant,
+            "prefix": "chanel", "target": {
+                "workspace_id": self.workspace, "item_id": self.lakehouse, "fact": "dbo.factsales",
+            },
+        })
+        self.assertFalse((self.root / deploy.LOCK_FILE).exists())
+        before = candidate_path.read_bytes()
+        proc, result = self.run_resolver(result_name="second-result.json")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(candidate_path.read_bytes(), before)
+
+    def test_missing_incomplete_or_conflicting_ownership_blocks(self):
+        proc, result = self.run_resolver()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(result["status"], "blocked")
+        cases = []
+        for field in ("pending_operations", "uncertain_operations"):
+            journal = copy.deepcopy(self.journal)
+            journal[field] = ["unresolved"]
+            cases.append((journal, self.config))
+        for field, value in (("status", "pending"), ("created_by_owner", str(uuid.uuid4())),
+                             ("create_intent_id", str(uuid.UUID(int=0)))):
+            journal = copy.deepcopy(self.journal)
+            journal["workspace"][field] = value
+            cases.append((journal, self.config))
+        journal = copy.deepcopy(self.journal)
+        journal["lakehouse"]["readback"]["workspace_id"] = str(uuid.uuid4())
+        cases.append((journal, self.config))
+        journal = copy.deepcopy(self.journal)
+        journal["lakehouse"]["readback"]["owner_marker"] = "different-owner"
+        cases.append((journal, self.config))
+        journal = copy.deepcopy(self.journal)
+        journal["fact"]["name"] = "dbo.OtherFact"
+        cases.append((journal, self.config))
+        for field, value in (("workspace_id", str(uuid.uuid4())),
+                             ("lakehouse_id", str(uuid.uuid4())),
+                             ("destination_table", "dbo.OtherFact")):
+            config = copy.deepcopy(self.config)
+            config["demo-3"][field] = value
+            cases.append((self.journal, config))
+        for index, (journal, config) in enumerate(cases):
+            with self.subTest(case=index):
+                proc, result = self.run_resolver(journal, config, f"invalid-{index}.json")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(result["status"], "blocked")
+                self.assertFalse((self.root / deploy.CANDIDATE_FILE).exists())
+                self.assertFalse((self.root / deploy.LOCK_FILE).exists())
+
+    def test_stale_lock_and_journal_are_never_overwritten(self):
+        lock = self.root / deploy.LOCK_FILE
+        lock.write_text("existing lock\n", encoding="utf-8")
+        proc, result = self.run_resolver(self.journal)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(lock.read_text(encoding="utf-8"), "existing lock\n")
+        self.assertFalse((self.root / deploy.CANDIDATE_FILE).exists())
+        journal_path = self.root / deploy.STATE_FILE
+        before = journal_path.read_bytes()
+        proc, _ = self.run_resolver(result_name=deploy.STATE_FILE)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(journal_path.read_bytes(), before)
+
+
+class SetupNotebookTests(unittest.TestCase):
+    def setUp(self):
+        self.generator = (
+            "from dataclasses import dataclass\n"
+            "from pathlib import Path\n"
+            "assert Path(__file__).is_file()\n"
+            "@dataclass\n"
+            "class RunConfig:\n    pass\n"
+            "def dimensions(config):\n    return {}\n"
+        )
+        self.config = {"contract_version": 1, "data": {
+            "start_date": "2026-01-01", "date_count": 365, "product_count": 20,
+            "customer_count": 100, "seed": 42,
+        }}
+        self.workspace_id = str(uuid.uuid4())
+        self.lakehouse_id = str(uuid.uuid4())
+
+    def test_notebook_uses_shared_source_and_binds_the_lakehouse(self):
+        notebook = setup.build_notebook(
+            self.generator, self.config, self.workspace_id, self.lakehouse_id, "DemoLakehouse")
+        binding = notebook["metadata"]["trident"]["lakehouse"]
+        self.assertEqual(binding["default_lakehouse"], self.lakehouse_id)
+        self.assertEqual(binding["default_lakehouse_workspace_id"], self.workspace_id)
+        parameters = "".join(notebook["cells"][0]["source"])
+        self.assertIn("setup_start_date = '2026-01-01'", parameters)
+        self.assertIn("setup_customer_count = 100", parameters)
+        for cell in notebook["cells"]:
+            compile("".join(cell["source"]), cell["id"], "exec")
+        namespace = {}
+        exec("".join(notebook["cells"][1]["source"]), namespace)
+        self.addCleanup(namespace["_setup_generator_dir"].cleanup)
+        self.addCleanup(sys.modules.pop, namespace["_setup_generator_name"], None)
+        self.assertEqual(namespace["_setup_generator_path"].read_bytes(), self.generator.encode("utf-8"))
+        self.assertEqual(namespace["dimensions"](namespace["RunConfig"]()), {})
+
+    def test_invalid_dimension_inputs_are_rejected(self):
+        for field, value in (("date_count", 0), ("product_count", True),
+                             ("customer_count", 2147483648), ("seed", None),
+                             ("start_date", "invalid")):
+            config = {**self.config, "data": {**self.config["data"], field: value}}
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                setup.build_notebook(
+                    self.generator, config, self.workspace_id, self.lakehouse_id, "DemoLakehouse")
+        with self.assertRaises(ValueError):
+            setup.build_notebook(
+                self.generator, self.config, self.workspace_id, self.lakehouse_id,
+                "DemoLakehouse`; DROP TABLE x")
+
+    def test_spark_view_definition_allows_only_the_same_workspace_qualifier(self):
+        view = "`DemoLakehouse`.`dbo`.`FactSalesAmounts`"
+        table = "`DemoLakehouse`.`dbo`.`FactSales`"
+        query = f"SELECT *, CAST(`SalesAmountMinorUnits` / 100 AS DECIMAL(18,2)) AS `SalesAmount` FROM {table}"
+        ddl = (
+            f"CREATE VIEW `demo-workspace`.{view} (`SalesAmount`) "
+            f"WITH SCHEMA COMPENSATION AS {query.replace(f'FROM {table}', f'FROM `demo-workspace`.{table}')}"
+        )
+        self.assertTrue(view_validation.matches_amount_view(ddl, query, view, table))
+        self.assertTrue(view_validation.matches_amount_view(
+            f"CREATE VIEW {view} AS {query}", query, view, table))
+        self.assertFalse(view_validation.matches_amount_view(
+            ddl.replace(f"FROM `demo-workspace`.{table}", f"FROM `other-workspace`.{table}"),
+            query, view, table))
+        self.assertFalse(view_validation.matches_amount_view(
+            ddl + " WHERE Quantity > 0", query, view, table))
+        self.assertFalse(view_validation.matches_amount_view(
+            ddl.replace("/ 100", "/ 10"), query, view, table))
+
+
 class ReconciliationTests(unittest.TestCase):
     def test_exact_results_and_excluded_batch_classes(self):
         entry = {"batch_id": "run_0001", "batch_class": "measured",
@@ -132,12 +343,28 @@ class ReconciliationTests(unittest.TestCase):
         import csv
         import io
         from collections import defaultdict
-        producer_spec = importlib.util.spec_from_file_location("producer_fixture", os.environ["DEMO3_PRODUCER_PATH"])
+        producer_path = Path(os.environ["DEMO3_PRODUCER_PATH"]).resolve()
+        sys.path.insert(0, str(producer_path.parent))
+        self.addCleanup(sys.path.remove, str(producer_path.parent))
+        producer_spec = importlib.util.spec_from_file_location("producer_fixture", producer_path)
         producer = importlib.util.module_from_spec(producer_spec)
         sys.modules[producer_spec.name] = producer
+        self.addCleanup(sys.modules.pop, producer_spec.name, None)
         producer_spec.loader.exec_module(producer)
         config = producer.RunConfig("integration", date_count=4, products=3, customers=5,
                                     file_count=1, rows_per_file=12)
+        notebook = setup.build_notebook(
+            producer_path.read_text(encoding="utf-8"),
+            {"contract_version": 1, "data": {"start_date": "2024-01-01", "date_count": 4,
+             "product_count": 3, "customer_count": 5, "seed": 42}},
+            str(uuid.uuid4()), str(uuid.uuid4()), "DemoLakehouse")
+        namespace = {}
+        exec("".join(notebook["cells"][1]["source"]), namespace)
+        self.addCleanup(namespace["_setup_generator_dir"].cleanup)
+        self.addCleanup(sys.modules.pop, namespace["_setup_generator_name"], None)
+        self.assertEqual(namespace["dimensions"](namespace["RunConfig"](
+            "integration", date_count=4, products=3, customers=5,
+            file_count=1, rows_per_file=12)), producer.dimensions(config))
         with tempfile.TemporaryDirectory() as directory:
             entry = producer.stage_batch(directory, config, 1, ["demo-3"])
             manifest = json.loads((Path(directory) / "integration" / "manifest.json").read_text(encoding="utf-8"))

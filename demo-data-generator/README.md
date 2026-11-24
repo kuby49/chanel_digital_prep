@@ -97,6 +97,8 @@ Single-use profiles and CLI runs still require an explicit run ID.
 Defaults are 10 files of 1,000 rows, 60s
 apart. The SHA-256 and exact stop nonce are derived again from the entire
 fresh projected runtime document, not reused from the template.
+Demo 1's accepted scheduled MLV refresh cadence is five minutes; the
+60-second file cadence does not imply 60-second table visibility.
 
 **This is not yet a runnable all-demo launch.** Demo 1's read-only hook
 requires an approved one-time bounded control-plane schedule receipt;
@@ -164,10 +166,13 @@ reserve 300 seconds; set `shared.native_run_window_seconds`,
 `shared.native_cleanup_timeout_seconds` before template publication when
 needed. The window must cover preparation, producer duration, downstream
 verification and cleanup. Expiry is fixed at run allocation, never extended.
-In particular, the generous default window cannot fit Demo 1's currently
-approved 60-minute setup schedule: activation must choose explicit compatible
-budgets, and the read-only hook must reject launches without enough remaining
-coverage rather than silently shorten verification or widen the schedule.
+The default verification deadline is 115 minutes after allocation and must
+fall within Demo 1's active setup schedule. A 180-minute setup window, once
+supported and explicitly configured, covers the complete 120-minute lifecycle
+when allocation occurs within its first 60 minutes. Startup and actual run
+times reduce the opportunity for additional serialized runs. The read-only
+hook must reject insufficient remaining coverage rather than silently shorten
+verification or widen the schedule.
 Native cleanup first persists and reads back the exact immutable stop marker,
 then closes Demo 3 admission only while holding its per-run ledger.
 Track cleanup must prove its owned schedules/jobs stopped or its precisely

@@ -12,7 +12,8 @@ separately started monitor. No coordinated 10-file run has been verified.
 The first default-run attempt on 2026-11-24 failed at the pipeline level with
 `BadRequest`; no activity or notebook child was observed. This absence is not
 proof that no child existed. Reconcile the exact attempt and any owned work
-before another measured launch.
+before another measured launch. Subsequent local runtime pagination and
+bodyless-request fixes have not yet been published to the Fabric notebook.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer

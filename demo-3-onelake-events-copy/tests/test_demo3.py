@@ -1162,7 +1162,7 @@ class NativeGuardTests(unittest.TestCase):
     def test_native_lifecycle_requires_enabled_graph_and_verifies_each_event_batch(self):
         from dataclasses import asdict, replace
 
-        config = replace(self.config, file_count=1, rows_per_file=2)
+        config = replace(self.config, file_count=2, rows_per_file=2)
         self.config = config
         self.manifest = self.generator.new_manifest(config, ["demo-3"])
         self.manifest["demo3_admission"] = {
@@ -1171,20 +1171,24 @@ class NativeGuardTests(unittest.TestCase):
             "config_sha256": self.native.config_sha256(asdict(config)),
             "expires_at_utc": (self.now + timedelta(seconds=1800)).isoformat(),
         }
-        source, entry = self.generator.batch_bytes(config, 1)
-        self.manifest["batches"]["1"] = {**entry, "deliveries": {"demo-3": {"status": "submitted"}}}
-        self.subject = "/Files/incoming/sales/" + entry["filename"]
-        self.target.create(self.subject[1:], source)
+        entries = {}
+        for number in (1, 2):
+            source, entry = self.generator.batch_bytes(config, number)
+            entries[entry["batch_id"]] = entry
+            self.manifest["batches"][str(number)] = {**entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+            self.target.create("Files/incoming/sales/" + entry["filename"], source)
         self.publish()
         batch_audit = self.native.AdmissionAudit(
             self.target, self.target.workspace_id, self.target.lakehouse_id, self.resolve)
         guarded = delivery_runtime.GuardedDelivery(self.generator, config, self.authority, batch_audit)
-        job = str(uuid.uuid4())
-        attempt = guarded.prepare(job, self.subject, "actual-event", "event")
-        guarded.finish(job, attempt, {
-            "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
-            "files_read": 1, "rows_read": 2, "rows_copied": 2,
-        }, lambda _: self.proof(entry))
+        for entry in entries.values():
+            self.subject = "/Files/incoming/sales/" + entry["filename"]
+            job = str(uuid.uuid4())
+            attempt = guarded.prepare(job, self.subject, "actual-event", "event")
+            guarded.finish(job, attempt, {
+                "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+                "files_read": 1, "rows_read": 2, "rows_copied": 2,
+            }, lambda _: self.proof(entry))
 
         ids = [str(uuid.uuid4()) for _ in range(5)]
         tenant, notebook_id, pipeline_id, reflex_id, connection_id = ids
@@ -1228,7 +1232,7 @@ class NativeGuardTests(unittest.TestCase):
 
         modules = {"generator": self.generator, "fabric_runtime": types.SimpleNamespace(
             run_config=lambda document: (config, 1800)),
-            "guard_spark": types.SimpleNamespace(query_target=lambda *args: self.proof(entry))}
+            "guard_spark": types.SimpleNamespace(query_target=lambda *args: self.proof(entries[args[-1]]))}
         with mock.patch.dict(sys.modules, modules):
             import native_demo3
 
@@ -1262,7 +1266,7 @@ class NativeGuardTests(unittest.TestCase):
             graph[3]["payload"]["definition"]["settings"]["shouldRun"] = True
             with mock.patch.object(native_demo3, "_dimensions"):
                 prepared = native_demo3.prepare(context)
-            self.assertEqual(native_demo3.verify(context, prepared)["batch_count"], 1)
+            self.assertEqual(native_demo3.verify(context, prepared)["batch_count"], 2)
             path = audit.RECORD_PREFIX + entry["batch_id"] + ".json"
             original = self.target.read(path)
             changed = json.loads(original[0])

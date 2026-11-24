@@ -113,6 +113,60 @@ class SharedManifestIntegrationTest(unittest.TestCase):
         for key in ("target_bindings", "generator_sha256", "producer_config", "monitor_binding_sha256"):
             self.assertEqual(root_binding[key], eventhouse_binding[key])
 
+    def test_orchestrator_resolves_real_eventhouse_candidate_without_cloud_calls(self):
+        sys.path.insert(0, str(ROOT / "demo-2-eventhouse"))
+        try:
+            eventhouse = load_script("eventhouse_candidate_integration", ROOT / "demo-2-eventhouse" / "deploy.py")
+        finally:
+            sys.path.pop(0)
+        orchestration = load_script("orchestration_candidate_integration", ROOT / "scripts" / "deploy-demos")
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["shared"].update({"workspace_id": "11111111-1111-4111-8111-111111111111",
+                                 "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222"})
+        settings = eventhouse.validate_config(config, "chanel")
+        workspace = "33333333-3333-4333-8333-333333333333"
+        eventhouse_id = "44444444-4444-4444-8444-444444444444"
+        database = "55555555-5555-4555-8555-555555555555"
+        target = {"workspace_id": workspace, "item_id": database, "fact": settings["table"]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            with eventhouse.Ledger(state, settings, create=True) as ledger:
+                ledger.data["resources"].update({
+                    "workspace": {"id": workspace, "name": settings["workspace_name"],
+                                  "type": "Workspace", "confirmed": True},
+                    "eventhouse": {"id": eventhouse_id, "name": settings["eventhouse_name"],
+                                   "type": "Eventhouse", "confirmed": True},
+                    "database": {"id": database, "name": settings["database_name"], "type": "KQLDatabase",
+                                 "parent_eventhouse_id": eventhouse_id, "confirmed": True},
+                    "table": {"name": settings["table"], "database_id": database, "confirmed": True},
+                })
+                ledger.save()
+            journal = state / eventhouse.STATE_FILE
+            before = journal.read_bytes()
+            invocation = root / "invocation"
+            invocation.mkdir()
+            phases, resolved, path = orchestration.effective_run_config(
+                config, "chanel", state, invocation, 30, ["demo-2"], 1)
+            candidate_result = phases["resolve-target-candidate"]["demo-2"]
+            self.assertEqual((candidate_result["status"], candidate_result["ready"]), ("pass", False))
+            self.assertEqual(resolved["shared"]["target_bindings"], {"demo-2": target})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), resolved)
+            self.assertEqual(journal.read_bytes(), before)
+            self.assertEqual(config["shared"]["target_bindings"], {})
+
+            conflict = json.loads(json.dumps(config))
+            conflict["demo-2"]["kql_database_id"] = "66666666-6666-4666-8666-666666666666"
+            rejected = root / "rejected"
+            rejected.mkdir()
+            phases, resolved, path = orchestration.effective_run_config(
+                conflict, "chanel", state, rejected, 30, ["demo-2"], 1)
+            self.assertEqual(phases["resolve-target-candidate"]["demo-2"]["status"], "blocked")
+            self.assertIsNone(resolved)
+            self.assertIsNone(path)
+            self.assertFalse((rejected / "demo-2-target-candidate.json").exists())
+            self.assertEqual(journal.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -69,8 +69,9 @@ def validate_batch(generator, expected_config, manifest_bytes, source_subject, s
     if (not isinstance(manifest, dict) or type(manifest.get("contract_version")) is not int
             or manifest["contract_version"] != 1
             or manifest.get("run_id") != expected_config.run_id
-            or not _same_json(manifest.get("config"), asdict(expected_config))):
-        raise ValueError("manifest version, run ID, or producer configuration differs")
+            or not _same_json(manifest.get("config"), asdict(expected_config))
+            or manifest.get("generator_sha256") != generator.generator_source_sha256()):
+        raise ValueError("manifest version, run ID, configuration, or generator fingerprint differs")
     destinations = manifest.get("destinations")
     if (not isinstance(destinations, list) or not all(
         isinstance(item, str) and item in ("demo-1", "demo-2", "demo-3")

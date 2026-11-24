@@ -556,6 +556,7 @@ class ReconciliationTests(unittest.TestCase):
             shifted_producer = SimpleNamespace(
                 RunConfig=producer.RunConfig, HEADER=producer.HEADER,
                 strict_json_loads=producer.strict_json_loads,
+                generator_source_sha256=producer.generator_source_sha256,
                 batch_bytes=lambda _config, _number: (shifted, shifted_metadata))
             with self.assertRaisesRegex(ValueError, "contiguous from 1"):
                 batch_gate.validate_batch(shifted_producer, config, json.dumps(shifted_manifest).encode(),
@@ -652,6 +653,7 @@ class ReconciliationTests(unittest.TestCase):
                 validate()
             for path, value in (
                 (("config", "seed"), 999),
+                (("generator_sha256",), "0" * 64),
                 (("batches", "1", "row_count"), True),
                 (("batches", "1", "amount_by_date"), {"2024-01-01": 0}),
                 (("batches", "1", "deliveries", "demo-3", "status"), "pending"),

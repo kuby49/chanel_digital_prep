@@ -156,6 +156,11 @@
     },
     {
       "track": "demo-3",
+      "source": "Demo 3 owner later isolated probes",
+      "note": "The owner reports a later non-sales event-triggered dynamic exact-filename Copy that read one file and upserted two ProbeKey/ProbeValue rows into isolated dbo.Demo3ConnectionProbea9bbae81 after a six-minute Activator warm-up. A subsequent definition readback showed shouldRun=false, unchanged source filters and bindings, and both actions restored to original parameter-only pipeline fdee7340-20c4-4a52-9774-47379f07d63e. A separate SQL probe remained stale for over 900 seconds until a targeted non-recreating metadata refresh. A cooperative conditional-store audit probe exercised transitions and duplicate recognition with synthetic Copy/query evidence and no fact writes. These probes do not prove reliable event delivery, production pipeline identity, crash recovery, writer exclusion or immediate SQL visibility."
+    },
+    {
+      "track": "demo-3",
       "source": "Demo 3 owner",
       "intended_landing_uri": "abfss://744223de-ceab-4c4f-82ba-f811bcb5c7d7@onelake.dfs.fabric.microsoft.com/02fd5f73-32d5-4295-bfb5-c5436e9c3b62/Files/incoming/sales/",
       "connection_id": "c906689d-a8de-48fb-b505-1ac3b4c8a9c5",

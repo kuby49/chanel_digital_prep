@@ -422,11 +422,17 @@ def main(argv=None):
             runs_dir = state_dir / "runs"
             runs_dir.mkdir(parents=True, exist_ok=True)
             invocation_dir = Path(tempfile.mkdtemp(prefix="run-", dir=runs_dir))
+            config = copy.deepcopy(config)
+            if args.prefix is not None:
+                config["prefix"] = prefix
+                if isinstance(config.get("common"), dict) and "prefix" in config["common"]:
+                    config["common"]["prefix"] = prefix
+            config_path = invocation_dir / "input-config.json"
+            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
             tracks = args.selector + (["shared"] if args.mode != "cleanup" or len(args.selector) == 3 else [])
             phases = {args.mode: run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
                                            timeout, args.selector, concurrency, args.yes)}
             if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
-                (invocation_dir / "input-config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
                 resolution_phases, effective_config, effective_path = effective_run_config(
                     config, prefix, state_dir, invocation_dir, timeout, args.selector)
                 phases.update(resolution_phases)

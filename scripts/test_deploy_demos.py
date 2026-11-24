@@ -32,7 +32,9 @@ stop_job = json.loads(start_path.read_text())['job_id'] if a.mode == 'stop-monit
 event_path = pathlib.Path(a.result).parent / ('event-' + str(time.time_ns()) + '-' + track + '-' + a.mode + '.json')
 event_path.write_text(json.dumps({'track': track, 'mode': a.mode, 'yes': a.yes, 'selected': a.selected_demos,
                                   'stop_job': stop_job, 'state_dir': a.state_dir, 'config_path': a.config,
-                                  'shared': config.get('shared')}))
+                                  'shared': config.get('shared'), 'prefix': config.get('prefix'),
+                                  'common_prefix': config.get('common', {}).get('prefix'),
+                                  'argument_prefix': a.prefix}))
 if behavior.get('delay'):
     time.sleep(behavior['delay'])
 if behavior.get('omit_result'):
@@ -137,6 +139,17 @@ class OrchestrationTests(unittest.TestCase):
         code, _, second = self.run_cli("demo-1", "--deploy")
         self.assertEqual(code, 0)
         self.assertNotEqual(first[0]["state_dir"], second[0]["state_dir"])
+
+    def test_prefix_override_is_applied_to_snapshot_for_all_phases(self):
+        self.config["common"] = {"prefix": "chanel"}
+        self.config["shared"]["workspace_id"] = None
+        code, _, events = self.run_cli("demo-2", "--deploy", "--run-data", "--prefix", "alternate")
+        self.assertEqual(code, 0)
+        self.assertTrue(all(event["prefix"] == event["common_prefix"] == event["argument_prefix"] == "alternate"
+                            for event in events))
+        original = json.loads((self.root / "config.json").read_text())
+        self.assertEqual(original["prefix"], "chanel")
+        self.assertEqual(original["common"]["prefix"], "chanel")
 
     def test_existing_orchestrator_lock_blocks_without_clearing_it(self):
         state = self.root / "state" / ("chanel-" + self.config["tenant_id"])

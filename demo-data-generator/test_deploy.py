@@ -1418,6 +1418,43 @@ class FabricClientTests(unittest.TestCase):
                     self.client(opener).list_all("/v1/workspaces")
                 self.assertEqual(len(opener.requests), 1)
 
+    def test_mlv_wabi_continuation_is_reconstructed_on_original_origin(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances"
+        uri = "https://wabi-west-us3-a-primary-redirect.analysis.windows.net" + path + "?continuationToken=a%3D"
+        opener = Opener(Response(body={"value": [1], "continuationUri": uri, "continuationToken": "a%3D"}),
+                        Response(body={"value": [2]}))
+        self.assertEqual(self.client(opener).list_all(path), [1, 2])
+        self.assertEqual(opener.requests[1][0].full_url, deploy.API_ROOT + path + "?continuationToken=a%3D")
+
+    def test_mlv_wabi_continuation_rejects_unsafe_or_conflicting_data(self):
+        path = f"/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}/jobs/refreshMaterializedLakeViews/instances"
+        origin = "https://wabi-west-us3-a-primary-redirect.analysis.windows.net"
+        for uri, token in (
+            (origin + path + "?continuationToken=a", "b"),
+            (origin + path + "?continuationToken=a", None),
+            (origin + path + "?continuationToken=a&continuationToken=a", "a"),
+            (origin + path + "?continuationToken=a&other=x", "a"),
+            (origin + path + "/other?continuationToken=a", "a"),
+            (origin + path + "?continuationToken=a#fragment", "a"),
+            (origin.replace("https://", "https://user@") + path + "?continuationToken=a", "a"),
+            (origin + ":443" + path + "?continuationToken=a", "a"),
+            (origin.replace("https://", "http://") + path + "?continuationToken=a", "a"),
+            ("https://attacker.invalid" + path + "?continuationToken=a", "a"),
+        ):
+            with self.subTest(uri=uri, token=token):
+                opener = Opener(Response(body={"value": [], "continuationUri": uri, "continuationToken": token}))
+                with self.assertRaises(deploy.Blocked):
+                    self.client(opener).list_all(path)
+                self.assertEqual(len(opener.requests), 1)
+
+    def test_wabi_continuation_remains_blocked_for_other_endpoints(self):
+        path = f"/v1/workspaces/{WORKSPACE}/items"
+        uri = "https://wabi-west-us3-a-primary-redirect.analysis.windows.net" + path + "?continuationToken=a"
+        opener = Opener(Response(body={"value": [], "continuationUri": uri, "continuationToken": "a"}))
+        with self.assertRaises(deploy.Blocked):
+            self.client(opener).list_all(path)
+        self.assertEqual(len(opener.requests), 1)
+
     def test_environment_library_pagination_preserves_release_query(self):
         path = f"/v1/workspaces/{WORKSPACE}/environments/{ENVIRONMENT}/libraries?beta=false"
         continuation = (f"{deploy.API_ROOT}/v1/workspaces/{WORKSPACE}/environments/{ENVIRONMENT}"

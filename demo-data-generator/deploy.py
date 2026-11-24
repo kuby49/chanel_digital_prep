@@ -808,7 +808,16 @@ class FabricClient:
             uri = None if uri == "null" else uri
             token = None if token == "null" else token
             if uri:
-                continuation = parse.urlsplit(self._url(uri))
+                if not isinstance(uri, str) or "\\" in uri or any(ord(char) < 32 or ord(char) == 127 for char in uri):
+                    raise Blocked("Fabric returned an unsafe API URL.")
+                continuation = parse.urlsplit(uri)
+                wabi_mlv = (re.fullmatch(r"/v1/workspaces/[a-f0-9-]{36}/lakehouses/[a-f0-9-]{36}"
+                                          r"/jobs/refreshMaterializedLakeViews/instances", original_parts.path)
+                            and continuation.scheme == "https"
+                            and re.fullmatch(r"wabi-[a-z0-9-]+\.analysis\.windows\.net", continuation.netloc)
+                            and not continuation.fragment)
+                if not wabi_mlv:
+                    continuation = parse.urlsplit(self._url(uri))
                 if continuation.path != original_parts.path:
                     raise Blocked("Fabric pagination changed the requested API path.")
                 query = parse.parse_qsl(continuation.query, keep_blank_values=True)
@@ -816,6 +825,10 @@ class FabricClient:
                 if (len(continuation_tokens) > 1
                         or any(pair not in original_query for pair in query if pair[0] != "continuationToken")):
                     raise Blocked("Fabric pagination changed the requested API parameters.")
+                if wabi_mlv and (len({key for key, _ in query}) != len(query)
+                                 or not isinstance(token, str) or not token or len(continuation_tokens) != 1
+                                 or continuation_tokens[0][1] != parse.unquote(token)):
+                    raise Blocked("Fabric pagination returned conflicting continuation tokens.")
                 next_url = parse.urlunsplit((original_parts.scheme, original_parts.netloc,
                                              original_parts.path,
                                              parse.urlencode(original_query + continuation_tokens), ""))

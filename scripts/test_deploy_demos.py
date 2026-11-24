@@ -22,11 +22,11 @@ TARGETS = {
     "demo-2": {"workspace_id": "55555555-5555-4555-8555-555555555555",
                "item_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "fact": "FactSales"},
     "demo-3": {"workspace_id": "66666666-6666-4666-8666-666666666666",
-               "item_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "fact": "dbo.FactSales"},
+               "item_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "fact": "dbo.factsales"},
 }
 
 FAKE_TRACK = """
-import argparse, datetime, json, pathlib, sys, time
+import argparse, datetime, hashlib, json, pathlib, sys, time
 p = argparse.ArgumentParser()
 for option in ('mode', 'config', 'prefix', 'state-dir', 'result'):
     p.add_argument('--' + option, required=True)
@@ -61,7 +61,7 @@ if track != 'shared' and a.mode == 'resolve-target-candidate' and status == 'pas
         'demo-2': {'workspace_id': '55555555-5555-4555-8555-555555555555',
                    'item_id': 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'fact': 'FactSales'},
         'demo-3': {'workspace_id': '66666666-6666-4666-8666-666666666666',
-                   'item_id': 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'fact': 'dbo.FactSales'}}
+                   'item_id': 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'fact': 'dbo.factsales'}}
     candidate = behavior.get('candidate', {'contract_version': 1, 'track': track,
         'tenant_id': config['tenant_id'], 'prefix': a.prefix, 'target': targets[track]})
     sidecar = pathlib.Path(a.result).parent / (track + '-target-candidate.json')
@@ -72,8 +72,22 @@ if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status', 'wait-mon
         shared = config['shared']
         root = ('https://onelake.blob.fabric.microsoft.com/' + shared['workspace_id'] + '/' +
                 shared['staging_lakehouse_id'] + '/Files/producer/runs/' + config['data']['run_id'])
+        data = config['data']
+        producer_config = {'run_id': data.get('run_id'), 'batch_class': 'measured', 'start_date': data.get('start_date'),
+                           'seed': data.get('seed'), 'date_count': data.get('date_count'),
+                           'products': data.get('product_count'), 'customers': data.get('customer_count'),
+                           'file_count': data.get('file_count'), 'rows_per_file': data.get('rows_per_file'),
+                           'interval_seconds': data.get('interval_seconds')}
+        source = (pathlib.Path.cwd() / 'demo-data-generator' / 'generator.py').read_bytes().decode('utf-8')
+        generator_digest = hashlib.sha256(source.replace('\\r\\n', '\\n').replace('\\r', '\\n').encode('utf-8')).hexdigest()
+        binding = {'targets': shared['target_bindings'], 'generator_sha256': generator_digest,
+                   'config': producer_config}
+        binding_digest = hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(',', ':'),
+                                                   ensure_ascii=False, allow_nan=False).encode('utf-8')).hexdigest()
         evidence = {'contract_version': 1, 'run_id': config['data']['run_id'], 'job_id': 'job-1',
                     'manifest_uri': root + '/manifest.json', 'state': 'submitted',
+                    'target_bindings': shared['target_bindings'], 'generator_sha256': generator_digest,
+                    'producer_config': producer_config, 'monitor_binding_sha256': binding_digest,
                     'deadline_utc': (datetime.datetime.now(datetime.timezone.utc) +
                                      datetime.timedelta(seconds=10)).isoformat()}
     else:
@@ -113,7 +127,9 @@ class OrchestrationTests(unittest.TestCase):
             "tenant_id": "33333333-3333-4333-8333-333333333333",
             "execution": {"max_concurrency": 4, "track_timeout_seconds": 10,
                           "verification_timeout_seconds": 15},
-            "data": {"run_id": "run-1", "file_count": 2, "rows_per_file": 2,
+            "data": {"run_id": "run-1", "seed": 42, "start_date": "2026-01-01",
+                     "date_count": 365, "product_count": 20, "customer_count": 100,
+                     "file_count": 2, "rows_per_file": 2,
                      "interval_seconds": 1, "max_duration_seconds": 10, "currency": "USD"},
             "shared": {"workspace_id": "11111111-1111-4111-8111-111111111111",
                        "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222",
@@ -419,6 +435,17 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-2"]["status"], "fail")
                 self.assertNotIn("validate-only", [event["mode"] for event in events])
 
+    def test_demo3_fact_binding_preserves_physical_identifier_case(self):
+        self.config["demo-3"] = {"destination_table": "dbo.FactSales"}
+        code, summary, events = self.run_cli("demo-3", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-3"]["status"], "fail")
+        self.assertNotIn("validate-only", [event["mode"] for event in events])
+        self.config["demo-3"]["destination_table"] = "dbo.factsales"
+        code, summary, _ = self.run_cli("demo-3", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-3"]["status"], "pass")
+
     def test_shared_or_duplicate_demo_workspace_blocks_execution(self):
         for workspace in (self.config["shared"]["workspace_id"], TARGETS["demo-1"]["workspace_id"]):
             with self.subTest(workspace=workspace):
@@ -481,6 +508,15 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "blocked")
         self.assertNotIn("run-data", summary["phases"])
 
+    def test_unavailable_binding_blocks_before_monitor_submission(self):
+        with mock.patch.object(deploy, "monitor_binding", side_effect=OSError("generator unavailable")):
+            code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "blocked")
+        self.assertNotIn("start-monitor", [event["mode"] for event in events])
+        self.assertNotIn("stop-monitor", summary["phases"])
+        self.assertNotIn("run-data", summary["phases"])
+
     def test_failed_monitor_stop_is_not_hidden(self):
         self.config["behavior"] = {
             "demo-2:start-monitor": {"status": "blocked", "ready": False},
@@ -494,7 +530,11 @@ class OrchestrationTests(unittest.TestCase):
         for evidence in ({"run_id": "another-run"}, {"job_id": "different-job"},
                          {"manifest_uri": "https://example.invalid/manifest.json"},
                          {"deadline_utc": "2100-01-01T00:00:00Z"},
-                         {"state": "not-running"}):
+                         {"state": "not-running"},
+                         {"target_bindings": {"demo-2": TARGETS["demo-3"]}},
+                         {"generator_sha256": "0" * 64},
+                         {"monitor_binding_sha256": "0" * 64},
+                         {"producer_config": {"run_id": "different-run"}}):
             with self.subTest(evidence=evidence):
                 self.config["behavior"] = {"demo-2:monitor-status": {"evidence": evidence}}
                 code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
@@ -529,14 +569,35 @@ class OrchestrationTests(unittest.TestCase):
         self.assertNotIn("run-data", summary["phases"])
 
     def test_changed_original_job_record_blocks_producer(self):
-        self.config["behavior"] = {"demo-2:monitor-status": {
-            "start_record_evidence": {"job_id": "different-job"}}}
-        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
-        self.assertEqual(code, 1)
-        self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
-        self.assertEqual(summary["phases"]["stop-monitor"]["demo-2"]["status"], "fail")
-        self.assertEqual(events[-1]["mode"], "monitor-status")
-        self.assertNotIn("run-data", summary["phases"])
+        for change in ({"job_id": "different-job"}, {"target_bindings": {}},
+                       {"monitor_binding_sha256": "0" * 64}):
+            with self.subTest(change=change):
+                self.config["behavior"] = {"demo-2:monitor-status": {"start_record_evidence": change}}
+                code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["phases"]["monitor-status"]["demo-2"]["status"], "fail")
+                self.assertEqual(summary["phases"]["stop-monitor"]["demo-2"]["status"], "fail")
+                self.assertEqual(events[-1]["mode"], "monitor-status")
+                self.assertNotIn("run-data", summary["phases"])
+
+    def test_duplicate_monitor_start_record_blocks_stop(self):
+        state = self.root / "monitor-state"
+        state.mkdir()
+        initial = {
+            "contract_version": 1, "run_id": "run-1", "job_id": "job-1",
+            "manifest_uri": "https://example.invalid/manifest.json",
+            "deadline_utc": "2100-01-01T00:00:00Z", "target_bindings": {},
+            "generator_sha256": "a" * 64, "producer_config": {},
+            "monitor_binding_sha256": "b" * 64,
+        }
+        (state / "demo-2-monitor-start.json").write_text(
+            json.dumps(initial)[:-1] + ', "job_id": "job-1"}', encoding="utf-8")
+        with mock.patch.object(deploy, "invoke") as invoke:
+            outcome = deploy.stop_monitor(initial, self.root / "config.json", "chanel", state,
+                                          self.root, 10, ["demo-2"])
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("termination unconfirmed", outcome["diagnostics"][0])
+        invoke.assert_not_called()
 
     def test_monitor_start_timeout_attempts_stop_before_producer(self):
         self.config["execution"]["track_timeout_seconds"] = 5
@@ -575,7 +636,11 @@ class OrchestrationTests(unittest.TestCase):
     def test_incomplete_or_unready_monitor_never_reports_success(self):
         for behavior in ({"status": "blocked", "ready": False},
                          {"ready": False}, {"evidence": {"state": "running"}},
-                         {"evidence": {"job_id": "different-job"}}):
+                         {"evidence": {"job_id": "different-job"}},
+                         {"evidence": {"target_bindings": {"demo-2": TARGETS["demo-3"]}}},
+                         {"evidence": {"generator_sha256": "0" * 64}},
+                         {"evidence": {"producer_config": {"run_id": "different-run"}}},
+                         {"evidence": {"monitor_binding_sha256": "0" * 64}}):
             with self.subTest(behavior=behavior):
                 self.config["behavior"] = {"demo-2:wait-monitor": behavior}
                 code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
@@ -583,6 +648,24 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertNotEqual(summary["phases"]["wait-monitor"]["demo-2"]["status"], "pass")
                 self.assertEqual(events[-1]["mode"], "stop-monitor")
                 self.assertEqual(events[-1]["stop_job"], "job-1")
+
+    def test_unavailable_terminal_binding_fails_and_attempts_exact_stop(self):
+        binding = deploy.monitor_binding
+        calls = 0
+
+        def unavailable_after_start(config):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return binding(config)
+            raise OSError("generator unavailable")
+
+        with mock.patch.object(deploy, "monitor_binding", side_effect=unavailable_after_start):
+            code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["wait-monitor"]["demo-2"]["status"], "fail")
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertEqual(events[-1]["stop_job"], "job-1")
 
     def test_demo2_manifest_config_mismatch_blocks_before_deploy(self):
         self.config["shared"]["run_state_location"] = "https://example.invalid/other-root"

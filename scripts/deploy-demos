@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import copy
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -244,6 +245,24 @@ def monitor_config(config):
     return f"{root}/{config['data']['run_id']}/manifest.json", duration
 
 
+def monitor_binding(config):
+    data = config["data"]
+    producer_config = {
+        "run_id": data.get("run_id"), "batch_class": "measured", "start_date": data.get("start_date"),
+        "seed": data.get("seed"), "date_count": data.get("date_count"), "products": data.get("product_count"),
+        "customers": data.get("customer_count"), "file_count": data.get("file_count"),
+        "rows_per_file": data.get("rows_per_file"), "interval_seconds": data.get("interval_seconds"),
+    }
+    source = (ROOT / "demo-data-generator" / "generator.py").read_bytes().decode("utf-8")
+    generator_digest = hashlib.sha256(source.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")).hexdigest()
+    targets = config["shared"]["target_bindings"]
+    binding = {"targets": targets, "generator_sha256": generator_digest, "config": producer_config}
+    encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                         allow_nan=False).encode("utf-8")
+    return {"target_bindings": targets, "generator_sha256": generator_digest,
+            "producer_config": producer_config, "monitor_binding_sha256": hashlib.sha256(encoded).hexdigest()}
+
+
 def target_candidate(path, track, tenant_id, prefix):
     candidate = strict_json(path)
     if (not isinstance(candidate, dict) or set(candidate) !=
@@ -364,9 +383,8 @@ def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, sel
         return phases, None, None
 
 
-def monitor_evidence(path, run_id, manifest_uri, max_duration, state, require_future=True):
-    with path.open(encoding="utf-8") as file:
-        evidence = json.load(file)
+def monitor_evidence(path, run_id, manifest_uri, max_duration, state, binding, require_future=True):
+    evidence = strict_json(path)
     if not isinstance(evidence, dict) or type(evidence.get("contract_version")) is not int or evidence["contract_version"] != 1:
         raise ValueError("invalid monitor evidence version")
     for key in ("run_id", "job_id", "state", "manifest_uri", "deadline_utc"):
@@ -376,6 +394,11 @@ def monitor_evidence(path, run_id, manifest_uri, max_duration, state, require_fu
         raise ValueError("monitor is observing a different run")
     if evidence["manifest_uri"] != manifest_uri:
         raise ValueError("monitor is observing a different manifest")
+    for key, expected in binding.items():
+        if json.dumps(evidence.get(key), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False) != json.dumps(expected, sort_keys=True, separators=(",", ":"),
+                                                     ensure_ascii=False, allow_nan=False):
+            raise ValueError(f"monitor {key} does not match the effective configuration")
     states = {"start": {"submitted", "running"}, "running": {"running"}, "completed": {"completed"}}
     if evidence["state"] not in states[state]:
         raise ValueError("monitor has an invalid lifecycle state")
@@ -392,16 +415,18 @@ def monitor_evidence(path, run_id, manifest_uri, max_duration, state, require_fu
 
 
 def matching_monitor_identity(first, second):
-    for key in ("contract_version", "run_id", "job_id", "manifest_uri", "deadline_utc"):
-        if first[key] != second[key]:
+    for key in ("contract_version", "run_id", "job_id", "manifest_uri", "deadline_utc",
+                "target_bindings", "generator_sha256", "producer_config", "monitor_binding_sha256"):
+        if json.dumps(first[key], sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False) != json.dumps(second[key], sort_keys=True, separators=(",", ":"),
+                                                     ensure_ascii=False, allow_nan=False):
             raise ValueError(f"monitor {key} does not match the start record")
 
 
 def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeout, selected):
     try:
         if initial is not None:
-            with (state_dir / "demo-2-monitor-start.json").open(encoding="utf-8") as file:
-                record = json.load(file)
+            record = strict_json(state_dir / "demo-2-monitor-start.json")
             matching_monitor_identity(initial, record)
     except (OSError, ValueError, TypeError, KeyError) as error:
         return result("demo-2", "stop-monitor", "fail",
@@ -412,17 +437,25 @@ def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeou
 def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeout, selected, monitor_settings):
     phases = {}
     started = False
+    attempted = False
     initial = None
     try:
+        try:
+            binding = monitor_binding(config)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
+            phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "blocked",
+                                                        f"Cannot bind monitor configuration: {error}")}
+            return phases, False, None
+        attempted = True
         start = invoke("demo-2", "start-monitor", config_path, prefix, state_dir, invocation_dir, timeout, selected)
         phases["start-monitor"] = {"demo-2": start}
         if start["status"] != "pass":
             return phases, False, None
         try:
             initial = monitor_evidence(state_dir / "demo-2-monitor-start.json",
-                                       config["data"]["run_id"], *monitor_settings, "start")
+                                       config["data"]["run_id"], *monitor_settings, "start", binding)
             sidecar = monitor_evidence(state_dir / "demo-2-monitor.json",
-                                       config["data"]["run_id"], *monitor_settings, "start")
+                                       config["data"]["run_id"], *monitor_settings, "start", binding)
             matching_monitor_identity(initial, sidecar)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "fail",
@@ -434,9 +467,9 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
             return phases, False, None
         try:
             record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
-                                      config["data"]["run_id"], *monitor_settings, "start")
+                                      config["data"]["run_id"], *monitor_settings, "start", binding)
             current = monitor_evidence(state_dir / "demo-2-monitor.json",
-                                       config["data"]["run_id"], *monitor_settings, "running")
+                                       config["data"]["run_id"], *monitor_settings, "running", binding)
             matching_monitor_identity(initial, record)
             matching_monitor_identity(initial, current)
         except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -446,7 +479,7 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
         started = True
         return phases, True, initial
     finally:
-        if not started:
+        if attempted and not started:
             phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
                                                                state_dir, invocation_dir, timeout, selected)}
 
@@ -459,13 +492,14 @@ def wait_monitor(initial, config, config_path, prefix, state_dir, invocation_dir
     phases = {"wait-monitor": {"demo-2": outcome}}
     if outcome["status"] == "pass":
         try:
+            binding = monitor_binding(config)
             record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
-                                      config["data"]["run_id"], *monitor_settings, "start", False)
+                                      config["data"]["run_id"], *monitor_settings, "start", binding, False)
             current = monitor_evidence(state_dir / "demo-2-monitor.json",
-                                       config["data"]["run_id"], *monitor_settings, "completed", False)
+                                       config["data"]["run_id"], *monitor_settings, "completed", binding, False)
             matching_monitor_identity(initial, record)
             matching_monitor_identity(initial, current)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
             phases["wait-monitor"] = {"demo-2": result("demo-2", "wait-monitor", "fail",
                                                        f"Invalid terminal monitor evidence: {error}")}
     if phases["wait-monitor"]["demo-2"]["status"] != "pass":

@@ -31,6 +31,130 @@ def load_script(name, path):
 
 
 class SharedManifestIntegrationTest(unittest.TestCase):
+    def test_native_demo1_bundle_reconciles_real_producer_manifests_across_clicks(self):
+        import fabric_assets
+
+        deploy = load_script("shared_native_demo1_integration", ROOT / "demo-data-generator" / "deploy.py")
+        tenant = "4526cee1-4399-4e4b-9134-46fabd583527"
+        workspace, lakehouse = "2aaaaaaa-1111-4111-8111-111111111111", "32222222-2222-4222-8222-222222222222"
+        identity, schedule_id = "74c0c844-c9ee-45ba-a099-aec374c28a09", "3b28eeb1-792d-493d-80e9-86a6b75d4831"
+        producer = {"workspace_id": "11111111-1111-4111-8111-111111111111",
+                    "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222",
+                    "producer_notebook_id": "33333333-3333-4333-8333-333333333333"}
+        start = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        request = {"enabled": True, "configuration": {
+            "startDateTime": start.isoformat(), "endDateTime": (start + timedelta(minutes=180)).isoformat(),
+            "localTimeZoneId": "UTC", "type": "Cron", "interval": 5}}
+        receipt = {"contract_version": 1, "track": "demo-1", "status": "confirmed",
+                   "setup_run_id": "setup_001", "tenant_id": tenant, "principal_id": identity,
+                   "workspace_id": workspace, "lakehouse_id": lakehouse, "schedule_id": schedule_id,
+                   "request": request, "create_response": {
+                       "id": schedule_id, "owner": {"id": identity, "type": "User"}, **request}}
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["demo-1"].update({
+            "workspace_id": workspace, "workspace_name": "demo-workspace", "lakehouse_id": lakehouse,
+            "lakehouse_name": "Lakehouse", "native_schedule": receipt,
+            "landing_uri": f"abfss://{workspace}@onelake.dfs.fabric.microsoft.com/{lakehouse}/Files/incoming/sales/",
+            "bronze_view": "sales_files", "silver_view": "sales_joined"})
+        target = {"workspace_id": workspace, "item_id": lakehouse, "fact": "silver.sales_joined"}
+        config["shared"].update({**producer, "identity_id": identity, "target_bindings": {"demo-1": target},
+                                 "native_launch": True, "native_reusable": True,
+                                 "native_selected_demos": "demo-1"})
+        resources = {"workspace": {"id": producer["workspace_id"]},
+                     "staging_lakehouse": {"id": producer["staging_lakehouse_id"]},
+                     "notebook": {"id": producer["producer_notebook_id"]}}
+        profile = deploy._native_profile(config, resources)
+        definition = fabric_assets.notebook_definition(producer["workspace_id"], producer["staging_lakehouse_id"],
+                                                      "producer_staging")
+        notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+        bundle = "".join(notebook["cells"][1]["source"])
+        script = bundle + """
+import json
+import sys
+import types
+from datetime import datetime, timedelta
+from fabric_runtime import native_parameters, run_config, stop_requested
+from native_lifecycle import LOCK_PATH, load_hooks, run_native_lifecycle
+from fabric_runner import run_fabric_batches
+import delivery
+
+profile, paths = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+hooks = load_hooks(profile["selected"])
+constants = types.ModuleType("test_deploy")
+receipt = profile["document"]["demo-1"]["native_schedule"]
+for name, value in (("TENANT", receipt["tenant_id"]), ("WORKSPACE", receipt["workspace_id"]),
+                    ("LAKEHOUSE", receipt["lakehouse_id"]), ("OWNER", receipt["principal_id"]),
+                    ("INTENT", receipt["schedule_id"])):
+    setattr(constants, name, value)
+sys.modules["test_deploy"] = constants
+sys.path[0:0] = paths
+from test_native_demo1 import Fabric, Spark
+from test_fabric_ledger import MemoryStore
+from test_fabric_runner import Adapter
+
+start = datetime.fromisoformat(receipt["request"]["configuration"]["startDateTime"])
+clock = types.SimpleNamespace(now=start + timedelta(minutes=1))
+def sleep(seconds):
+    clock.now += timedelta(seconds=seconds)
+delivery._now = lambda: clock.now.isoformat()
+fabric, spark, store = Fabric(receipt), Spark(), MemoryStore()
+results = []
+for _ in range(2):
+    document, selected, binding, nonce, expiry = native_parameters(profile, now=clock.now)
+    run, duration = run_config(document)
+    stopped = lambda: stop_requested(store, run.run_id, nonce, binding["config_sha256"])
+    def produce(before_source):
+        result = run_fabric_batches(store, run, {"demo-1": Adapter(clock)}, duration, 1,
+                                    selected_targets=document["shared"]["target_bindings"],
+                                    independent_source=True, fresh_only=True, before_source=before_source,
+                                    clock=lambda: clock.now, sleep=sleep, stop_requested=stopped)
+        manifest = json.loads(store.read(f"Files/producer/runs/{run.run_id}/manifest.json")[0])
+        for batch in manifest["batches"].values():
+            spark.bronze[batch["batch_id"]] = batch
+            spark.silver[batch["batch_id"]] = batch
+        fabric.jobs.append({"id": receipt["schedule_id"], "itemId": receipt["lakehouse_id"],
+                            "status": "Completed", "invokeType": "Scheduled",
+                            "startTimeUtc": clock.now.isoformat(), "endTimeUtc": clock.now.isoformat()})
+        return result
+    result = run_native_lifecycle(store, document, selected, binding, expiry, profile,
+        {"fabric": fabric, "spark": spark, "sleep": sleep, "stop_requested": stopped},
+        produce, hooks=hooks, clock=lambda: clock.now)
+    assert LOCK_PATH not in store.files
+    results.append(result)
+assert results[0]["run_id"] != results[1]["run_id"]
+
+clock.now = start + timedelta(minutes=66)
+document, selected, binding, nonce, expiry = native_parameters(profile, now=clock.now)
+run, duration = run_config(document)
+stopped = lambda: stop_requested(store, run.run_id, nonce, binding["config_sha256"])
+try:
+    run_native_lifecycle(store, document, selected, binding, expiry, profile,
+        {"fabric": fabric, "spark": spark, "sleep": sleep, "stop_requested": stopped},
+        lambda before_source: run_fabric_batches(
+            store, run, {"demo-1": Adapter(clock)}, duration, 1,
+            selected_targets=document["shared"]["target_bindings"],
+            independent_source=True, fresh_only=True, before_source=before_source,
+            clock=lambda: clock.now, sleep=sleep, stop_requested=stopped),
+        hooks=hooks, clock=lambda: clock.now)
+except RuntimeError as error:
+    assert "coverage insufficient" in str(error), str(error)
+else:
+    raise AssertionError("a fixed deadline outside the setup window must block")
+prefix = f"Files/producer/runs/{run.run_id}/"
+assert not any(path.startswith(prefix) and path.endswith(".csv") for path in store.files)
+print(json.dumps(results))
+"""
+        paths = [str(ROOT / "demo-1-materialized-lake-views"), str(ROOT / "demo-data-generator")]
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ, TEMP=directory, TMP=directory)
+            completed = subprocess.run([sys.executable, "-I", "-B", "-", json.dumps(profile), json.dumps(paths)],
+                                       input=script, text=True, capture_output=True, env=environment,
+                                       timeout=60, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        results = json.loads(completed.stdout.splitlines()[-1])
+        self.assertEqual([result["status"] for result in results], ["verified", "verified"])
+        self.assertNotEqual(results[0]["run_id"], results[1]["run_id"])
+
     def test_native_producer_bundle_loads_demo2_with_rendered_fresh_profiles(self):
         import fabric_assets
 

@@ -16,6 +16,10 @@ before another measured launch. Subsequent local runtime pagination and
 bodyless-request fixes have not yet been published to the Fabric notebook.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
 run requires a separately confirmed schedule and updated profile.
+The first-cycle Demo 3 rule was also disabled and read back. A requested
+capacity restart and retry remain pending: unrelated mirrored catalogs have
+periodic sync enabled on the shared capacity, so their interruption must be
+coordinated before suspension. The capacity was left running.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer

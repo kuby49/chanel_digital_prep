@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,8 +64,19 @@ class SharedManifestIntegrationTest(unittest.TestCase):
                 state["resources"][kind] = producer._record(state, plan, kind, resource_id)
             producer.StateStore(state_dir).write(state)
             (invocation_dir / "input-config.json").write_text(json.dumps(config), encoding="utf-8")
-            phases, resolved, path = orchestration.effective_run_config(
-                config, "sample", state_dir, invocation_dir, 30, ["demo-1"])
+            def resolve_target(tracks, mode, *args):
+                self.assertEqual((tracks, mode), (["demo-1"], "resolve-target-candidate"))
+                candidate = {"contract_version": 1, "track": "demo-1",
+                             "tenant_id": config["tenant_id"], "prefix": "sample",
+                             "target": {"workspace_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                                        "item_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                                        "fact": "silver.sales_joined"}}
+                (invocation_dir / "demo-1-target-candidate.json").write_text(
+                    json.dumps(candidate), encoding="utf-8")
+                return {"demo-1": orchestration.result("demo-1", mode, "pass", "candidate only")}
+            with mock.patch.object(orchestration, "run_phase", side_effect=resolve_target):
+                phases, resolved, path = orchestration.effective_run_config(
+                    config, "sample", state_dir, invocation_dir, 30, ["demo-1"], 1)
             self.assertEqual(phases["resolve-candidate-ids"]["shared"]["status"], "pass",
                              (phases, (invocation_dir / "shared-resolve-candidate-ids.log").read_text()))
             self.assertFalse(phases["resolve-candidate-ids"]["shared"]["ready"])

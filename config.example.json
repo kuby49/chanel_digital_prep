@@ -83,6 +83,7 @@
     "wrapper_pipeline_id": null,
     "destination_connection_ids": [],
     "identity_id": null,
-    "run_state_location": null
+    "run_state_location": null,
+    "target_bindings": {}
   }
 }

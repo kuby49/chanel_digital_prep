@@ -25,9 +25,39 @@ TRACKS = {
     "shared": ROOT / "demo-data-generator" / "deploy.py",
 }
 STATUSES = {"pass", "fail", "blocked"}
+DEMOS = ("demo-1", "demo-2", "demo-3")
 LEGACY_STATE = {"shared-producer-v1.json", ".shared-producer-v1.lock",
                 "demo-1-state.json", "demo-2-state.json", "demo-3-state.json",
                 "demo-2-monitor-start.json", "demo-2-monitor.json", "demo-2.lock"}
+
+
+def strict_json(path):
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    with path.open(encoding="utf-8") as file:
+        return json.load(file, object_pairs_hook=object_pairs, parse_constant=invalid_constant)
+
+
+def canonical_uuid(value, label, require_canonical=False):
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a nonzero UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be a nonzero UUID") from error
+    if parsed.int == 0 or (require_canonical and str(parsed) != value):
+        raise ValueError(f"{label} must be a canonical nonzero UUID" if require_canonical
+                         else f"{label} must be a nonzero UUID")
+    return str(parsed)
 
 
 def parse_selector(value):
@@ -42,8 +72,7 @@ def parse_selector(value):
 
 
 def load_config(path):
-    with path.open(encoding="utf-8") as file:
-        config = json.load(file)
+    config = strict_json(path)
     if not isinstance(config, dict) or type(config.get("contract_version")) is not int or config["contract_version"] != 1:
         raise ValueError("configuration contract_version must be 1")
     if not isinstance(config.get("execution"), dict):
@@ -120,8 +149,7 @@ def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout,
     except OSError as error:
         return result(track, mode, "fail", f"Could not launch entry point: {error}")
     try:
-        with result_path.open(encoding="utf-8") as file:
-            data = json.load(file)
+        data = strict_json(result_path)
         if not isinstance(data, dict):
             raise ValueError("result must be an object")
         if (type(data.get("contract_version")) is not int or data["contract_version"] != 1
@@ -135,6 +163,8 @@ def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout,
             raise ValueError("failed/blocked result must be not ready and explain why")
         if (completed.returncode == 0) != (data["status"] == "pass"):
             raise ValueError(f"exit code {completed.returncode} disagrees with status")
+        if mode in {"resolve-candidate-ids", "resolve-target-candidate"} and data["ready"]:
+            raise ValueError("candidate resolution must not claim readiness")
         if mode in {"deploy", "validate-only", "monitor-status", "wait-monitor"} and data["status"] == "pass" and not data["ready"]:
             return result(track, mode, "blocked", "Entry point reported pass but did not verify readiness")
         return data
@@ -214,7 +244,50 @@ def monitor_config(config):
     return f"{root}/{config['data']['run_id']}/manifest.json", duration
 
 
-def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, selected, check_monitor=False):
+def target_candidate(path, track, tenant_id, prefix):
+    candidate = strict_json(path)
+    if (not isinstance(candidate, dict) or set(candidate) !=
+            {"contract_version", "track", "tenant_id", "prefix", "target"}
+            or type(candidate["contract_version"]) is not int or candidate["contract_version"] != 1
+            or candidate["track"] != track or candidate["tenant_id"] != tenant_id
+            or candidate["prefix"] != prefix):
+        raise ValueError("candidate identity or contract version mismatch")
+    target = candidate["target"]
+    if not isinstance(target, dict) or set(target) != {"workspace_id", "item_id", "fact"}:
+        raise ValueError("target must contain exactly workspace_id, item_id, and fact")
+    for field in ("workspace_id", "item_id"):
+        canonical_uuid(target[field], field, require_canonical=True)
+    if not isinstance(target["fact"], str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,255}", target["fact"]):
+        raise ValueError("target fact has an invalid identifier")
+    return target
+
+
+def check_target_config(config, track, target, configured):
+    if configured is not None and configured != target:
+        raise ValueError(f"shared.target_bindings.{track} conflicts with its journal candidate")
+    settings = config.get(track) or {}
+    item_field = {"demo-1": "lakehouse_id", "demo-2": "kql_database_id", "demo-3": "lakehouse_id"}[track]
+    for target_field, config_field in (("workspace_id", "workspace_id"), ("item_id", item_field)):
+        value = settings.get(config_field)
+        if value is not None and canonical_uuid(value, f"{track}.{config_field}") != target[target_field]:
+            raise ValueError(f"{track}.{config_field} conflicts with its journal candidate")
+    if track == "demo-1":
+        schema, separator, view = target["fact"].partition(".")
+        if not separator or "." in view:
+            raise ValueError("Demo 1 target fact must be schema.view")
+        for value, name, actual in ((settings.get("silver_schema"), "silver_schema", schema),
+                                    (settings.get("silver_view"), "silver_view", view)):
+            if value is not None and value != actual:
+                raise ValueError(f"demo-1.{name} conflicts with its journal candidate")
+    else:
+        fact_field = "sales_table" if track == "demo-2" else "destination_table"
+        value = settings.get(fact_field)
+        if value is not None and value != target["fact"]:
+            raise ValueError(f"{track}.{fact_field} conflicts with its journal candidate")
+
+
+def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, selected, concurrency,
+                         check_monitor=False):
     phases = {}
     resolved = copy.deepcopy(config)
     shared = resolved.get("shared")
@@ -228,21 +301,57 @@ def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, sel
             phases["resolve-candidate-ids"] = {"shared": candidate_result}
             if candidate_result["status"] != "pass":
                 return phases, None, None
-            with (invocation_dir / "shared-producer-candidate-ids.json").open(encoding="utf-8") as file:
-                candidate = json.load(file)
+            candidate = strict_json(invocation_dir / "shared-producer-candidate-ids.json")
             if (not isinstance(candidate, dict) or set(candidate) != {"version", *keys}
                     or type(candidate["version"]) is not int or candidate["version"] != 1):
                 raise ValueError("invalid candidate ID sidecar")
             for key in keys:
-                candidate_id = str(uuid.UUID(candidate[key]))
-                if shared.get(key) is not None and str(uuid.UUID(shared[key])) != candidate_id:
+                candidate_id = canonical_uuid(candidate[key], key, require_canonical=True)
+                if shared.get(key) is not None and canonical_uuid(shared[key], key) != candidate_id:
                     raise ValueError(f"explicit shared.{key} conflicts with the producer journal candidate")
                 shared[key] = candidate_id
         else:
             for key in keys:
-                shared[key] = str(uuid.UUID(shared[key]))
+                shared[key] = canonical_uuid(shared[key], key)
         if check_monitor and "demo-2" in selected:
             monitor_config(resolved)
+        configured_targets = shared.get("target_bindings", {})
+        if not isinstance(configured_targets, dict) or set(configured_targets) - set(DEMOS):
+            raise ValueError("shared.target_bindings must be an object keyed by demo names")
+        candidate_config = invocation_dir / "candidate-config.json"
+        candidate_config.write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
+        candidates = run_phase(selected, "resolve-target-candidate", candidate_config, prefix, state_dir,
+                               invocation_dir, timeout, selected, concurrency, False)
+        phases["resolve-target-candidate"] = candidates
+        targets = {}
+        tenant_id = canonical_uuid(resolved["tenant_id"], "tenant_id")
+        for track in selected:
+            if candidates[track]["status"] != "pass":
+                continue
+            try:
+                target = target_candidate(invocation_dir / f"{track}-target-candidate.json",
+                                          track, tenant_id, prefix)
+                check_target_config(resolved, track, target, configured_targets.get(track))
+                targets[track] = target
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                candidates[track] = result(track, "resolve-target-candidate", "fail",
+                                           f"Invalid target candidate: {error}")
+        if any(outcome["status"] != "pass" for outcome in candidates.values()):
+            return phases, None, None
+        workspace_owners = {shared["workspace_id"]: "shared"}
+        for track, target in targets.items():
+            other = workspace_owners.get(target["workspace_id"])
+            if other is None:
+                workspace_owners[target["workspace_id"]] = track
+                continue
+            candidates[track] = result(track, "resolve-target-candidate", "fail",
+                                       f"Target workspace conflicts with {other}")
+            if other != "shared":
+                candidates[other] = result(other, "resolve-target-candidate", "fail",
+                                           f"Target workspace conflicts with {track}")
+        if any(outcome["status"] != "pass" for outcome in candidates.values()):
+            return phases, None, None
+        shared["target_bindings"] = targets
         effective_path = invocation_dir / "effective-config.json"
         effective_path.write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
         phases["resolve-shared-config"] = {"shared": result(
@@ -389,7 +498,7 @@ def main(argv=None):
         if not isinstance(prefix, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", prefix):
             raise ValueError("prefix must contain only lowercase letters, digits and hyphens, beginning with a letter or digit")
         try:
-            tenant_id = str(uuid.UUID(config["tenant_id"]))
+            tenant_id = canonical_uuid(config["tenant_id"], "tenant_id")
         except (KeyError, ValueError, TypeError, AttributeError) as error:
             raise ValueError("tenant_id must be a UUID") from error
         execution = config["execution"]
@@ -433,7 +542,7 @@ def main(argv=None):
             phases = {}
             if args.mode == "validate-only":
                 resolution_phases, effective_config, effective_path = effective_run_config(
-                    config, prefix, state_dir, invocation_dir, timeout, args.selector)
+                    config, prefix, state_dir, invocation_dir, timeout, args.selector, concurrency)
                 phases.update(resolution_phases)
                 if effective_config is not None:
                     config = effective_config
@@ -442,7 +551,7 @@ def main(argv=None):
                                           timeout, args.selector, concurrency, args.yes)
             if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
                 resolution_phases, effective_config, effective_path = effective_run_config(
-                    config, prefix, state_dir, invocation_dir, timeout, args.selector, check_monitor=True)
+                    config, prefix, state_dir, invocation_dir, timeout, args.selector, concurrency, check_monitor=True)
                 phases.update(resolution_phases)
                 if effective_config is not None:
                     config = effective_config

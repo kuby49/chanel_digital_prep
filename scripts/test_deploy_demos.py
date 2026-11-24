@@ -16,6 +16,15 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 deploy = importlib.util.module_from_spec(spec)
 loader.exec_module(deploy)
 
+TARGETS = {
+    "demo-1": {"workspace_id": "44444444-4444-4444-8444-444444444444",
+               "item_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "fact": "silver.sales_joined"},
+    "demo-2": {"workspace_id": "55555555-5555-4555-8555-555555555555",
+               "item_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "fact": "FactSales"},
+    "demo-3": {"workspace_id": "66666666-6666-4666-8666-666666666666",
+               "item_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "fact": "dbo.FactSales"},
+}
+
 FAKE_TRACK = """
 import argparse, datetime, json, pathlib, sys, time
 p = argparse.ArgumentParser()
@@ -45,6 +54,18 @@ if track == 'shared' and a.mode == 'resolve-candidate-ids' and status == 'pass' 
         'workspace_id': '11111111-1111-4111-8111-111111111111',
         'staging_lakehouse_id': '22222222-2222-4222-8222-222222222222'})
     (pathlib.Path(a.result).parent / 'shared-producer-candidate-ids.json').write_text(json.dumps(candidate))
+if track != 'shared' and a.mode == 'resolve-target-candidate' and status == 'pass' and not behavior.get('omit_candidate'):
+    targets = {
+        'demo-1': {'workspace_id': '44444444-4444-4444-8444-444444444444',
+                   'item_id': 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'fact': 'silver.sales_joined'},
+        'demo-2': {'workspace_id': '55555555-5555-4555-8555-555555555555',
+                   'item_id': 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'fact': 'FactSales'},
+        'demo-3': {'workspace_id': '66666666-6666-4666-8666-666666666666',
+                   'item_id': 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'fact': 'dbo.FactSales'}}
+    candidate = behavior.get('candidate', {'contract_version': 1, 'track': track,
+        'tenant_id': config['tenant_id'], 'prefix': a.prefix, 'target': targets[track]})
+    sidecar = pathlib.Path(a.result).parent / (track + '-target-candidate.json')
+    sidecar.write_text(behavior.get('raw_candidate', json.dumps(candidate)))
 monitor_path = pathlib.Path(a.state_dir) / 'demo-2-monitor.json'
 if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status', 'wait-monitor') and status == 'pass':
     if a.mode == 'start-monitor':
@@ -257,7 +278,8 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(code, 0)
         modes = [event["mode"] for event in events]
         self.assertEqual(modes[-4:], ["start-monitor", "monitor-status", "run-data", "wait-monitor"])
-        self.assertTrue(all(mode == "validate-only" for mode in modes[3:-4]))
+        self.assertLess(max(index for index, mode in enumerate(modes) if mode == "resolve-target-candidate"),
+                        min(index for index, mode in enumerate(modes) if mode == "validate-only"))
         self.assertEqual(events[-2]["selected"], "demo-2,demo-3")
         self.assertEqual(events[-3]["selected"], "demo-2,demo-3")
         self.assertTrue(summary["phases"]["monitor-status"]["demo-2"]["ready"])
@@ -284,6 +306,7 @@ class OrchestrationTests(unittest.TestCase):
         expected = json.loads(json.dumps(self.config))
         expected["shared"]["workspace_id"] = "11111111-1111-4111-8111-111111111111"
         expected["shared"]["staging_lakehouse_id"] = "22222222-2222-4222-8222-222222222222"
+        expected["shared"]["target_bindings"] = {track: TARGETS[track] for track in ("demo-2", "demo-3")}
         self.assertEqual(effective, expected)
         self.assertIsNone(self.config["shared"]["workspace_id"])
         self.assertIsNone(json.loads((self.root / "config.json").read_text())["shared"]["workspace_id"])
@@ -292,7 +315,8 @@ class OrchestrationTests(unittest.TestCase):
         code, _, events = self.run_cli("demo-1", "--deploy", "--run-data")
         self.assertEqual(code, 0)
         self.assertNotIn("resolve-candidate-ids", [event["mode"] for event in events])
-        self.assertEqual(len({event["config_path"] for event in events if event["mode"] != "deploy"}), 1)
+        self.assertEqual(len({event["config_path"] for event in events
+                              if event["mode"] not in ("deploy", "resolve-target-candidate")}), 1)
 
     def test_candidate_conflict_and_missing_sidecar_block_before_validation(self):
         for behavior in (
@@ -338,6 +362,94 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(summary["phases"]["validate-only"]["shared"]["status"], "blocked")
         self.assertNotIn("start-monitor", [event["mode"] for event in events])
         self.assertNotIn("run-data", summary["phases"])
+
+    def test_selected_targets_bind_to_every_validation_and_monitor_call(self):
+        self.config["shared"]["target_bindings"] = dict(TARGETS)
+        code, summary, events = self.run_cli("demo-1,demo-3", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.assertEqual(set(summary["phases"]["resolve-target-candidate"]), {"demo-1", "demo-3"})
+        self.assertFalse(any(event["track"] == "demo-2" for event in events))
+        after = [event for event in events if event["mode"] in ("validate-only", "run-data")]
+        self.assertEqual(len({event["config_path"] for event in after}), 1)
+        self.assertTrue(all(event["shared"]["target_bindings"] ==
+                            {name: TARGETS[name] for name in ("demo-1", "demo-3")} for event in after))
+        self.assertEqual(json.loads((self.root / "config.json").read_text())["shared"]["target_bindings"],
+                         TARGETS)
+
+    def test_unavailable_or_untrusted_target_candidates_block_the_run(self):
+        for behavior in ({"status": "blocked", "ready": False}, {"omit_candidate": True},
+                         {"ready": True}, {"raw_candidate": '{"contract_version":1,"contract_version":1}'}):
+            with self.subTest(behavior=behavior):
+                self.config["behavior"] = {"demo-2:resolve-target-candidate": behavior}
+                code, summary, events = self.run_cli("demo-2,demo-3", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertNotEqual(summary["phases"]["resolve-target-candidate"]["demo-2"]["status"], "pass")
+                self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-3"]["status"], "pass")
+                self.assertNotIn("validate-only", summary["phases"])
+                self.assertNotIn("start-monitor", [event["mode"] for event in events])
+                self.assertNotIn("run-data", summary["phases"])
+
+    def test_previous_target_candidate_cannot_be_reused(self):
+        code, _, _ = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.config["behavior"] = {"demo-1:resolve-target-candidate": {"omit_candidate": True}}
+        code, summary, events = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-1"]["status"], "fail")
+        self.assertNotIn("validate-only", [event["mode"] for event in events])
+
+    def test_explicit_target_and_per_track_conflicts_block(self):
+        cases = (
+            {"shared": {"target_bindings": {"demo-2": TARGETS["demo-3"]}}},
+            {"demo-2": {"workspace_id": TARGETS["demo-3"]["workspace_id"]}},
+            {"demo-2": {"kql_database_id": TARGETS["demo-3"]["item_id"]}},
+            {"demo-2": {"sales_table": "DifferentTable"}},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.config.pop("demo-2", None)
+                self.config["shared"].pop("target_bindings", None)
+                for key, value in case.items():
+                    if key == "shared":
+                        self.config["shared"].update(value)
+                    else:
+                        self.config[key] = value
+                code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-2"]["status"], "fail")
+                self.assertNotIn("validate-only", [event["mode"] for event in events])
+
+    def test_shared_or_duplicate_demo_workspace_blocks_execution(self):
+        for workspace in (self.config["shared"]["workspace_id"], TARGETS["demo-1"]["workspace_id"]):
+            with self.subTest(workspace=workspace):
+                candidate = {"contract_version": 1, "track": "demo-3",
+                             "tenant_id": self.config["tenant_id"], "prefix": "chanel",
+                             "target": dict(TARGETS["demo-3"], workspace_id=workspace)}
+                self.config["behavior"] = {"demo-3:resolve-target-candidate": {"candidate": candidate}}
+                code, summary, events = self.run_cli("demo-1,demo-3", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["phases"]["resolve-target-candidate"]["demo-3"]["status"], "fail")
+                self.assertNotIn("validate-only", [event["mode"] for event in events])
+
+    def test_target_sidecar_strictly_checks_identity_and_canonical_ids(self):
+        candidate = {"contract_version": 1, "track": "demo-2", "tenant_id": self.config["tenant_id"],
+                     "prefix": "chanel", "target": TARGETS["demo-2"]}
+        invalid = (
+            dict(candidate, contract_version=True),
+            dict(candidate, track="demo-1"),
+            dict(candidate, tenant_id="44444444-4444-4444-8444-444444444444"),
+            dict(candidate, prefix="other"),
+            dict(candidate, target=dict(TARGETS["demo-2"], workspace_id="00000000-0000-0000-0000-000000000000")),
+            dict(candidate, target=dict(TARGETS["demo-2"], item_id=TARGETS["demo-2"]["item_id"].upper())),
+            dict(candidate, target=dict(TARGETS["demo-2"], fact="bad name")),
+            dict(candidate, target=dict(TARGETS["demo-2"], extra=True)),
+        )
+        path = self.root / "candidate.json"
+        for value in invalid:
+            with self.subTest(value=value):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    deploy.target_candidate(path, "demo-2", self.config["tenant_id"], "chanel")
 
     def test_validate_only_resolves_missing_ids_without_requiring_run_id(self):
         self.config["shared"]["workspace_id"] = None

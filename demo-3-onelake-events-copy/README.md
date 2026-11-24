@@ -59,6 +59,13 @@ in coordinated-run totals; `bootstrap` and `negative-test` are separate.
 | Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. A synthetic audit-journal probe exercised state transitions and duplicate recognition against OneLake. The guarded pipeline and recovery launcher remain uninstalled candidates. | Verify per-file audit, missed events and uncertain writes, safe serialization/exclusive writers, bounded retries, duplicate delivery, and write-then-crash recovery end to end. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
 | Query surface | Setup verified dimensions and the fact schema. A non-destructive SQL metadata refresh using actual lowercase Delta paths exposed all four tables; the Spark amount view is not exposed as a SQL view. A separate probe had stale SQL results for over 900 seconds until a targeted, non-recreating refresh. | Verify joined queries, DECIMAL(18,2) results, exact totals and visibility with valid sales data. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
 
+In an isolated runtime 2.0 probe, the default fact table had deletion vectors
+enabled (Delta reader 3/writer 7). The Copy connector rejected its writer
+features. A new empty test table created with deletion vectors disabled used
+reader 1/writer 2. Setup requests that compatible protocol for new fact tables
+and blocks on an incompatible existing table; it never downgrades or replaces
+one. Composite Copy against that protocol still needs live verification.
+
 On 2026-11-23, read-only MCAP cloud `supportedConnectionTypes` returned one
 `Lakehouse` type with creation method `Lakehouse.Contents`, optional Boolean
 `HierarchicalNavigation`, `EnableVorder`, and `OutputMetadataRefresh`, and
@@ -69,6 +76,11 @@ and use that specific connection. The [connector overview](https://learn.microso
 lists organizational account authentication for pipelines. `Connection.Read.All`
 or `Connection.ReadWrite.All` permits metadata listing; creation requires
 `Connection.ReadWrite.All` and appropriate Fabric permissions.
+
+For this demo, notification delivery is assumed to work in general. One
+preflight event was visible at the source without a corresponding activation
+during a five-minute observation window; this is not proof of a general
+delivery failure or a guarantee of later delivery.
 
 OneLake's documented [`FileCreated`](https://learn.microsoft.com/en-us/fabric/real-time-hub/explore-fabric-onelake-events)
 can mean create **or update**; rename is a different event. The current producer

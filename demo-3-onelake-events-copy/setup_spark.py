@@ -61,11 +61,11 @@ def column_types(schema):
     return [(field.name, field.dataType.simpleString()) for field in schema.fields]
 
 
-def create_table(name, schema):
+def create_table(name, schema, properties=""):
     columns = ", ".join(
         f"`{field.name}` {field.dataType.simpleString()}" for field in schema.fields
     )
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {qualified(name)} ({columns}) USING DELTA")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {qualified(name)} ({columns}) USING DELTA {properties}")
     actual = spark.table(qualified(name))
     if column_types(actual.schema) != column_types(schema):
         raise RuntimeError(f"{name} has a different schema")
@@ -90,7 +90,9 @@ for name, schema in dimension_schemas.items():
     ):
         raise RuntimeError(f"{name} does not match the shared deterministic dimensions")
 
-create_table("FactSales", fact_schema)
+create_table("FactSales", fact_schema, "TBLPROPERTIES ('delta.enableDeletionVectors' = 'false')")
+fact_details = spark.sql(f"DESCRIBE DETAIL {qualified('FactSales')}").first().asDict()
+validate_copy_protocol(fact_details)
 for name in missing:
     expected[name].write.format("delta").mode("append").saveAsTable(qualified(name))
 

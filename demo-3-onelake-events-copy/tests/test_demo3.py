@@ -317,6 +317,13 @@ class SetupNotebookTests(unittest.TestCase):
         self.assertFalse(view_validation.matches_amount_view(
             ddl.replace("/ 100", "/ 10"), query, view, table))
 
+    def test_incompatible_fact_protocol_is_rejected(self):
+        view_validation.validate_copy_protocol({"minReaderVersion": 1, "minWriterVersion": 2})
+        for detail in ({"minReaderVersion": 3, "minWriterVersion": 7}, {},
+                       {"minReaderVersion": True, "minWriterVersion": 2}):
+            with self.subTest(detail=detail), self.assertRaises(RuntimeError):
+                view_validation.validate_copy_protocol(detail)
+
 
 class ConditionalStore:
     class Conflict(RuntimeError):

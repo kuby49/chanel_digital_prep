@@ -2384,11 +2384,15 @@ class MonitorPending(Blocked):
 
 
 def _resolve_target_candidate(args, settings):
-    ledger = Ledger(args.state_dir, settings)
     try:
-        with ledger.path.open(encoding="utf-8") as stream:
-            ledger.data = json.load(stream)
-        ledger._validate()
+        with Ledger(args.state_dir, settings) as ledger:
+            return _write_target_candidate(args, settings, ledger)
+    except (OSError, ValueError) as exc:
+        raise Blocked("The existing Demo 2 ownership ledger could not be read.") from exc
+
+
+def _write_target_candidate(args, settings, ledger):
+    try:
         resources = ledger.data["resources"]
         workspace, eventhouse, database, table = (resources[key] for key in
                                                    ("workspace", "eventhouse", "database", "table"))
@@ -2408,7 +2412,7 @@ def _resolve_target_candidate(args, settings):
             raise ValueError
         target = {"workspace_id": workspace["id"], "item_id": database["id"], "fact": table["name"]}
         _targets({"demo-2": target})
-    except (OSError, KeyError, TypeError, ValueError, ReservationError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise Blocked("A complete, confirmed Demo 2 ownership ledger is required for a target candidate.") from exc
     candidate = {"contract_version": 1, "track": "demo-2", "tenant_id": settings["tenant_id"],
                  "prefix": settings["prefix"], "target": target}

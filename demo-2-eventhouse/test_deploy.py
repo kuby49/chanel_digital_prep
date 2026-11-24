@@ -2035,6 +2035,25 @@ with deploy.Ledger(Path(sys.argv[1]), settings):
             self.fail(f"The child process did not acquire the ledger lock: {stderr}")
         return process
 
+    def test_candidate_blocks_while_another_process_holds_the_ledger(self):
+        self.deploy_success()
+        candidate = self.result.with_name("demo-2-target-candidate.json")
+        journal = self.state / deploy.STATE_FILE
+        original = journal.read_bytes()
+        process = self.hold_ledger_in_subprocess()
+        try:
+            _, result = self.cli("resolve-target-candidate")
+            self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+            self.assertIn("locked", result["diagnostics"][0])
+            self.assertFalse(candidate.exists())
+        finally:
+            process.kill()
+            process.communicate(timeout=15)
+        _, result = self.cli("resolve-target-candidate")
+        self.assertEqual((result["status"], result["ready"]), ("pass", False), result)
+        self.assertTrue(candidate.is_file())
+        self.assertEqual(journal.read_bytes(), original)
+
     def test_killed_monitor_lock_holder_releases_ledger_for_exact_stop(self):
         self.monitor_setup()
         evidence = self.start_monitor()

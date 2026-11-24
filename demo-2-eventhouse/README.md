@@ -84,8 +84,9 @@ Monitor readiness also remains blocked until that proof is bound to the
 verified artifacts, dimensions and effective configuration.
 The manually created MCAP workspace also lacks the CLI's ownership ledger and
 markers; it is not automatically adopted.
-`resolve-target-candidate` reads the existing ownership ledger and exclusively
-creates `demo-2-target-candidate.json` beside the result. It reports `ready:false`:
+`resolve-target-candidate` holds the deployment ledger lock while reading the
+existing ledger and exclusively creating `demo-2-target-candidate.json` beside
+the result. It reports `ready:false`:
 the candidate is not a live ownership or access proof. Monitor starts require
 the complete selected `shared.target_bindings` map and bind it, the normalized
 generator digest and the producer configuration into the immutable start

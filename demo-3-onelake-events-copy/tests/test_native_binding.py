@@ -20,11 +20,16 @@ import native_binding
 from deploy import CandidateBlocked
 
 
-@unittest.skipUnless(os.environ.get("DEMO3_PRODUCER_PATH"), "producer fixture not supplied")
+@unittest.skipUnless(
+    os.environ.get("DEMO3_PRODUCER_PATH") or
+    (ROOT.parent / "demo-data-generator" / "generator.py").is_file(),
+    "producer fixture not supplied",
+)
 class NativeBindingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.producer = Path(os.environ["DEMO3_PRODUCER_PATH"]).resolve().parent
+        cls.producer = Path(os.environ.get("DEMO3_PRODUCER_PATH") or
+                            ROOT.parent / "demo-data-generator" / "generator.py").resolve().parent
         spec = importlib.util.spec_from_file_location("binding_producer_fixture", cls.producer / "generator.py")
         cls.generator = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = cls.generator

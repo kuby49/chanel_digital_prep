@@ -17,6 +17,12 @@ spec.loader.exec_module(activator)
 spec = importlib.util.spec_from_file_location("demo3_reconcile", ROOT / "reconcile.py")
 reconcile = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reconcile)
+spec = importlib.util.spec_from_file_location("demo3_batch_gate", ROOT / "batch_gate.py")
+batch_gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(batch_gate)
+spec = importlib.util.spec_from_file_location("demo3_audit", ROOT / "audit.py")
+audit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(audit)
 spec = importlib.util.spec_from_file_location("demo3_setup", ROOT / "setup_notebook.py")
 setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
@@ -310,6 +316,150 @@ class SetupNotebookTests(unittest.TestCase):
             ddl.replace("/ 100", "/ 10"), query, view, table))
 
 
+class ConditionalStore:
+    class Conflict(RuntimeError):
+        pass
+
+    def __init__(self, workspace_id, lakehouse_id):
+        self.workspace_id = workspace_id
+        self.lakehouse_id = lakehouse_id
+        self.objects = {}
+        self.version = 0
+        self.uncertain_replace = False
+
+    def read(self, path):
+        if path not in self.objects:
+            raise FileNotFoundError(path)
+        return self.objects[path]
+
+    def create(self, path, body):
+        if path in self.objects:
+            raise self.Conflict("already exists")
+        self.version += 1
+        etag = str(self.version)
+        self.objects[path] = (body, etag)
+        return etag
+
+    def replace(self, path, body, etag):
+        if self.read(path)[1] != etag:
+            raise self.Conflict("stale ETag")
+        self.version += 1
+        new_etag = str(self.version)
+        self.objects[path] = (body, new_etag)
+        if self.uncertain_replace:
+            self.uncertain_replace = False
+            raise RuntimeError("replacement outcome unknown")
+        return new_etag
+
+    def delete(self, path, etag):
+        if self.read(path)[1] != etag:
+            raise self.Conflict("stale ETag")
+        del self.objects[path]
+
+
+class AuditTests(unittest.TestCase):
+    def setUp(self):
+        self.workspace, self.lakehouse = str(uuid.uuid4()), str(uuid.uuid4())
+        self.job = str(uuid.uuid4())
+        self.store = ConditionalStore(self.workspace, self.lakehouse)
+        self.audit = audit.BatchAudit(self.store, self.workspace, self.lakehouse)
+        self.evidence = {
+            "origin": "event", "event_id": "event-1",
+            "batch_id": "run_0001", "source_subject": "/Files/incoming/sales/sales_run_0001.csv",
+            "sha256": "a" * 64, "row_count": 2, "sales_amount_minor_units": 42,
+            "first_sales_line_id": 11, "last_sales_line_id": 12,
+            "amount_by_date": {"2024-01-01": 42},
+            "amount_by_product_category": {"Beauty": 42},
+            "amount_by_customer_region": {"Europe": 42},
+            "delivery_status": "submitting",
+        }
+        self.copy_result = {
+            "status": "Succeeded", "pipeline_run_id": self.job, "activity_run_id": str(uuid.uuid4()),
+            "files_read": 1, "rows_read": 2, "rows_copied": 2,
+        }
+        self.proof = {
+            "row_count": 2, "distinct_sales_line_ids": 2, "first_sales_line_id": 11,
+            "last_sales_line_id": 12, "sales_amount_minor_units": 42,
+            "orphan_rows": 0, "row_difference_count": 0,
+            **{name: self.evidence[name] for name in audit.GROUPS},
+        }
+
+    def test_completed_batch_records_duplicate_without_another_copy(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        with self.assertRaises(ConditionalStore.Conflict):
+            self.audit.acquire(str(uuid.uuid4()), "run_0002")
+        self.assertEqual(self.audit.begin(token, self.evidence), "copy-required")
+        attempt = self.audit.copy_intent(token, self.evidence["batch_id"])
+        self.audit.copy_succeeded(token, self.evidence["batch_id"], attempt, self.copy_result)
+        with self.assertRaises(audit.AuditError):
+            self.audit.complete(token, self.evidence["batch_id"], {**self.proof, "row_difference_count": 1})
+        self.audit.complete(token, self.evidence["batch_id"], self.proof)
+        self.audit.release(token, self.evidence["batch_id"])
+
+        duplicate = self.audit.acquire(str(uuid.uuid4()), self.evidence["batch_id"])
+        self.assertEqual(self.audit.begin(duplicate, self.evidence), "already-completed")
+        with self.assertRaises(audit.AuditError):
+            self.audit.copy_intent(duplicate, self.evidence["batch_id"])
+        self.audit.release(duplicate, self.evidence["batch_id"])
+        document = json.loads(self.store.read(audit.RECORD_PREFIX + "run_0001.json")[0])
+        self.assertEqual((document["state"], len(document["observations"])), ("completed", 2))
+        self.assertEqual(document["copy_attempt"]["attempt_id"], attempt)
+        next_evidence = {**self.evidence, "batch_id": "run_0002",
+                         "source_subject": "/Files/incoming/sales/sales_run_0002.csv"}
+        next_token = self.audit.acquire(str(uuid.uuid4()), "run_0002")
+        self.audit.begin(next_token, next_evidence)
+        self.audit.copy_intent(next_token, "run_0002")
+        with self.assertRaises(audit.AuditError):
+            self.audit.release(next_token, "run_0001")
+
+    def test_uncertain_or_inflight_copy_keeps_lock_and_blocks_replay(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        self.audit.begin(token, self.evidence)
+        self.store.uncertain_replace = True
+        with self.assertRaisesRegex(RuntimeError, "outcome unknown"):
+            self.audit.copy_intent(token, self.evidence["batch_id"])
+        with self.assertRaises(audit.AuditError):
+            self.audit.release(token, self.evidence["batch_id"])
+        with self.assertRaises(ConditionalStore.Conflict):
+            self.audit.acquire(str(uuid.uuid4()), "run_0002")
+        with self.assertRaises(audit.AuditError):
+            self.audit.release(token, "run_0002")
+        with self.assertRaises(audit.AuditError):
+            self.audit.begin(token, self.evidence)
+
+    def test_pre_copy_release_and_conflicting_replay(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        self.audit.begin(token, self.evidence)
+        self.audit.release(token, self.evidence["batch_id"])
+        recovery = self.audit.acquire(str(uuid.uuid4()), self.evidence["batch_id"])
+        with self.assertRaises(audit.AuditError):
+            self.audit.begin(recovery, {**self.evidence, "sha256": "b" * 64})
+        self.assertEqual(self.audit.begin(
+            recovery, {**self.evidence, "origin": "recovery", "event_id": None}), "copy-required")
+        self.audit.release(recovery, self.evidence["batch_id"])
+
+    def test_target_identity_and_copy_readback_are_fail_closed(self):
+        with self.assertRaises(audit.AuditError):
+            audit.BatchAudit(self.store, str(uuid.uuid4()), self.lakehouse)
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        self.audit.begin(token, self.evidence)
+        attempt = self.audit.copy_intent(token, self.evidence["batch_id"])
+        with self.assertRaises(audit.AuditError):
+            self.audit.copy_succeeded(
+                token, self.evidence["batch_id"], attempt, {**self.copy_result, "files_read": 2})
+        with self.assertRaises(audit.AuditError):
+            self.audit.release(token, self.evidence["batch_id"])
+
+    def test_tampered_audit_record_cannot_start_copy(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        self.audit.begin(token, self.evidence)
+        path = audit.RECORD_PREFIX + "run_0001.json"
+        body, etag = self.store.read(path)
+        self.store.replace(path, b'{"contract_version":1,' + body[1:], etag)
+        with self.assertRaises(audit.AuditError):
+            self.audit.copy_intent(token, self.evidence["batch_id"])
+
+
 class ReconciliationTests(unittest.TestCase):
     def test_exact_results_and_excluded_batch_classes(self):
         entry = {"batch_id": "run_0001", "batch_class": "measured",
@@ -338,12 +488,17 @@ class ReconciliationTests(unittest.TestCase):
         observed["batches"]["run_0001"] = {**entry, "row_count": True}
         self.assertTrue(any("integer" in error for error in reconcile.reconcile(manifest, observed)))
 
-    @unittest.skipUnless(os.environ.get("DEMO3_PRODUCER_PATH"), "producer fixture not supplied")
+    @unittest.skipUnless(
+        os.environ.get("DEMO3_PRODUCER_PATH") or
+        (ROOT.parent / "demo-data-generator" / "generator.py").is_file(),
+        "producer fixture not supplied",
+    )
     def test_actual_producer_manifest(self):
         import csv
         import io
         from collections import defaultdict
-        producer_path = Path(os.environ["DEMO3_PRODUCER_PATH"]).resolve()
+        producer_path = Path(os.environ.get(
+            "DEMO3_PRODUCER_PATH", ROOT.parent / "demo-data-generator" / "generator.py")).resolve()
         sys.path.insert(0, str(producer_path.parent))
         self.addCleanup(sys.path.remove, str(producer_path.parent))
         producer_spec = importlib.util.spec_from_file_location("producer_fixture", producer_path)
@@ -368,7 +523,61 @@ class ReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             entry = producer.stage_batch(directory, config, 1, ["demo-3"])
             manifest = json.loads((Path(directory) / "integration" / "manifest.json").read_text(encoding="utf-8"))
-            payload = (Path(directory) / "integration" / entry["filename"]).read_text(encoding="utf-8")
+            source_bytes = (Path(directory) / "integration" / entry["filename"]).read_bytes()
+            payload = source_bytes.decode("utf-8")
+            manifest["batches"]["1"]["deliveries"]["demo-3"]["status"] = "submitting"
+            subject = f"/Files/incoming/sales/{entry['filename']}"
+
+            def validate(document=manifest, source=source_bytes, path=subject, **kwargs):
+                return batch_gate.validate_batch(
+                    producer, config, json.dumps(document).encode("utf-8"), path, source, **kwargs)
+
+            for status in ("submitting", "submitted", "unknown", "verified"):
+                manifest["batches"]["1"]["deliveries"]["demo-3"]["status"] = status
+                result = validate(event_id="event-1")
+                self.assertEqual((result["batch_id"], result["delivery_status"]),
+                                 (entry["batch_id"], status))
+            workspace, lakehouse, job = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+            batch_audit = audit.BatchAudit(ConditionalStore(workspace, lakehouse), workspace, lakehouse)
+            writer = batch_audit.acquire(job, result["batch_id"])
+            self.assertEqual(batch_audit.begin(writer, result), "copy-required")
+            batch_audit.release(writer, result["batch_id"])
+            self.assertEqual(validate(origin="recovery")["event_id"], None)
+            for path in (subject + ".tmp", subject.replace("/sales/", "/sales/../"),
+                         subject.replace("_0001.csv", "_1.csv"),
+                         subject.replace("_0001.csv", "_0002.csv"),
+                         "/Files/incoming/sales/other.csv"):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    validate(path=path, event_id="event-1")
+            with self.assertRaises(ValueError):
+                validate(source=source_bytes + b"x", event_id="event-1")
+            with self.assertRaises(ValueError):
+                validate(event_id="")
+            with self.assertRaises(ValueError):
+                validate(event_id="event\nforged")
+            with self.assertRaises(ValueError):
+                validate()
+            for path, value in (
+                (("config", "seed"), 999),
+                (("sales_line_id_reservation", "generator_sha256"), "0" * 64),
+                (("sales_line_id_reservation", "allocator_id"), "invalid"),
+                (("batches", "1", "row_count"), True),
+                (("batches", "1", "amount_by_date"), {"2024-01-01": 0}),
+                (("batches", "1", "deliveries", "demo-3", "status"), "pending"),
+                (("batches", "1", "deliveries", "demo-3", "status"), []),
+            ):
+                bad = copy.deepcopy(manifest)
+                target = bad
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.subTest(field=path), self.assertRaises(ValueError):
+                    validate(document=bad, event_id="event-1")
+            encoded = json.dumps(manifest).encode("utf-8")
+            with self.assertRaises(ValueError):
+                batch_gate.validate_batch(
+                    producer, config, b'{"contract_version":1,' + encoded[1:],
+                    subject, source_bytes, event_id="event-1")
             dims = producer.dimensions(config)
             products = {str(x["ProductID"]): x["ProductCategory"] for x in dims["DimProduct"]}
             customers = {str(x["CustomerID"]): x["CustomerRegion"] for x in dims["DimCustomer"]}

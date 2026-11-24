@@ -108,8 +108,8 @@ def _batch(evidence, landing_directory):
         raise AuditError("invalid batch checksum")
     count, total = batch["row_count"], batch["sales_amount_minor_units"]
     first, last = batch["first_sales_line_id"], batch["last_sales_line_id"]
-    if (not _integer(count, 1) or not _integer(total, 1) or not _integer(first, 1)
-            or not _integer(last, 1) or last > _MAX_ID or last - first + 1 != count):
+    if (not _integer(count, 1) or not _integer(total, 1) or type(first) is not int or first != 1
+            or not _integer(last, 1) or last > _MAX_ID or last != count):
         raise AuditError("invalid batch counts, amount, or key range")
     for name in GROUPS:
         groups = batch[name]

@@ -96,9 +96,9 @@ def validate_batch(generator, expected_config, manifest_bytes, source_subject, s
     if tuple(next(reader, ())) != generator.HEADER:
         raise ValueError("producer header differs from the v1 source mapping")
     keys = [int(row[0]) for row in reader]
-    if (len(keys) != expected["row_count"] or not keys or keys[0] <= 0
-            or any(key != keys[0] + index for index, key in enumerate(keys))):
-        raise ValueError("SalesLineID must be contiguous and positive within the batch")
+    if (len(keys) != expected["row_count"] or not keys
+            or any(key != index for index, key in enumerate(keys, start=1))):
+        raise ValueError("SalesLineID must be contiguous from 1 within the batch")
     return {
         "origin": origin, "event_id": event_id, "source_subject": source_subject,
         "batch_id": expected["batch_id"], "sha256": expected["sha256"],

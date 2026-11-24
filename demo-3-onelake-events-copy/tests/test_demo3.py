@@ -369,7 +369,7 @@ class AuditTests(unittest.TestCase):
             "origin": "event", "event_id": "event-1",
             "batch_id": "run_0001", "source_subject": "/Files/incoming/sales/sales_run_0001.csv",
             "sha256": "a" * 64, "row_count": 2, "sales_amount_minor_units": 42,
-            "first_sales_line_id": 11, "last_sales_line_id": 12,
+            "first_sales_line_id": 1, "last_sales_line_id": 2,
             "amount_by_date": {"2024-01-01": 42},
             "amount_by_product_category": {"Beauty": 42},
             "amount_by_customer_region": {"Europe": 42},
@@ -380,8 +380,8 @@ class AuditTests(unittest.TestCase):
             "files_read": 1, "rows_read": 2, "rows_copied": 2,
         }
         self.proof = {
-            "row_count": 2, "distinct_sales_line_ids": 2, "first_sales_line_id": 11,
-            "last_sales_line_id": 12, "sales_amount_minor_units": 42,
+            "row_count": 2, "distinct_sales_line_ids": 2, "first_sales_line_id": 1,
+            "last_sales_line_id": 2, "sales_amount_minor_units": 42,
             "orphan_rows": 0, "row_difference_count": 0,
             **{name: self.evidence[name] for name in audit.GROUPS},
         }
@@ -451,6 +451,12 @@ class AuditTests(unittest.TestCase):
                 token, self.evidence["batch_id"], attempt, {**self.copy_result, "files_read": 2})
         with self.assertRaises(audit.AuditError):
             self.audit.release(token, self.evidence["batch_id"])
+
+    def test_batch_ids_must_start_at_one(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        with self.assertRaises(audit.AuditError):
+            self.audit.begin(token, {**self.evidence, "first_sales_line_id": 11,
+                                     "last_sales_line_id": 12})
 
     def test_tampered_audit_record_cannot_start_copy(self):
         token = self.audit.acquire(self.job, self.evidence["batch_id"])
@@ -534,6 +540,26 @@ class ReconciliationTests(unittest.TestCase):
             def validate(document=manifest, source=source_bytes, path=subject, **kwargs):
                 return batch_gate.validate_batch(
                     producer, config, json.dumps(document).encode("utf-8"), path, source, **kwargs)
+
+            import hashlib
+            from types import SimpleNamespace
+            lines = source_bytes.decode("utf-8").splitlines()
+            shifted = ("\n".join([lines[0]] + [
+                f"{int(line.split(',', 1)[0]) + 10},{line.split(',', 1)[1]}"
+                for line in lines[1:]
+            ]) + "\n").encode("utf-8")
+            generated, generated_metadata = producer.batch_bytes(config, 1)
+            self.assertEqual(generated, source_bytes)
+            shifted_metadata = {**generated_metadata, "sha256": hashlib.sha256(shifted).hexdigest()}
+            shifted_manifest = copy.deepcopy(manifest)
+            shifted_manifest["batches"]["1"].update(shifted_metadata)
+            shifted_producer = SimpleNamespace(
+                RunConfig=producer.RunConfig, HEADER=producer.HEADER,
+                strict_json_loads=producer.strict_json_loads,
+                batch_bytes=lambda _config, _number: (shifted, shifted_metadata))
+            with self.assertRaisesRegex(ValueError, "contiguous from 1"):
+                batch_gate.validate_batch(shifted_producer, config, json.dumps(shifted_manifest).encode(),
+                                          subject, shifted, event_id="event-1")
 
             for status in ("submitting", "submitted", "unknown", "verified"):
                 manifest["batches"]["1"]["deliveries"]["demo-3"]["status"] = status
@@ -667,6 +693,71 @@ class ReconciliationTests(unittest.TestCase):
             observed = {"duplicate_batch_sales_line_ids": duplicates, "orphan_rows": orphans,
                         "batches": {entry["batch_id"]: result}}
             self.assertEqual(reconcile.reconcile(manifest, observed), [])
+
+    @unittest.skipUnless(
+        os.environ.get("DEMO3_PRODUCER_PATH") or
+        (ROOT.parent / "demo-data-generator" / "generator.py").is_file(),
+        "producer fixture not supplied",
+    )
+    def test_two_batches_reuse_ids_and_late_event_does_not_copy_again(self):
+        import csv
+        import io
+        producer_path = Path(os.environ.get("DEMO3_PRODUCER_PATH") or
+                             ROOT.parent / "demo-data-generator" / "generator.py").resolve()
+        sys.path.insert(0, str(producer_path.parent))
+        self.addCleanup(sys.path.remove, str(producer_path.parent))
+        producer_spec = importlib.util.spec_from_file_location("producer_fixture_two_batches", producer_path)
+        producer = importlib.util.module_from_spec(producer_spec)
+        sys.modules[producer_spec.name] = producer
+        self.addCleanup(sys.modules.pop, producer_spec.name, None)
+        producer_spec.loader.exec_module(producer)
+        config = producer.RunConfig("two_batches", date_count=4, products=3, customers=5,
+                                    file_count=2, rows_per_file=3)
+        manifest = producer.new_manifest(config, ["demo-3"])
+        workspace, lakehouse = str(uuid.uuid4()), str(uuid.uuid4())
+        storage = ConditionalStore(workspace, lakehouse)
+        authority = ConditionalStore(str(uuid.uuid4()), str(uuid.uuid4()))
+        audit_store = audit.BatchAudit(storage, workspace, lakehouse)
+        guarded = delivery_runtime.GuardedDelivery(producer, config, authority, audit_store)
+        for number in (1, 2):
+            payload, entry = producer.batch_bytes(config, number)
+            manifest["batches"][str(number)] = {
+                **entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+            storage.create(f"Files/incoming/sales/{entry['filename']}", payload)
+        authority.create(delivery_runtime.manifest_path(config), json.dumps(manifest).encode())
+        target, submissions = {}, []
+
+        def copy_batch(subject, event_id, origin, remaining):
+            job = str(uuid.uuid4())
+            prepared = guarded.prepare(job, subject, event_id or None, origin)
+            self.assertEqual(prepared["decision"], "copy-required")
+            submissions.append(subject)
+            payload, _ = storage.read(subject[1:])
+            rows = list(csv.DictReader(io.StringIO(payload.decode())))
+            for row in rows:
+                target[(row["BatchID"], int(row["SalesLineID"]))] = row
+            entry = next(item for item in manifest["batches"].values()
+                         if item["batch_id"] == prepared["batch_id"])
+            guarded.finish(job, prepared, {
+                "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+                "files_read": 1, "rows_read": len(rows), "rows_copied": len(rows),
+            }, lambda _: {
+                "row_count": len(rows), "distinct_sales_line_ids": len(rows),
+                "first_sales_line_id": 1, "last_sales_line_id": len(rows),
+                "sales_amount_minor_units": entry["sales_amount_minor_units"],
+                "orphan_rows": 0, "row_difference_count": 0,
+                **{name: entry[name] for name in audit.GROUPS},
+            })
+
+        guarded.reconcile(copy_batch, timeout_seconds=5, poll_seconds=1, event_grace_seconds=0)
+        batch_ids = [manifest["batches"][str(n)]["batch_id"] for n in (1, 2)]
+        self.assertEqual(set(target), {(batch, key) for batch in batch_ids for key in (1, 2, 3)})
+        first = manifest["batches"]["1"]["filename"]
+        replay = guarded.prepare(str(uuid.uuid4()), f"/Files/incoming/sales/{first}", "late", "event")
+        self.assertEqual(replay["decision"], "already-completed")
+        guarded.reconcile(copy_batch, timeout_seconds=5, poll_seconds=1, event_grace_seconds=0)
+        self.assertEqual(len(submissions), 2)
+        self.assertEqual(len(target), 6)
 
 
 if __name__ == "__main__":

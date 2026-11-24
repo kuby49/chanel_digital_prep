@@ -8,7 +8,15 @@ local contract.
 
 ## Contract
 
-`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. A v1 result reports `track: demo-3`; `ready` remains false. Deploy, validation and cleanup currently return `blocked` and make no Fabric requests; cleanup never deletes anything.
+`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate,provision-owned,verify-owned} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup and `provision-owned` require `--yes`. A v1 result reports `track: demo-3`; `ready` remains false. Deploy, validation and cleanup currently return `blocked` and make no Fabric requests; cleanup never deletes anything.
+
+`provision-owned` explicitly creates a new workspace and Lakehouse shell, journaling
+each creation intent and confirming live readback; `verify-owned` reads that
+journal and checks the live resources without creating anything. Both remain
+blocked for readiness: they do not create or verify the fact table, guarded
+pipeline, Activator, access or writer safety. They never adopt existing resources
+or retry an uncertain creation. The existing preflight workspace is not an
+owned production deployment journal.
 
 `resolve-target-candidate` is local-only. It reads a confirmed
 `demo-3-state.json` under an exclusive `demo-3-state.lock` and creates a fresh
@@ -16,8 +24,7 @@ local contract.
 file. Missing, invalid, pending, uncertain or conflicting ownership blocks the
 operation; a stale lock is never cleared automatically. A successful candidate is
 not proof of live ownership, access, inventory, exclusive writing or readiness.
-The current deployment stub does not create an ownership journal or adopt the
-preflight resources.
+The standard deployment stub does not adopt the preflight resources.
 
 The journal must identify contract version, track, tenant, prefix, an owner ID
 and marker `<prefix>-demo3-<owner-id>`, plus empty `pending_operations` and
@@ -49,7 +56,7 @@ in coordinated-run totals; `bootstrap` and `negative-test` are separate.
 | Connection | A Lakehouse OAuth2 connection was created in the Fabric UI, read back via API, and used by a two-row Copy probe. The public [create-connection request](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/create-connection) lists OAuth2 as a credential type but does not define OAuth2 in its create-credentials union. | Automate a supported connection path or explicitly require the UI-created connection; verify identity and access in each environment. Never store credentials. |
 | Pipeline | A non-sales probe used the event subject as a dynamic exact filename and Upserted two rows; its successful event-triggered job read one file. A top-level `keyColumns` property was accepted in a definition but failed at runtime; `upsertSettings.keys` worked for the probe. | Deploy and verify the guarded candidate with explicit sales mappings and composite `(BatchID, SalesLineID)` Upsert. The prior probe did not exercise the composite key or crash recovery. |
 | Activator | A restricted non-sales `FileCreated` event invoked a parameter-only pipeline. `___subject` and `___id` matched source and activation history in that probe. A later event-triggered dynamic Copy captured the subject and ID after a six-minute warm-up. `activator.py` builds a disabled candidate. | Verify the actual production source and bindings and completed-file readiness. An event published after a 30-second warm-up appeared in source history but produced no activation or job within 300 seconds. A single six-minute success is not a readiness guarantee; definition readback or a Running label alone is insufficient. |
-| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. A synthetic audit-journal probe exercised state transitions and duplicate recognition against OneLake. `audit.py` is not installed in a pipeline. | Wire and verify per-file audit, reconcile missed events and uncertain writes, prove safe serialization/exclusive writers, bounded retries, duplicate delivery, and write-then-crash recovery. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
+| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. A synthetic audit-journal probe exercised state transitions and duplicate recognition against OneLake. The guarded pipeline and recovery launcher remain uninstalled candidates. | Verify per-file audit, missed events and uncertain writes, safe serialization/exclusive writers, bounded retries, duplicate delivery, and write-then-crash recovery end to end. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
 | Query surface | Setup verified dimensions and the fact schema. A non-destructive SQL metadata refresh using actual lowercase Delta paths exposed all four tables; the Spark amount view is not exposed as a SQL view. A separate probe had stale SQL results for over 900 seconds until a targeted, non-recreating refresh. | Verify joined queries, DECIMAL(18,2) results, exact totals and visibility with valid sales data. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
 
 On 2026-11-23, read-only MCAP cloud `supportedConnectionTypes` returned one
@@ -113,7 +120,7 @@ manifest and generator provenance, runtime access, file immutability and writer
 exclusion; those and execution/target verification are not established by this
 check.
 
-`audit.BatchAudit` is an unintegrated candidate using the shared producer's
+`audit.BatchAudit` uses the shared producer's
 `OneLakeStore` interface in the target Lakehouse. Its conditional writer lock
 is bound to one pipeline run and batch; its per-batch record persists the event,
 Copy intent and result, and target-verification evidence. It refuses to release
@@ -121,8 +128,9 @@ an in-flight or unverified Copy, refuses automatic replay of an uncertain write,
 and recognizes a completed duplicate without a second Copy. Verification must
 come from an independent target query, including the symmetric multiset
 difference against all nine source columns, unique key range, orphan count, and
-grouped totals. The implementation does not perform that query, recover stale
-locks, or fence writers that ignore the lock. A lost response or crash requires
+grouped totals. `guard_spark.py` supplies a candidate query, but it has not been
+run end to end in the guarded pipeline. The implementation does not recover
+stale locks or fence writers that ignore the lock. A lost response or crash requires
 reconciliation; never automatically remove a stale lock. Isolated journal
 probes used the interactive preflight principal, not the pipeline identity,
 and synthetic Copy and query evidence. A client wrapper simulated losing the
@@ -130,6 +138,15 @@ response after real lock creation and Copy-intent writes; both retained the
 lock and rejected a competing writer. The probes did not interrupt the network,
 crash a process, perform Copy, or query the target. Their known test objects
 were conditionally removed only after confirming no Copy had been sent.
+
+`delivery_runtime.GuardedDelivery.reconcile` reads the authoritative manifest
+and dispatches the same guarded pipeline for missing batches, with a durable
+conditional submission intent. A lost response leaves that intent in place and
+blocks automatic resubmission. Its local tests model missed events, late
+duplicates and two batches with overlapping IDs; they do not prove live recovery.
+The pipeline high-concurrency setting was enabled in the isolated preflight
+workspace, but Spark session reuse has not been verified. This setting does not
+establish event delivery.
 
 `python demo-3-onelake-events-copy/reconcile.py --manifest <manifest.json> --query-export <results.json>`
 compares measured batches only. The query export must contain `batches` keyed by

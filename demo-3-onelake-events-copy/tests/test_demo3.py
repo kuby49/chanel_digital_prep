@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 from pathlib import Path
 
@@ -521,6 +522,12 @@ class ReconciliationTests(unittest.TestCase):
         sys.modules[producer_spec.name] = producer
         self.addCleanup(sys.modules.pop, producer_spec.name, None)
         producer_spec.loader.exec_module(producer)
+        with mock.patch.dict(sys.modules, {"generator": producer}):
+            import guard_spark
+            self.assertEqual(guard_spark.onelake_endpoint(
+                "https://onelake.dfs.fabric.microsoft.com/"), "onelake.dfs.fabric.microsoft.com")
+            with self.assertRaises(RuntimeError):
+                guard_spark.onelake_endpoint("https://other.invalid/")
         config = producer.RunConfig("integration", date_count=4, products=3, customers=5,
                                     file_count=1, rows_per_file=12)
         notebook = setup.build_notebook(

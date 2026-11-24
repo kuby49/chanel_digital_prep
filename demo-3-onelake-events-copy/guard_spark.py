@@ -11,6 +11,14 @@ from delivery_runtime import GuardedDelivery
 from fabric_storage import OneLakeStore
 
 
+def onelake_endpoint(value):
+    if isinstance(value, str):
+        value = value.removeprefix("https://").removesuffix("/")
+    if value != "onelake.dfs.fabric.microsoft.com":
+        raise RuntimeError("unexpected OneLake endpoint")
+    return value
+
+
 def query_target(spark, notebookutils, settings, config, batch_id):
     from pyspark.sql import functions as F
 
@@ -28,9 +36,7 @@ def query_target(spark, notebookutils, settings, config, batch_id):
               "ProductID INT, Date DATE, Quantity INT, UnitPriceMinorUnits LONG, "
               "SalesAmountMinorUnits LONG")
     expected_rows = spark.createDataFrame(rows, schema)
-    endpoint = notebookutils.conf.get("trident.onelake.endpoint")
-    if endpoint != "onelake.dfs.fabric.microsoft.com":
-        raise RuntimeError("unexpected OneLake endpoint")
+    endpoint = onelake_endpoint(notebookutils.conf.get("trident.onelake.endpoint"))
     root = f"abfss://{settings['workspace_id']}@{endpoint}/{settings['item_id']}/Tables/dbo"
     fact = spark.read.format("delta").load(f"{root}/factsales")
     actual = fact.where(F.col("BatchID") == batch_id)

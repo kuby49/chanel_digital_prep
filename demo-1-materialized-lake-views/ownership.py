@@ -3,10 +3,12 @@
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -22,27 +24,57 @@ class CandidateBlocked(Exception):
 
 
 FABRIC_ORIGIN = "https://api.fabric.microsoft.com"
+AZURE_CLI_TIMEOUT_SECONDS = 120
 
 
-def _az_json(*args):
-    executable = shutil.which("az")
+def _az_json(*args, timeout=AZURE_CLI_TIMEOUT_SECONDS, env=None):
+    environment = dict(os.environ if env is None else env)
+    executable = shutil.which("az", path=environment.get("PATH"))
     if not executable:
         raise CandidateBlocked("Azure CLI is required for live Demo 1 ownership readback.")
+    command = [executable]
+    launcher = Path(executable)
+    if os.name == "nt" and launcher.suffix.lower() in (".cmd", ".bat"):
+        runtime = launcher.parent.parent / "python.exe"
+        if launcher.name.lower() != "az.cmd" or not runtime.is_file():
+            raise CandidateBlocked(
+                "Azure CLI Windows launcher has no supported bundled Python runtime; repair the MSI installation."
+            )
+        # Avoid leaving a CMD child holding captured pipes open after a timeout.
+        command = [str(runtime), "-IBm", "azure.cli"]
+        environment["AZ_INSTALLER"] = "MSI"
+    operation = "token acquisition" if args[:2] == ("account", "get-access-token") else "metadata readback"
+    started = time.monotonic()
     try:
         result = subprocess.run(
-            [executable, *args, "--output", "json", "--only-show-errors"],
-            capture_output=True, text=True, encoding="utf-8", timeout=45, check=False,
+            [*command, *args, "--output", "json", "--only-show-errors"],
+            env=environment, capture_output=True, text=True, encoding="utf-8", timeout=timeout, check=False,
         )
-    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
-        raise CandidateBlocked(f"Azure CLI {args[0]} could not complete live readback.") from exc
+    except subprocess.TimeoutExpired:
+        raise CandidateBlocked(
+            f"Azure CLI {operation} timed out after {timeout:g}s "
+            f"(elapsed {time.monotonic() - started:.1f}s); "
+            "check CLI responsiveness and tenant connectivity. No automatic retry was made."
+        ) from None
+    except OSError as exc:
+        raise CandidateBlocked(
+            f"Azure CLI {operation} failed to launch "
+            f"(errno={exc.errno}, winerror={getattr(exc, 'winerror', None)}); "
+            "check the CLI installation and executable permissions."
+        ) from None
+    except UnicodeError:
+        raise CandidateBlocked(f"Azure CLI {operation} returned unreadable UTF-8 output.") from None
     if result.returncode:
-        raise CandidateBlocked(f"Azure CLI {args[0]} failed during live ownership readback.")
+        raise CandidateBlocked(
+            f"Azure CLI {operation} exited with code {result.returncode}; "
+            "check the selected tenant's cached CLI sign-in and connectivity. Command output is withheld."
+        )
     try:
         value = json.loads(result.stdout, object_pairs_hook=_unique_pairs)
-    except ValueError as exc:
-        raise CandidateBlocked("Azure CLI did not return valid ownership metadata.") from exc
+    except ValueError:
+        raise CandidateBlocked("Azure CLI did not return valid JSON metadata.") from None
     if not isinstance(value, dict):
-        raise CandidateBlocked("Azure CLI did not return an ownership metadata object.")
+        raise CandidateBlocked("Azure CLI did not return a JSON metadata object.")
     return value
 
 

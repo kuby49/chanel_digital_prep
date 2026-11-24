@@ -1449,6 +1449,7 @@ class DeployTests(unittest.TestCase):
         _, stopped = self.cli("stop-monitor")
         self.assertEqual((stopped["status"], stopped["ready"]), ("pass", False), stopped)
         self.assertEqual(self.backend.monitor_jobs[evidence["job_id"]]["status"], "Cancelled")
+        self.assertEqual(json.loads(sidecar_path.read_text(encoding="utf-8"))["job_status"], "Cancelled")
         self.assertEqual(start_path.read_bytes(), start)
 
     def test_completed_monitor_cannot_report_ready_without_fresh_producer_proof(self):
@@ -2253,6 +2254,8 @@ class DeployTests(unittest.TestCase):
         self.assertEqual((finished["status"], finished["ready"]), ("pass", True), finished)
         _, stopped = self.cli("stop-monitor")
         self.assertEqual((stopped["status"], stopped["ready"]), ("pass", False), stopped)
+        self.assertEqual(json.loads((self.state / deploy.MONITOR_FILE).read_text(encoding="utf-8"))["job_status"],
+                         "Completed")
         self.assertFalse((self.state / "shared-producer-v1.json").exists())
 
     def test_wait_monitor_blocks_on_failure_or_absolute_readback_deadline(self):
@@ -2570,9 +2573,22 @@ class DeployTests(unittest.TestCase):
         current = json.loads((self.state / deploy.MONITOR_START_FILE).read_text())
         self.assertEqual((current["run_id"], current["job_id"]), ("next_run", NEXT_MONITOR_JOB))
 
+    def test_monitor_duration_reserves_serial_admission_and_parallel_headroom(self):
+        self.monitor_setup()
+        self.config["execution"].update(track_timeout_seconds=600, verification_timeout_seconds=900)
+        self.config["data"]["max_duration_seconds"] = 1800
+        for concurrency, expected in ((1, 6750), (2, 6150), (3, 6150), (4, 6150)):
+            with self.subTest(concurrency=concurrency):
+                self.config["execution"]["max_concurrency"] = concurrency
+                settings = deploy.validate_config(self.config, "chanel")
+                monitor = deploy._monitor_config(settings, {"demo-1", "demo-2"}, bind=False)
+                self.assertEqual(monitor["duration"], expected)
+
     def test_legacy_deadline_can_be_reconciled_but_unrecognized_deadline_is_blocked(self):
         self.monitor_setup()
+        self.config["execution"]["max_concurrency"] = 1
         evidence = self.start_monitor()
+        self.assertEqual(evidence["duration_seconds"], 1250)
         paths = (self.state / deploy.MONITOR_START_FILE, self.state / deploy.MONITOR_FILE,
                  self.state / deploy.STATE_FILE)
 
@@ -2592,6 +2608,10 @@ class DeployTests(unittest.TestCase):
         set_duration(171)
         _, invalid = self.cli("monitor-status")
         self.assertEqual((invalid["status"], invalid["ready"]), ("blocked", False), invalid)
+
+        set_duration(1240)
+        _, previous = self.cli("monitor-status")
+        self.assertEqual((previous["status"], previous["ready"]), ("pass", True), previous)
 
         set_duration(170)
         _, legacy = self.cli("monitor-status")

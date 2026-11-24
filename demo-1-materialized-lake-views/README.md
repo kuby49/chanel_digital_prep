@@ -165,6 +165,12 @@ idempotency without destructive replacement.
 
 ## Entry point
 
+Azure CLI calls are bounded at 120 seconds or the remaining Fabric deadline.
+On Windows MSI installations the helper invokes the bundled Python CLI
+directly, so timeout cleanup does not wait on a CMD wrapper's inherited
+pipes. Failures are reported without tokens or command output; acquisition is
+not automatically retried.
+
 Invoke `python deploy.py --mode MODE --config ABSOLUTE_JSON --prefix PREFIX
 --state-dir ABSOLUTE_DIR --result ABSOLUTE_JSON`, where `MODE` is `dry-run`,
 `validate-only`, `deploy`, `cleanup`, or `resolve-target-candidate`; cleanup

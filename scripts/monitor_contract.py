@@ -76,7 +76,11 @@ def monitor_config(config):
         verification_timeout = config["execution"].get("verification_timeout_seconds")
     if type(verification_timeout) is not int or verification_timeout < 1:
         raise ValueError("Demo 2 verification timeout must be a positive integer")
-    duration = (4 * config["execution"]["track_timeout_seconds"]
+    concurrency = config["execution"].get("max_concurrency", 4)
+    if type(concurrency) is not int or not 1 <= concurrency <= 4:
+        raise ValueError("execution.max_concurrency must be an integer between 1 and 4")
+    waves = max(4, (4 + concurrency - 1) // concurrency + 1)
+    duration = (waves * config["execution"]["track_timeout_seconds"]
                 + config["data"]["max_duration_seconds"] + PRODUCER_HEADROOM_SECONDS + verification_timeout)
     try:
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)

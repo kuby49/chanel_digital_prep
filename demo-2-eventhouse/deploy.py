@@ -2002,8 +2002,9 @@ def _monitor_binding(targets, generator_digest, producer_config):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _monitor_duration(track_timeout, max_duration, verification_timeout, *, legacy=False):
-    headroom = 2 * track_timeout if legacy else 4 * track_timeout + MONITOR_STARTUP_HEADROOM_SECONDS
+def _monitor_duration(track_timeout, max_duration, verification_timeout, max_concurrency, *, legacy=False):
+    waves = max(4, (4 + max_concurrency - 1) // max_concurrency + 1)
+    headroom = 2 * track_timeout if legacy else waves * track_timeout + MONITOR_STARTUP_HEADROOM_SECONDS
     return headroom + max_duration + verification_timeout
 
 
@@ -2044,7 +2045,8 @@ def _monitor_config(settings, selected, *, bind=True, require_run=True):
         "customers": data["customer_count"], "file_count": settings["expected_batch_count"],
         "rows_per_file": settings["rows_per_file"], "interval_seconds": settings["interval_seconds"],
     }
-    duration = _monitor_duration(settings["track_timeout"], settings["max_duration"], settings["timeout"])
+    duration = _monitor_duration(settings["track_timeout"], settings["max_duration"], settings["timeout"],
+                                 settings["max_concurrency"])
     try:
         _now() + timedelta(seconds=duration + settings["track_timeout"])
     except (OverflowError, ValueError) as exc:
@@ -2218,19 +2220,20 @@ class Monitor:
                 and start["producer_config"]["file_count"] == start["expected_batch_count"]
                 and all(key in record and key in start and _same_json(record[key], start[key]) for key in fixed)
             )
-            if (not valid or _uuid(start.get("controller_id"), "controller ID") != start["controller_id"]
+            if (not valid or start["max_concurrent_batches"] > 4
+                    or _uuid(start.get("controller_id"), "controller ID") != start["controller_id"]
                     or _uuid(start.get("job_id"), "owned monitor job ID") != start["job_id"]):
                 raise ValueError
             submitted = _utc(start["submitted_at_utc"], "submission time")
             deadline = _utc(start["deadline_utc"], "deadline")
             durations = {
                 _monitor_duration(start["track_timeout_seconds"], start["max_duration_seconds"],
-                                  start["verification_timeout_seconds"], legacy=legacy_duration)
-                for legacy_duration in (False, True)
+                                  start["verification_timeout_seconds"], concurrency, legacy=legacy_duration)
+                for concurrency, legacy_duration in ((start["max_concurrent_batches"], False),
+                                                      (4, False), (4, True))
             }
             if (start["duration_seconds"] not in durations
-                    or submitted + timedelta(seconds=start["duration_seconds"]) != deadline
-                    or start["max_concurrent_batches"] > 4):
+                    or submitted + timedelta(seconds=start["duration_seconds"]) != deadline):
                 raise ValueError
             ledger_job = record.get("job_id")
             if ledger_job is not None and _uuid(ledger_job, "recorded monitor job ID") != ledger_job:
@@ -2614,7 +2617,7 @@ class Monitor:
     def _cancel_and_confirm(self, notebook_id, job_id, role, *, external=False):
         job, headers = self._job(notebook_id, job_id)
         if job["status"] in self.TERMINAL:
-            return
+            return job["status"]
         key = f"{role}:{job_id}"
         requests = self.evidence["cancel_requests"]
         if key not in requests:
@@ -2632,13 +2635,13 @@ class Monitor:
                 except (Failure, Blocked) as exc:
                     job, headers = self._job(notebook_id, job_id)
                     if job["status"] in self.TERMINAL:
-                        return
+                        return job["status"]
                     raise Blocked("The exact job cancellation outcome is uncertain; it will not be retried blindly.") from exc
         while True:
             self.d.deadline.wait(_retry_delay(headers.get("retry-after"), self.s["poll"]))
             job, headers = self._job(notebook_id, job_id)
             if job["status"] in self.TERMINAL:
-                return
+                return job["status"]
 
     def _reconcile_runtime(self, *, cancel):
         evidence = self.evidence
@@ -2864,7 +2867,7 @@ class Monitor:
         self._owned(definitions=False)
         job_id = start["job_id"]
         self._save()
-        self._cancel_and_confirm(start["monitor_notebook_id"], job_id, "monitor")
+        job_status = self._cancel_and_confirm(start["monitor_notebook_id"], job_id, "monitor")
         self._reconcile_runtime(cancel=True)
         self.evidence["state"] = "stopped"
         self._save()
@@ -2886,7 +2889,8 @@ class Monitor:
                 pass
             else:
                 final_state = "completed"
-        sidecar.update(state=final_state, cancel_requests=dict(self.evidence["cancel_requests"]))
+        sidecar.update(state=final_state, job_status=job_status,
+                       cancel_requests=dict(self.evidence["cancel_requests"]))
         _atomic_json(self.path, sidecar)
         return True
 

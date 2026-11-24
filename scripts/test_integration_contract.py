@@ -160,12 +160,20 @@ class SharedManifestIntegrationTest(unittest.TestCase):
         })
         config["demo-2"]["workspace_id"] = config["shared"]["target_bindings"]["demo-2"]["workspace_id"]
         config["demo-2"]["kql_database_id"] = config["shared"]["target_bindings"]["demo-2"]["item_id"]
-        settings = eventhouse.validate_config(config, "chanel")
-        eventhouse_binding = eventhouse._monitor_config(settings, {"demo-1", "demo-2"})
-        root_binding = orchestration.monitor_binding(config)
-        for key in ("target_bindings", "generator_sha256", "producer_config", "monitor_binding_sha256"):
-            self.assertEqual(root_binding[key], eventhouse_binding[key])
-        self.assertEqual(orchestration.monitor_config(config)[1], eventhouse_binding["duration"])
+        for concurrency in (1, 2, 4):
+            with self.subTest(concurrency=concurrency):
+                config["execution"]["max_concurrency"] = concurrency
+                settings = eventhouse.validate_config(config, "chanel")
+                eventhouse_binding = eventhouse._monitor_config(settings, {"demo-1", "demo-2"})
+                root_binding = orchestration.monitor_binding(config)
+                for key in ("target_bindings", "generator_sha256", "producer_config", "monitor_binding_sha256"):
+                    self.assertEqual(root_binding[key], eventhouse_binding[key])
+                duration = orchestration.monitor_config(config)[1]
+                self.assertEqual(duration, eventhouse_binding["duration"])
+                waves = 5 if concurrency == 1 else 4
+                self.assertEqual(duration, waves * config["execution"]["track_timeout_seconds"]
+                                 + config["data"]["max_duration_seconds"] + 1050
+                                 + config["execution"]["verification_timeout_seconds"])
 
     def test_orchestrator_binds_mocked_demo1_candidate_without_cloud_calls(self):
         orchestration = load_script("orchestration_demo1_integration", ROOT / "scripts" / "deploy-demos")

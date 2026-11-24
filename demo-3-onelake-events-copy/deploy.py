@@ -203,6 +203,11 @@ def main(argv=None):
             raise ValueError("configuration contract_version must be 1")
         if not isinstance(config.get("demo-3"), dict):
             raise ValueError("configuration must contain a demo-3 object")
+        selected_journal = config["demo-3"].get("customer_binding_journal")
+        if isinstance(selected_journal, str):
+            if args.result.resolve() == (args.state_dir / selected_journal).resolve():
+                print("Result path conflicts with customer binding journal", file=sys.stderr)
+                return 1
         verification_timeout(config)
         if args.mode == "cleanup" and not args.yes:
             raise ValueError("cleanup requires --yes; no resources were removed")

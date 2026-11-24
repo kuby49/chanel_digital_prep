@@ -1,14 +1,19 @@
 import base64
 from email.message import Message
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from ownership import FABRIC_ORIGIN, LOCK_FILE, STATE_FILE, CandidateBlocked, _state_lock
+from ownership import (
+    AZURE_CLI_TIMEOUT_SECONDS, FABRIC_ORIGIN, LOCK_FILE, STATE_FILE, CandidateBlocked, _az_json, _state_lock,
+)
 from provision_synthetic import FabricClient, provision
 from test_deploy import INTENT, LAKEHOUSE, OWNER, TENANT, WORKSPACE, candidate_config
 
@@ -239,8 +244,15 @@ class ProvisionerTest(unittest.TestCase):
 
 
 class TransportTest(unittest.TestCase):
-    @patch("provision_synthetic.shutil.which", return_value="az")
-    @patch("provision_synthetic.subprocess.run")
+    def test_direct_process_timeout_returns_without_waiting_for_completion(self):
+        started = time.monotonic()
+        with patch("ownership.shutil.which", return_value=sys.executable):
+            with self.assertRaisesRegex(CandidateBlocked, "timed out after 0.2s"):
+                _az_json("-c", "import time; time.sleep(10)", timeout=0.2)
+        self.assertLess(time.monotonic() - started, 5)
+
+    @patch("ownership.shutil.which", return_value="az")
+    @patch("ownership.subprocess.run")
     def test_fabric_token_binds_tenant_and_oid_and_headers(self, execute, _which):
         claims = base64.urlsafe_b64encode(json.dumps(
             {"tid": TENANT, "oid": OWNER, "exp": int(time.time()) + 300}
@@ -252,6 +264,7 @@ class TransportTest(unittest.TestCase):
             FabricClient(TENANT, INTENT, 60, Path("isolated"))
         client = FabricClient(TENANT, OWNER, 60, Path("isolated"))
         self.assertEqual(execute.call_args.kwargs["env"]["AZURE_CONFIG_DIR"], "isolated")
+        self.assertLessEqual(execute.call_args.kwargs["timeout"], 60)
         with patch.object(client.requester, "open") as send:
             reply = send.return_value.__enter__.return_value
             reply.status, reply.headers = 201, Message()
@@ -271,6 +284,53 @@ class TransportTest(unittest.TestCase):
                     self.assertEqual(send.call_args.args[0].full_url, FABRIC_ORIGIN + path)
             with self.assertRaisesRegex(ValueError, "Invalid Fabric"):
                 client.request("GET", WS + "?outside=guard")
+
+    @patch("ownership.shutil.which", return_value="az")
+    @patch("ownership.subprocess.run")
+    def test_sanitized_timeout_launch_and_exit_diagnostics(self, execute, _which):
+        private = "private-token-or-command-output"
+        cases = (
+            (subprocess.TimeoutExpired([private], 120, output=private, stderr=private), "timed out"),
+            (OSError(5, private), "failed to launch"),
+            (UnicodeError(private), "unreadable UTF-8"),
+        )
+        for error, message in cases:
+            execute.side_effect = error
+            with self.subTest(message=message), self.assertRaises(CandidateBlocked) as caught:
+                _az_json("account", "get-access-token")
+            self.assertIn(message, str(caught.exception))
+            self.assertNotIn(private, str(caught.exception))
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertEqual(execute.call_args.kwargs["timeout"], AZURE_CLI_TIMEOUT_SECONDS)
+        execute.side_effect = None
+        execute.return_value = SimpleNamespace(returncode=17, stdout=private, stderr=private)
+        with self.assertRaisesRegex(CandidateBlocked, "exited with code 17") as caught:
+            _az_json("account", "get-access-token")
+        self.assertNotIn(private, str(caught.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows MSI launcher")
+    @patch("ownership.subprocess.run")
+    def test_msi_runtime_avoids_cmd_and_preserves_isolated_environment(self, execute):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "python.exe").touch()
+            wrapper = root / "wbin" / "az.CMD"
+            environment = {"AZURE_CONFIG_DIR": "isolated", "PATH": "selected-path"}
+            execute.return_value = SimpleNamespace(returncode=0, stdout='{"ok": true}')
+            with patch("ownership.shutil.which", return_value=str(wrapper)) as which:
+                self.assertEqual(_az_json("account", "show", timeout=13, env=environment), {"ok": True})
+            which.assert_called_once_with("az", path="selected-path")
+            self.assertEqual(execute.call_args.args[0][:3], [str(root / "python.exe"), "-IBm", "azure.cli"])
+            self.assertEqual(execute.call_args.kwargs["timeout"], 13)
+            self.assertEqual(execute.call_args.kwargs["env"],
+                             {**environment, "AZ_INSTALLER": "MSI"})
+            self.assertNotIn("AZ_INSTALLER", environment)
+            (root / "python.exe").unlink()
+            execute.reset_mock()
+            with patch("ownership.shutil.which", return_value=str(wrapper)):
+                with self.assertRaisesRegex(CandidateBlocked, "repair the MSI"):
+                    _az_json("account", "show")
+            execute.assert_not_called()
 
 
 if __name__ == "__main__":

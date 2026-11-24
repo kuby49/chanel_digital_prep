@@ -36,6 +36,7 @@ RUN = {
     "start_date": "2026-01-01", "seed": 42, "date_count": 365, "products": 20,
     "customers": 100, "file_count": 1, "rows_per_file": 10, "interval_seconds": 60,
 }
+FRESH_RUN_ID = "customer_demo_20261124_dc2792654b5b"
 TERMINAL = {"Completed", "Failed", "Cancelled", "Canceled", "Deduped"}
 LANDING = f"abfss://{WORKSPACE}@onelake.dfs.fabric.microsoft.com/{LAKEHOUSE}/Files/incoming/sales"
 
@@ -43,6 +44,27 @@ LANDING = f"abfss://{WORKSPACE}@onelake.dfs.fabric.microsoft.com/{LAKEHOUSE}/Fil
 def _require(condition, message):
     if not condition:
         raise CandidateBlocked(message)
+
+
+def config_sha256(config):
+    return hashlib.sha256(json.dumps(
+        config, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def customer_run(config):
+    run_id = config.get("data", {}).get("run_id")
+    _require(run_id in (RUN["run_id"], FRESH_RUN_ID), "Customer run is not explicitly approved.")
+    return {**RUN, "run_id": run_id}
+
+
+def binding_journal(config):
+    run = customer_run(config)
+    expected = JOURNAL if run["run_id"] == RUN["run_id"] else (
+        "demo3-customer-" + run["run_id"] + "-binding-state.json")
+    supplied = config["demo-3"].get("customer_binding_journal", JOURNAL)
+    _require(supplied == expected, "Customer journal must be the exact run-specific basename.")
+    return expected
 
 
 def _inventory(api, path, skill="spark-cli"):
@@ -161,19 +183,30 @@ def _validate(config, prefix, state_dir, *, api=None):
     _require(type(data.get("max_duration_seconds")) is int
              and 0 < data["max_duration_seconds"] <= 1800 and data.get("currency") == "USD",
              "Customer run needs a bounded duration of at most 1800 seconds and USD.")
-    state = _load_json(state_dir / JOURNAL)
+    run = customer_run(config)
+    journal_path = state_dir / binding_journal(config)
+    state = _load_json(journal_path)
     expected = {
         "workspace_id": WORKSPACE, "lakehouse_id": LAKEHOUSE, "guard_notebook_id": NOTEBOOK,
         "pipeline_id": PIPELINE, "reflex_id": REFLEX, "producer_workspace_id": STAGING_WORKSPACE,
         "producer_lakehouse_id": STAGING_LAKEHOUSE, "generator_sha256": GENERATOR_SHA,
-        "run_config": RUN,
+        "run_config": run,
     }
     _require(all(state.get(key) == value for key, value in expected.items()),
              "Original customer binding journal differs.")
     _require(all(state.get("actions", {}).get(key, {}).get("status") == "confirmed-readback"
                  for key in ("guard_update", "activator_update")), "Customer binding is unconfirmed.")
+    if run["run_id"] == FRESH_RUN_ID:
+        _require(state.get("config_sha256") == config_sha256(config),
+                 "Fresh customer binding does not match the final agreed config hash.")
+        previous = _load_json(state_dir / JOURNAL)
+        _require(state.get("previous_journal") == JOURNAL
+                 and state.get("previous_journal_sha256") == config_sha256(previous)
+                 and previous.get("runtime_stop") == "rule-disabled-jobs-terminal-lock-absent"
+                 and previous.get("actions", {}).get("disable", {}).get("status") == "confirmed-readback",
+                 "Previous customer attempt is not preserved and safely stopped.")
     producer, generator, storage = _producer(state_dir)
-    _require(guarded_notebook.run_config_from_shared(generator, config) == RUN,
+    _require(guarded_notebook.run_config_from_shared(generator, config) == run,
              "Only the bound one-file ten-row customer run is supported.")
     api = api or FabricControl.from_cli(TENANT, timeout=90)
     base = "/v1/workspaces/" + WORKSPACE
@@ -187,7 +220,7 @@ def _validate(config, prefix, state_dir, *, api=None):
     notebook = _definition(api, base, "/items/" + NOTEBOOK,
                            "notebook-content.ipynb", suffix="?format=ipynb")
     expected_notebook = guarded_notebook.build_notebook(
-        producer, RUN, WORKSPACE, LAKEHOUSE, HOUSE_NAME, STAGING_WORKSPACE, STAGING_LAKEHOUSE)
+        producer, run, WORKSPACE, LAKEHOUSE, HOUSE_NAME, STAGING_WORKSPACE, STAGING_LAKEHOUSE)
     _require([cell["source"] for cell in notebook["cells"]]
              == [cell["source"] for cell in expected_notebook["cells"]]
              and notebook["metadata"]["trident"]["lakehouse"]
@@ -216,8 +249,8 @@ def _validate(config, prefix, state_dir, *, api=None):
             "An owned notebook or pipeline job is not terminal.")
     token = _storage_token()
     store = storage.OneLakeStore(WORKSPACE, LAKEHOUSE, lambda: token)
-    for path in (LOCK_PATH, RECORD_PREFIX + RUN["run_id"] + "_0001.json",
-                 "Files/incoming/sales/sales_" + RUN["run_id"] + "_0001.csv"):
+    for path in (LOCK_PATH, RECORD_PREFIX + run["run_id"] + "_0001.json",
+                 "Files/incoming/sales/sales_" + run["run_id"] + "_0001.csv"):
         _absent(store, path)
     proof = json.loads(store.read("Files/demo3-audit/setup/common-dimensions-a9bbae81.json")[0])
     _require(proof.get("workspace_id") == WORKSPACE and proof.get("lakehouse_id") == LAKEHOUSE
@@ -230,7 +263,7 @@ def _validate(config, prefix, state_dir, *, api=None):
              and access.get("producer_lakehouse_id") == STAGING_LAKEHOUSE
              and access.get("result", {}).get("notebook_job_status") == "Completed",
              "Original pipeline-context staging access proof is missing.")
-    _require(_load_json(state_dir / JOURNAL) == state, "Customer journal changed during admission.")
+    _require(_load_json(journal_path) == state, "Customer journal changed during admission.")
     return [
         "Bound customer-run preflight passed; rule is " + ("enabled." if running else "stopped."),
         "Existing guard, exact-file Copy, target, connection, dimensions, terminal jobs and absent "

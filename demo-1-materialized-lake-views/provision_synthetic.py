@@ -7,8 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
 import time
 from urllib.error import HTTPError, URLError
@@ -18,7 +16,8 @@ from fresh_deploy import (
     begin, binding, confirm, record_intent, record_lro_result, record_response, verify_readback,
 )
 from ownership import (
-    FABRIC_ORIGIN, STATE_FILE, CandidateBlocked, _resource, _state_lock, _unique_pairs, _uuid,
+    AZURE_CLI_TIMEOUT_SECONDS, FABRIC_ORIGIN, STATE_FILE, CandidateBlocked,
+    _az_json, _resource, _state_lock, _unique_pairs, _uuid,
 )
 
 
@@ -31,22 +30,12 @@ class FabricClient:
     def __init__(self, tenant, principal, timeout, azure_config):
         self.end = time.monotonic() + timeout
         self.requester = build_opener(_NoRedirect())
-        az = shutil.which("az")
-        if not az:
-            raise CandidateBlocked("Azure CLI is required for synthetic provisioning.")
+        credential = _az_json(
+            "account", "get-access-token", "--resource", FABRIC_ORIGIN, "--tenant", tenant,
+            env={**os.environ, "AZURE_CONFIG_DIR": str(azure_config)},
+            timeout=min(AZURE_CLI_TIMEOUT_SECONDS, self.remaining()),
+        )
         try:
-            process = subprocess.run(
-                [az, "account", "get-access-token", "--resource", FABRIC_ORIGIN, "--tenant",
-                 tenant, "--output", "json", "--only-show-errors"],
-                env={**os.environ, "AZURE_CONFIG_DIR": str(azure_config)},
-                capture_output=True, timeout=min(45, self.remaining()), check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            raise CandidateBlocked("Azure CLI could not acquire a Fabric token.") from None
-        if process.returncode:
-            raise CandidateBlocked("Azure CLI has no usable Fabric token for the configured tenant.")
-        try:
-            credential = json.loads(process.stdout, object_pairs_hook=_unique_pairs)
             token = credential["accessToken"]
             parts = token.split(".")
             if len(parts) != 3 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):

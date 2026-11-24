@@ -1215,6 +1215,16 @@ def _track_timeout(config):
     return timeout
 
 
+def _admission_concurrency(config):
+    execution = config.get("execution", {})
+    if not isinstance(execution, dict):
+        raise ContractError("execution must be a configuration object.")
+    concurrency = execution.get("max_concurrency", 4)
+    if type(concurrency) is not int or not 1 <= concurrency <= 4:
+        raise ContractError("execution.max_concurrency must be an integer between 1 and 4.")
+    return concurrency
+
+
 def _monitor_contract():
     path = HERE.parent / "scripts" / "monitor_contract.py"
     if not path.is_file():
@@ -1291,7 +1301,7 @@ def _fresh_admission(config, config_path, prefix, state_dir, directory, selected
         raise Blocked(f"Demo deployment scope is invalid: {exc} No job was started.") from None
     _config_snapshot(config_path, config)
     tracks = [*selected, "shared"]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tracks)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tracks), _admission_concurrency(config))) as executor:
         futures = []
         for track in tracks:
             track_prefix, track_state = scopes.get(track, (prefix, state_dir))
@@ -1502,8 +1512,12 @@ def _run_measured(config, plan, state_dir, selected_demos):
     if location is not None and (not isinstance(location, str) or location.rstrip("/") != root):
         raise Blocked("Configured producer state location differs from owned staging; no job was started.")
     timeout = _track_timeout(config)
+    concurrency = _admission_concurrency(config)
     duration = config["data"]["max_duration_seconds"]
-    total = timeout * (2 if "demo-2" in selected else 1) + duration + STARTUP_HEADROOM_SECONDS + STOP_CHILD_WAIT_SECONDS
+    validator_count = len(selected) + 1
+    admission_waves = (validator_count + concurrency - 1) // concurrency
+    total = timeout * (admission_waves + ("demo-2" in selected)) + duration + \
+        STARTUP_HEADROOM_SECONDS + STOP_CHILD_WAIT_SECONDS
     try:
         deadline = datetime.now(timezone.utc) + timedelta(seconds=total)
     except OverflowError:

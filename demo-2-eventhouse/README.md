@@ -109,10 +109,12 @@ selected destination. `submitted` means queued, not ingested.
    producer runs. The orchestrator uses the track's `start-monitor`,
    `monitor-status`, `wait-monitor` and `stop-monitor` modes with the same
    config and state directory.
-   The monitor deadline is `4*T + D + 1050 + V` seconds after submission,
-   where `T` is the track timeout, `D` the producer's maximum duration, and
-   `V` the verification timeout. Existing records retain their original
-   `2*T + D + V` deadline for reconciliation.
+   The monitor deadline is `W*T + D + 1050 + V` seconds after submission,
+   where `W = max(4, ceil(4/C) + 1)`, `C` is the configured admission
+   concurrency, `T` is the track timeout, `D` is the producer's maximum
+   duration, and `V` is the verification timeout. The four validators cover
+   up to three demos and the producer; the extra wave covers monitor status.
+   Earlier `4*T + D + 1050 + V` and `2*T + D + V` records remain reconcilable.
 3. Run the producer for the selected, ready demos. The monitor independently
    reads its durable manifest and launches bounded shortcut-verification jobs;
    Spark waiting does not block the one-minute generator. Each batch deadline

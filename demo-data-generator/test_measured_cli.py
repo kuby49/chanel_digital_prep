@@ -103,6 +103,20 @@ class FreshAdmissionTests(unittest.TestCase):
             self.invoke(mutate)
         self.assertNotIn(("token",), self.calls)
 
+    def test_admission_respects_configured_concurrency(self):
+        self.document["execution"]["max_concurrency"] = 1
+        self.config_path.write_bytes(canonical_bytes(self.document))
+        executor = deploy.concurrent.futures.ThreadPoolExecutor
+        with mock.patch.object(deploy.concurrent.futures, "ThreadPoolExecutor", wraps=executor) as pool:
+            self.invoke()
+        pool.assert_called_once_with(max_workers=1)
+        self.assertEqual([call[0] for call in self.calls[:4]], ["demo-1", "demo-2", "demo-3", "shared"])
+
+        for value in (0, 5, True, "1"):
+            self.document["execution"]["max_concurrency"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(deploy.ContractError, "max_concurrency"):
+                deploy._admission_concurrency(self.document)
+
     def test_monitor_must_be_running_and_cover_execution_and_verification(self):
         self.helper.monitor_evidence.side_effect = ValueError("monitor is not running")
         with self.assertRaisesRegex(deploy.Blocked, "not running"):
@@ -175,6 +189,20 @@ class MeasuredSubmissionTests(unittest.TestCase):
                 self.invoke()
         client.assert_not_called()
         self.assertEqual(list((self.state_dir / "producer-jobs-v1").glob("*.json")), [])
+
+    def test_serial_admission_budget_covers_each_validator(self):
+        self.document["execution"] = {"max_concurrency": 1, "track_timeout_seconds": 600}
+        start = datetime.now(timezone.utc)
+        with (mock.patch.object(deploy, "PipelineJob", wraps=deploy.PipelineJob) as job,
+              mock.patch.object(deploy, "_fresh_admission", side_effect=deploy.Blocked("not ready"))):
+            with self.assertRaisesRegex(deploy.Blocked, "not ready"):
+                self.invoke()
+        binding = job.call_args.args[1]
+        deadline = datetime.fromisoformat(binding["deadline_utc"])
+        expected = 2 * 600 + self.document["data"]["max_duration_seconds"] + \
+            deploy.STARTUP_HEADROOM_SECONDS + deploy.STOP_CHILD_WAIT_SECONDS
+        self.assertGreaterEqual((deadline - start).total_seconds(), expected)
+        self.assertLess((deadline - start).total_seconds(), expected + 5)
 
     def test_one_bound_submission_is_journaled_and_never_resubmitted(self):
         client = mock.Mock()

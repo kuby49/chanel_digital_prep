@@ -23,6 +23,15 @@ duplicate-retry safety, target-row validation and safe stopping.
 
 `python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. The explicit customer preflight can report `ready: true` for its bound run after live checks. Other deployment, validation and cleanup paths remain blocked; cleanup never deletes anything.
 
+The separately approved fresh run `customer_demo_20261124_dc2792654b5b` uses
+the original ownership directory and the exclusive
+`demo3-customer-customer_demo_20261124_dc2792654b5b-binding-state.json` journal,
+configured by `demo-3.customer_binding_journal`. It preserves the stopped
+predecessor journal and pins the complete canonical configuration hash. Other
+run IDs and journal paths are not admitted. Rebinding the guard and disabled
+rule requires coordinated journaled updates and readback before admission;
+historical proofs do not establish new delivery.
+
 `resolve-target-candidate` is local-only. It reads a confirmed
 `demo-3-state.json` under an exclusive `demo-3-state.lock` and creates a fresh
 `demo-3-target-candidate.json` beside the result without overwriting an existing

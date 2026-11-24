@@ -131,7 +131,9 @@ delivery. `cleanup` remains blocked. The
 `run-data` launcher requires fresh passing producer and selected-destination
 validators before submitting; when Demo 2 is selected it also requires the
 bound monitor to be running with enough time left for execution and
-verification.
+verification. Admission honors `execution.max_concurrency` (1-4), and its
+deadline includes a timeout budget for each wave of validators and the monitor
+status check.
 
 The notebook checks its actual runtime identity, producer and destination
 bindings, direct workspace write roles and run bounds before staging. A caller

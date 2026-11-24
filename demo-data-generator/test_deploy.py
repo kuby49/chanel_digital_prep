@@ -1243,6 +1243,145 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIsNone(store.state["pending"])
         self.assertEqual(store.state["resources"]["environment_item"]["published_version"], PUBLISHED_VERSION)
 
+    def test_initial_empty_success_is_published_once_after_pinned_readbacks(self):
+        state, store, client = self.fresh_environment()
+        client.items[ENVIRONMENT]["properties"] = {
+            "publishDetails": {"state": "Success", "targetVersion": PUBLISHED_VERSION}}
+        original_list = client.list_all
+        published = False
+
+        def lists(path, collection_key="value"):
+            if path.endswith("/libraries?beta=false") and "/staging/" not in path and not published:
+                raise deploy.FabricHttpError("GET", 404, error_code="EnvironmentLibrariesNotFound",
+                                             url=deploy.FabricClient._url(path))
+            return original_list(path, collection_key)
+
+        def publish(path, on_accepted, require_result):
+            nonlocal published
+            self.assertEqual(store.state["pending"]["action"], "publish")
+            published = True
+            client.items[ENVIRONMENT]["properties"] = {
+                "publishDetails": {"state": "Success", "targetVersion": NOTEBOOK}}
+            return 200, {"publishDetails": {"state": "Running", "targetVersion": NOTEBOOK}}
+
+        client.list_all = lists
+        client.post_operation.side_effect = publish
+        deploy._ensure_environment(client, store, state, self.spec)
+        self.assertEqual(client.post_operation.call_count, 1)
+        self.assertIsNone(store.state["pending"])
+        self.assertEqual(store.state["resources"]["environment_item"]["published_version"], NOTEBOOK)
+
+    def test_initial_empty_detection_rejects_unrelated_or_paginated_errors(self):
+        for status, code, suffix in ((404, "OtherError", ""), (403, "EnvironmentLibrariesNotFound", ""),
+                                     (404, None, ""), (404, "EnvironmentLibrariesNotFound",
+                                                        "&continuationToken=next")):
+            with self.subTest(status=status, code=code, suffix=suffix):
+                state, store, client = self.fresh_environment()
+                client.items[ENVIRONMENT]["properties"] = {
+                    "publishDetails": {"state": "Success", "targetVersion": PUBLISHED_VERSION}}
+
+                def lists(path, collection_key="value"):
+                    raise deploy.FabricHttpError("GET", status, error_code=code,
+                                                 url=deploy.FabricClient._url(path) + suffix)
+
+                client.list_all = lists
+                with self.assertRaises(deploy.FabricHttpError):
+                    deploy._ensure_environment(client, store, state, self.spec)
+                client.post_operation.assert_not_called()
+                self.assertEqual(store.writes, [])
+
+    def test_empty_published_libraries_never_republish_legacy_or_recorded_version(self):
+        for legacy, recorded in ((True, None), (False, PUBLISHED_VERSION)):
+            with self.subTest(legacy=legacy, recorded=recorded):
+                state, store, client = self.fresh_environment()
+                state["legacy"] = legacy
+                state["resources"]["environment_item"]["published_version"] = recorded
+                client.items[ENVIRONMENT]["properties"] = {
+                    "publishDetails": {"state": "Success", "targetVersion": PUBLISHED_VERSION}}
+                original_list = client.list_all
+
+                def lists(path, collection_key="value"):
+                    if path.endswith("/libraries?beta=false") and "/staging/" not in path:
+                        raise deploy.FabricHttpError("GET", 404, error_code="EnvironmentLibrariesNotFound",
+                                                     url=deploy.FabricClient._url(path))
+                    return original_list(path, collection_key)
+
+                client.list_all = lists
+                with self.assertRaises(deploy.FabricHttpError):
+                    deploy._ensure_environment(client, store, state, self.spec)
+                client.post_operation.assert_not_called()
+
+    def test_initial_empty_publication_change_blocks_before_post(self):
+        for change in ("version", "libraries"):
+            with self.subTest(change=change):
+                state, store, client = self.fresh_environment()
+                client.items[ENVIRONMENT]["properties"] = {
+                    "publishDetails": {"state": "Success", "targetVersion": PUBLISHED_VERSION}}
+                original_list = client.list_all
+                checks = 0
+
+                def lists(path, collection_key="value"):
+                    nonlocal checks
+                    if path.endswith("/libraries?beta=false") and "/staging/" not in path:
+                        checks += 1
+                        if change == "libraries" and checks > 1:
+                            return original_list(path, collection_key)
+                        if change == "version":
+                            client.items[ENVIRONMENT]["properties"]["publishDetails"]["targetVersion"] = NOTEBOOK
+                        raise deploy.FabricHttpError("GET", 404, error_code="EnvironmentLibrariesNotFound",
+                                                     url=deploy.FabricClient._url(path))
+                    return original_list(path, collection_key)
+
+                client.list_all = lists
+                with self.assertRaisesRegex(deploy.Blocked, "publication changed"):
+                    deploy._ensure_environment(client, store, state, self.spec)
+                client.post_operation.assert_not_called()
+                self.assertEqual(store.writes, [])
+
+    def test_initial_empty_publication_requires_unchanged_staging(self):
+        for change in ("libraries", "compute"):
+            with self.subTest(change=change):
+                state, store, client = self.fresh_environment()
+                client.items[ENVIRONMENT]["properties"] = {
+                    "publishDetails": {"state": "Success", "targetVersion": PUBLISHED_VERSION}}
+                original_list = client.list_all
+
+                def lists(path, collection_key="value"):
+                    if path.endswith("/libraries?beta=false") and "/staging/" not in path:
+                        raise deploy.FabricHttpError("GET", 404, error_code="EnvironmentLibrariesNotFound",
+                                                     url=deploy.FabricClient._url(path))
+                    return original_list(path, collection_key)
+
+                client.list_all = lists
+                if change == "libraries":
+                    client.staging_libraries[0]["version"] = "0.0.0"
+                else:
+                    client.compute["runtimeVersion"] = "2.0"
+                with self.assertRaises(deploy.Blocked):
+                    deploy._ensure_environment(client, store, state, self.spec)
+                client.post_operation.assert_not_called()
+                self.assertEqual(store.writes, [])
+
+    def test_initial_empty_unconfirmed_publish_remains_journaled(self):
+        state, store, client = self.fresh_environment()
+        client.items[ENVIRONMENT]["properties"] = {
+            "publishDetails": {"state": "Success", "targetVersion": PUBLISHED_VERSION}}
+        original_list = client.list_all
+
+        def lists(path, collection_key="value"):
+            if path.endswith("/libraries?beta=false") and "/staging/" not in path:
+                raise deploy.FabricHttpError("GET", 404, error_code="EnvironmentLibrariesNotFound",
+                                             url=deploy.FabricClient._url(path))
+            return original_list(path, collection_key)
+
+        client.list_all = lists
+        client.post_operation.side_effect = deploy.FabricTransportError("transport failed")
+        with self.assertRaisesRegex(deploy.Blocked, "no POST was retried"):
+            deploy._ensure_environment(client, store, state, self.spec)
+        with self.assertRaisesRegex(deploy.Blocked, "unknown outcome"):
+            deploy.validate_state(store.state, self.plan)
+        self.assertEqual(client.post_operation.call_count, 1)
+
     def test_unconfirmed_publish_never_reposts(self):
         state, store, client = self.fresh_environment()
         client.post_operation.side_effect = deploy.FabricTransportError("transport failed")
@@ -1398,6 +1537,24 @@ class FabricClientTests(unittest.TestCase):
         req = handler.do_request_(opener.requests[0][0])
         self.assertEqual(json.loads(req.data), {"value": "example"})
         self.assertEqual(req.get_header("Content-type"), "application/json")
+
+    def test_not_found_error_code_is_bounded_and_never_exposes_response(self):
+        for body, expected in (
+            (b'{"errorCode":"EnvironmentLibrariesNotFound","message":"sensitive"}',
+             "EnvironmentLibrariesNotFound"),
+            (b'{"errorCode":"OtherError"}', "OtherError"),
+            (b'{"errorCode":"EnvironmentLibrariesNotFound","errorCode":"OtherError"}', None),
+            (b"not-json-sensitive", None),
+            (b"x" * 65537, None),
+        ):
+            with self.subTest(expected=expected, size=len(body)):
+                url = deploy.API_ROOT + "/v1/workspaces"
+                opener = Opener(error.HTTPError(url, 404, "sensitive", {}, io.BytesIO(body)))
+                with self.assertRaises(deploy.FabricHttpError) as raised:
+                    self.client(opener).request("GET", "/v1/workspaces")
+                self.assertEqual(raised.exception.error_code, expected)
+                self.assertEqual(raised.exception.url, url)
+                self.assertNotIn("sensitive", str(raised.exception))
 
     def test_pagination_follows_canonical_continuation_and_token_only(self):
         path = "/v1/workspaces"

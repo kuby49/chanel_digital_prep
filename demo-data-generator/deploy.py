@@ -107,9 +107,11 @@ class Blocked(Exception):
 
 
 class FabricHttpError(Exception):
-    def __init__(self, method, status, retry_after=None):
+    def __init__(self, method, status, retry_after=None, *, error_code=None, url=None):
         self.status = status
         self.retry_after = retry_after
+        self.error_code = error_code
+        self.url = url
         super().__init__(f"Fabric {method} request failed (HTTP {status}).")
 
 
@@ -670,6 +672,17 @@ def _header(headers, name):
     return None
 
 
+def _fabric_error_code(body):
+    if not isinstance(body, bytes) or len(body) > 65536:
+        return None
+    try:
+        response = strict_json_loads(body.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
+    code = response.get("errorCode") if isinstance(response, dict) else None
+    return code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_]{1,128}", code) else None
+
+
 def _retry_after(headers, default=1):
     value = _header(headers, "Retry-After")
     if value is None:
@@ -743,15 +756,21 @@ class FabricClient:
                 body = response.read(8 * 1024 * 1024 + 1)
         except error.HTTPError as exc:
             status, retry_after = int(exc.code), _header(exc.headers, "Retry-After")
-            exc.close()
-            raise FabricHttpError(method, status, retry_after) from None
+            try:
+                body = exc.read(65537) if status == 404 else b""
+            except (OSError, ValueError):
+                body = b""
+            finally:
+                exc.close()
+            raise FabricHttpError(method, status, retry_after, error_code=_fabric_error_code(body), url=url) from None
         except (error.URLError, OSError, TimeoutError) as exc:
             reason = exc.reason if isinstance(exc, error.URLError) else exc
             if isinstance(reason, (TimeoutError, ConnectionError)):
                 raise FabricTransientTransportError(f"Fabric {method} request failed or timed out.") from None
             raise FabricTransportError(f"Fabric {method} request failed or timed out.") from None
         if not 200 <= status < 300:
-            raise FabricHttpError(method, status, _header(response_headers, "Retry-After"))
+            raise FabricHttpError(method, status, _header(response_headers, "Retry-After"),
+                                  error_code=_fabric_error_code(body) if status == 404 else None, url=url)
         if len(body) > 8 * 1024 * 1024:
             raise FabricTransportError("Fabric response exceeded the size limit.")
         if not body:
@@ -999,10 +1018,16 @@ def _success_version(live):
     return details[1]
 
 
-def _verify_libraries(client, state, spec, published):
+def _verify_libraries(client, state, spec, published, *, allow_missing=False):
     stage = "" if published else "/staging"
     path = _environment_path(state) + stage + "/libraries?beta=false"
-    libraries = client.list_all(path, collection_key="libraries")
+    try:
+        libraries = client.list_all(path, collection_key="libraries")
+    except FabricHttpError as exc:
+        if (published and allow_missing and exc.status == 404
+                and exc.error_code == "EnvironmentLibrariesNotFound" and exc.url == FabricClient._url(path)):
+            return False
+        raise
     actual = {}
     for library in libraries:
         if (not isinstance(library, dict) or library.get("libraryType") != "External"
@@ -1017,6 +1042,7 @@ def _verify_libraries(client, state, spec, published):
     if actual != spec["pins"]:
         phase = "Published" if published else "Staging"
         raise Blocked(f"{phase} Environment libraries differ from pinned environment.yml; no definition update was attempted.")
+    return True
 
 
 def _compute_fingerprint(client, state):
@@ -1082,14 +1108,20 @@ def _ensure_environment(client, store, state, spec):
     _, live = _read_environment(client, state)
     details = _publish_details(live)
     record = state["resources"]["environment_item"]
+    empty_baseline_version = None
     if details is not None:
         if details[0] != "Success":
             raise Blocked("Environment has an unjournaled or unsuccessful publish; reconcile before proceeding.")
-        version = _verify_published_environment(client, state, spec)
         if not state.get("legacy") and record.get("published_version") is None:
-            record["published_version"] = version
-            store.write(state)
-        return
+            empty_baseline_version = _success_version(live)
+            if _verify_libraries(client, state, spec, published=True, allow_missing=True):
+                version = _verify_published_environment(client, state, spec, expected_version=empty_baseline_version)
+                record["published_version"] = version
+                store.write(state)
+                return
+        else:
+            _verify_published_environment(client, state, spec)
+            return
     if state.get("legacy") or record.get("published_version") is not None:
         raise Blocked("An existing Environment without a verified publication will not be published automatically.")
     if not record.get("staging_compute_sha256"):
@@ -1098,7 +1130,11 @@ def _ensure_environment(client, store, state, spec):
     if _compute_fingerprint(client, state) != record["staging_compute_sha256"]:
         raise Blocked("Environment staging compute changed since creation; publishing is blocked.")
     _, live = _read_environment(client, state)
-    if _publish_details(live) is not None:
+    if empty_baseline_version is None:
+        if _publish_details(live) is not None:
+            raise Blocked("Environment publication changed before the publish request; reconcile before proceeding.")
+    elif (_success_version(live) != empty_baseline_version
+          or _verify_libraries(client, state, spec, published=True, allow_missing=True)):
         raise Blocked("Environment publication changed before the publish request; reconcile before proceeding.")
     state["pending"] = {"kind": "environment_item", "action": "publish", "spec_sha256": spec["sha256"],
                         "operation_id": None, "target_version": None, "operation_succeeded": False}

@@ -689,7 +689,7 @@ class NativeRebind:
     def _read_proof(self, state):
         return self._proof_readback(state, allow_running=False)
 
-    def _proof_readback(self, state, *, allow_running):
+    def _proof_readback(self, state, *, allow_running, rule_cycle=2):
         if state != self._published():
             raise CandidateBlocked("Staging rebind changed before proof.")
         self._lineage()
@@ -698,16 +698,25 @@ class NativeRebind:
         running = check._rule_state(graph, {"definition_disabled": self.graph}, reusable=True)
         if running and not allow_running:
             raise CandidateBlocked("New proof requires the exact stopped rule.")
-        cycle = None
-        if running:
-            controller = native_rule.NativeRule(self, cycle=2)
-            cycle = controller._state(check.config_sha256(state))
-            if (set(cycle["actions"]) != {"enable"}
-                    or cycle["actions"]["enable"]["status"] != "confirmed-readback"):
-                raise CandidateBlocked("Enabled rebound rule has no confirmed second-cycle enable.")
-            controller._readback(True, cycle["actions"]["enable"]["target"])
-        elif allow_running and (self.root / binding.RULE_SECOND_JOURNAL).exists():
-            raise CandidateBlocked("A stopped second rule cycle cannot be admitted again.")
+        expected_proof_sha = None
+        if allow_running:
+            if rule_cycle == 2 and (self.root / binding.RULE_THIRD_JOURNAL).exists():
+                raise CandidateBlocked("The third rule cycle has already been attempted.")
+            controller = native_rule.NativeRule(self, cycle=rule_cycle)
+            fingerprint = check.config_sha256(state)
+            if running:
+                cycle = controller._state(fingerprint)
+                if (set(cycle["actions"]) != {"enable"}
+                        or cycle["actions"]["enable"]["status"] != "confirmed-readback"):
+                    raise CandidateBlocked("Enabled rebound rule has no confirmed enable for the selected cycle.")
+                controller._readback(True, cycle["actions"]["enable"]["target"])
+                expected_proof_sha = cycle["proof_sha256"]
+            elif controller.journal.exists():
+                raise CandidateBlocked("A stopped selected rule cycle cannot be admitted again.")
+            elif rule_cycle == 3:
+                previous, _ = controller._predecessor(fingerprint)
+                controller._readback(False, previous["actions"]["disable"]["target"])
+                expected_proof_sha = previous["proof_sha256"]
         disabled = copy.deepcopy(graph)
         for entity in disabled:
             definition = entity.get("payload", {}).get("definition", {})
@@ -727,14 +736,15 @@ class NativeRebind:
                  "guard_sha256": check.config_sha256(binding._notebook(notebook)),
                  "pipeline_sha256": check.config_sha256(pipeline["properties"]),
                  "graph_disabled_sha256": check.config_sha256(check._canonical(disabled))}
-        if cycle is not None and cycle["proof_sha256"] != check.config_sha256(proof):
-            raise CandidateBlocked("Second-cycle enable is bound to a different proof.")
+        if expected_proof_sha is not None and expected_proof_sha != check.config_sha256(proof):
+            raise CandidateBlocked("Rule-cycle lineage is bound to a different proof.")
         return proof
 
     def proof(self, output):
         output = Path(output)
         protected = (*self.paths.values(), self.journal, self.access_journal, self.publisher.journal,
-                     self.root / binding.RULE_SECOND_JOURNAL, self.publisher.candidate_path,
+                     self.root / binding.RULE_SECOND_JOURNAL, self.root / binding.RULE_THIRD_JOURNAL,
+                     self.publisher.candidate_path,
                      self.publisher.native_config_path, self.publisher.previous_config_path,
                      self.root / binding._PREVIOUS, self.root / check.JOURNAL)
         if not output.is_absolute() or any(output.resolve() == item.resolve() for item in protected):
@@ -748,11 +758,13 @@ class NativeRebind:
 def validate_rebound(config, prefix, state_dir, *, api=None):
     demo, shared, data = config["demo-3"], config["shared"], config["data"]
     refs = demo.get("native_rebind")
+    rule_cycle = demo.get("native_rule_cycle", 2)
     fields = {"candidate", "native_config", "previous_config", "spec", "previous_proof", "proof"}
     if (prefix != "chanel" or config.get("tenant_id") != check.TENANT
             or type(config.get("contract_version")) is not int or config["contract_version"] != 1
             or demo.get("native_preflight") is not True or demo.get("customer_preflight") is True
             or demo.get("native_binding_journal") != check.NATIVE_JOURNAL
+            or type(rule_cycle) is not int or rule_cycle not in (2, 3)
             or not isinstance(refs, dict) or set(refs) != fields
             or any(not isinstance(value, str) or not Path(value).is_absolute() for value in refs.values())):
         raise CandidateBlocked("Rebound native preflight inputs are incomplete or not absolute.")
@@ -780,7 +792,7 @@ def validate_rebound(config, prefix, state_dir, *, api=None):
         generator.RunConfig(**guarded_notebook.run_config_from_shared(generator, projected)), policy)
     saved = _load_json(Path(refs["proof"]))
     if saved != demo.get("native_proof") or saved != rebind._proof_readback(
-            rebind._published(), allow_running=True):
+            rebind._published(), allow_running=True, rule_cycle=rule_cycle):
         raise CandidateBlocked("Rebound native proof differs from the profile or fresh readback.")
     return [
         "Rebound native target, staging, access proof and confirmed rule lineage verified.",

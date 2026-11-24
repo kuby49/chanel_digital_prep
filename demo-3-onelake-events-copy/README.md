@@ -307,7 +307,21 @@ before and after each change. For the common profile, set
 `previous_config`, `spec`, `previous_proof`, and `proof`; set
 `demo-3.native_proof` to the new proof and shared staging IDs to the new
 Lakehouse. The preflight rejects a guard and producer bound to different
-staging. A stopped second cycle cannot be admitted again.
+staging. A stopped second cycle cannot be admitted again as cycle 2.
+
+After the producer owner reconciles the failed run and its launcher lock,
+and the coordinator separately authorizes a retry, set
+`demo-3.native_rule_cycle: 3` in the replacement profile. Reuse the same
+rebound proof and lineage inputs; run `validate-only` against the retry
+profile. It requires confirmed cycle-2 enable and disable, an exact stopped
+definition, and fresh target, access and quiescence readbacks. Enable with
+`native_rule.py --mode enable --cycle 3 @inputs @rebind --proof <rebound-proof.json> --yes`.
+Keep `native_rule_cycle: 3` for later `validate-only` checks, and use
+`--cycle 3` for the controller's `disable`, `reconcile` and `drain`
+commands. The separate `demo3-native-rule-cycle-3-state.json`
+pins the untouched second journal and, through it, the first. An attempted
+cycle 3 cannot be relaunched or silently reused. Rule admission does not
+reconcile the producer's lock or authorize producer launch.
 
 ETags and hashes are point-in-time checks, not WORM guarantees. An outside
 writer can alter source bytes between guard validation and the Copy's later
@@ -354,7 +368,8 @@ a separately authorized second cycle can use `--cycle 2` with each of the
 same commands. Its separate journal pins the unchanged first journal, requires
 confirmed first-cycle enable and disable, and rechecks the stopped graph and
 fresh proof before re-enabling. This does not establish that the event queue
-has drained; do not reset either journal or attempt a third cycle. On an
+has drained; do not reset either journal. The separately authorized third
+cycle described above is available only for the rebound deployment. On an
 interrupted update run `--mode reconcile @inputs` only: it uses the recorded
 operation ID and Location and never resubmits. If acceptance is unknown,
 stop and reconcile with the operator; neither a second submission nor a

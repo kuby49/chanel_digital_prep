@@ -21,6 +21,7 @@ readiness requirements can be demonstrated.
 import argparse
 import base64
 import concurrent.futures
+import copy
 import hashlib
 import importlib.util
 import json
@@ -1184,12 +1185,74 @@ def _read_definition(client, state, kind):
     return definition, _parts(definition)
 
 
+def _merge_notebook_content(expected, live, *, allow_missing_trident):
+    try:
+        if not isinstance(expected, dict) or not isinstance(live, dict):
+            raise ValueError
+        if any(live.get(key) != expected[key] for key in ("nbformat", "nbformat_minor")):
+            raise ValueError
+        target_metadata, live_metadata = expected["metadata"], live["metadata"]
+        if not isinstance(target_metadata, dict) or not isinstance(live_metadata, dict):
+            raise ValueError
+        for key, value in target_metadata.items():
+            if key not in ("dependencies", "trident") and live_metadata.get(key) != value:
+                raise ValueError
+        target_dependencies = target_metadata["dependencies"]
+        live_dependencies = live_metadata["dependencies"]
+        if not isinstance(target_dependencies, dict) or not isinstance(live_dependencies, dict):
+            raise ValueError
+        if any(live_dependencies.get(key) != value for key, value in target_dependencies.items()):
+            raise ValueError
+        binding = target_metadata["trident"]["lakehouse"]
+        if target_dependencies.get("lakehouse") != binding:
+            raise ValueError
+        trident = live_metadata.get("trident")
+        if trident is not None and not isinstance(trident, dict):
+            raise ValueError
+        if isinstance(trident, dict) and "lakehouse" in trident and trident["lakehouse"] is None:
+            raise ValueError
+        existing_binding = trident.get("lakehouse") if trident is not None else None
+        if existing_binding != binding and not (allow_missing_trident and existing_binding is None):
+            raise ValueError
+        if "trident" in live_metadata and trident is None:
+            raise ValueError
+        expected_cells, live_cells = expected["cells"], live["cells"]
+        if (not isinstance(expected_cells, list) or not isinstance(live_cells, list)
+                or len(expected_cells) != len(live_cells)):
+            raise ValueError
+        merged = copy.deepcopy(live)
+        merged["metadata"].setdefault("trident", {})["lakehouse"] = copy.deepcopy(binding)
+        for target_cell, live_cell, result_cell in zip(expected_cells, live_cells, merged["cells"]):
+            if not isinstance(target_cell, dict) or not isinstance(live_cell, dict):
+                raise ValueError
+            if any(live_cell.get(key) != value for key, value in target_cell.items()
+                   if key not in ("source", "metadata", "outputs", "execution_count")):
+                raise ValueError
+            target_cell_metadata = target_cell["metadata"]
+            live_cell_metadata = live_cell["metadata"]
+            if not isinstance(target_cell_metadata, dict) or not isinstance(live_cell_metadata, dict):
+                raise ValueError
+            if any(live_cell_metadata.get(key) != value for key, value in target_cell_metadata.items()):
+                raise ValueError
+            for source in (target_cell["source"], live_cell["source"]):
+                if not isinstance(source, list) or any(not isinstance(line, str) for line in source):
+                    raise ValueError
+            result_cell["source"] = copy.deepcopy(target_cell["source"])
+        return merged
+    except (KeyError, TypeError, ValueError):
+        raise Blocked("Notebook layout, metadata or owned binding cannot be preserved safely; "
+                      "no overwrite was attempted.") from None
+
+
 def _verify_definition(client, state, kind, config=None):
     expected_definition = _definition(state, kind, config)
     expected = _parts(expected_definition)
     if kind == "notebook" and expected_definition.get("format") != "ipynb":
         raise Blocked("Local notebook definition does not use the supported ipynb format.")
     _, actual = _read_definition(client, state, kind)
+    if kind == "notebook" and "notebook-content.ipynb" in actual and "notebook-content.ipynb" in expected:
+        expected["notebook-content.ipynb"] = _merge_notebook_content(
+            expected["notebook-content.ipynb"], actual["notebook-content.ipynb"], allow_missing_trident=False)
     if set(actual) - set(expected) - {".platform"} or any(actual.get(key) != value for key, value in expected.items()):
         raise Blocked("Live item definition differs from local assets; no overwrite was attempted.")
 
@@ -1284,6 +1347,13 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
         if kind == "pipeline":
             _verify_definition(client, state, "notebook", config)
         live, actual = _read_definition(client, state, kind)
+        if kind == "notebook":
+            if set(target_parts) != {"notebook-content.ipynb"} or "notebook-content.ipynb" not in actual:
+                raise Blocked("Live notebook definition differs from the supported layout; no overwrite was attempted.")
+            merged = _merge_notebook_content(target_parts["notebook-content.ipynb"],
+                                             actual["notebook-content.ipynb"], allow_missing_trident=True)
+            target["parts"][0]["payload"] = base64.b64encode(canonical_bytes(merged)).decode("ascii")
+            target_parts = _parts(target)
         if set(actual) - {".platform"} != set(target_parts):
             raise Blocked("Live definition differs from the supported part layout; no overwrite was attempted.")
         after = dict(target_parts)

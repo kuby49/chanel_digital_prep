@@ -255,7 +255,16 @@ in `ipynb` format. A mismatching digest is reported without writing, but
 inspect and approve the actual definition before using that digest.
 
 The controller preserves `.platform` byte-for-byte and does not update item
-metadata. If publication is interrupted, rerun the **same command** with
+metadata. For notebooks it retains existing notebook and cell metadata, cell
+IDs, execution counts, and outputs, replacing only the owned cell sources and
+adding the required `trident.lakehouse` binding if missing. The existing
+lakehouse and environment dependencies must match the owned deployment; a
+conflicting binding or unsupported notebook layout blocks publication.
+Notebook verification also requires the owned cell sources and lakehouse
+binding while allowing preserved metadata. Reinspect the live baseline and
+producer quiescence immediately before publication.
+
+If publication is interrupted, rerun the **same command** with
 the same config and approved baseline. The durable
 `shared-producer-definition-update-v1.json` intent records the target and any
 accepted Fabric operation ID. The controller polls only that ID or checks

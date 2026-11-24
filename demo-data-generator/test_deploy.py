@@ -74,6 +74,21 @@ def definition(content, path="notebook-content.ipynb"):
     return {"parts": [{"path": path, "payloadType": "InlineBase64", "payload": payload}]}
 
 
+def notebook_content(revision):
+    binding = {"default_lakehouse": LAKEHOUSE, "default_lakehouse_name": "producer_staging",
+               "default_lakehouse_workspace_id": WORKSPACE, "known_lakehouses": [{"id": LAKEHOUSE}]}
+    return {"nbformat": 4, "nbformat_minor": 5,
+            "metadata": {"kernelspec": {"name": "synapse_pyspark"},
+                         "dependencies": {"lakehouse": binding, "environment": {"environmentId": ENVIRONMENT}},
+                         "trident": {"lakehouse": binding}},
+            "cells": [{"cell_type": "code", "metadata": {"tags": ["parameters"]}, "source": [revision],
+                       "execution_count": None, "outputs": []},
+                      {"cell_type": "code", "metadata": {}, "source": [revision],
+                       "execution_count": None, "outputs": []},
+                      {"cell_type": "code", "metadata": {}, "source": [revision],
+                       "execution_count": None, "outputs": []}]}
+
+
 class DefinitionUpdateTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -85,14 +100,15 @@ class DefinitionUpdateTests(unittest.TestCase):
         self.store.write(self.state)
         self.client = mock.Mock()
         self.client.list_all.return_value = []
-        self.targets = {"notebook": definition({"revision": "new"}),
+        self.targets = {"notebook": definition(notebook_content("new")),
                         "pipeline": definition({"revision": "new"}, "pipeline-content.json")}
         self.targets["notebook"]["format"] = "ipynb"
         self.live = copy.deepcopy(self.targets)
         self.platform = definition({"metadata": {"displayName": "owned"}}, ".platform")["parts"][0]
         for kind, live in self.live.items():
             live["parts"].append(self.platform)
-            live["parts"][0] = definition({"revision": "old"}, live["parts"][0]["path"])["parts"][0]
+            old = notebook_content("old") if kind == "notebook" else {"revision": "old"}
+            live["parts"][0] = definition(old, live["parts"][0]["path"])["parts"][0]
         self.calls = []
         self.behavior = self.complete
         self.client.post_operation.side_effect = self.post
@@ -251,6 +267,83 @@ class DefinitionUpdateTests(unittest.TestCase):
         deploy._atomic_json(self.store.directory / deploy.DEFINITION_UPDATE_NAME, journal)
         self.update("notebook", digest)
         self.assertEqual(self.calls, ["notebook"])
+
+    def test_update_preserves_live_metadata_and_cell_ids_then_allows_pipeline(self):
+        content = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+        del content["metadata"]["trident"]
+        content["metadata"]["microsoft"] = {"language": "python"}
+        content["metadata"]["spark_compute"] = {"compute_id": "/trident/default"}
+        content["metadata"]["dependencies"]["extra"] = {"preserve": True}
+        for index, cell in enumerate(content["cells"]):
+            cell["id"] = f"cell-{index}"
+            cell["metadata"]["microsoft"] = {"language": "python"}
+            cell["outputs"] = [{"output_type": "stream", "text": ["existing"]}]
+            cell["execution_count"] = index
+        self.live["notebook"]["parts"][0] = definition(content)["parts"][0]
+        self.update("notebook")
+        actual = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+        expected = copy.deepcopy(content)
+        expected["metadata"]["trident"] = {"lakehouse": content["metadata"]["dependencies"]["lakehouse"]}
+        for cell in expected["cells"]:
+            cell["source"] = ["new"]
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.live["notebook"]["parts"][-1], self.platform)
+        self.update("pipeline")
+        self.assertEqual(self.calls, ["notebook", "pipeline"])
+
+    def test_update_rejects_unsafe_layout_or_conflicting_bindings(self):
+        original = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+        mutations = (
+            lambda value: value["metadata"]["dependencies"]["lakehouse"].update(default_lakehouse=NOTEBOOK),
+            lambda value: value["metadata"]["trident"]["lakehouse"].update(default_lakehouse=NOTEBOOK),
+            lambda value: value["metadata"]["trident"].update(lakehouse=None),
+            lambda value: value["cells"].pop(),
+            lambda value: value["cells"][0]["metadata"].update(tags=[]),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                content = copy.deepcopy(original)
+                mutate(content)
+                self.live["notebook"]["parts"][0] = definition(content)["parts"][0]
+                with self.assertRaisesRegex(deploy.Blocked, "cannot be preserved safely"):
+                    self.update("notebook")
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(deploy._definition_update_record(self.store))
+
+    def test_notebook_verification_rejects_unowned_binding_and_source_drift(self):
+        self.update("notebook")
+        correct = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+        for mutate in (
+            lambda value: value["metadata"].pop("trident"),
+            lambda value: value["metadata"]["dependencies"]["environment"].update(environmentId=NOTEBOOK),
+            lambda value: value["cells"][1].update(source=["unexpected"]),
+        ):
+            content = copy.deepcopy(correct)
+            mutate(content)
+            self.live["notebook"]["parts"][0] = definition(content)["parts"][0]
+            with self.assertRaises(deploy.Blocked):
+                deploy._verify_definition(self.client, self.state, "notebook", self.config)
+        self.assertEqual(self.calls, ["notebook"])
+
+    def test_baseline_change_before_post_blocks_without_mutation(self):
+        original = self.post
+        reads = 0
+
+        def changed(path, payload=None, **kwargs):
+            nonlocal reads
+            if "/getDefinition" in path and NOTEBOOK in path:
+                reads += 1
+                if reads == 2:
+                    content = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+                    content["metadata"]["nteract"] = {"version": "changed"}
+                    self.live["notebook"]["parts"][0] = definition(content)["parts"][0]
+            return original(path, payload, **kwargs)
+
+        self.client.post_operation.side_effect = changed
+        with self.assertRaisesRegex(deploy.Blocked, "changed during admission"):
+            self.update("notebook")
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(deploy._definition_update_record(self.store))
 
     def test_active_and_unknown_scheduler_jobs_block_before_intent(self):
         for status in ("NotStarted", "InProgress", "NewStatus"):
@@ -1503,10 +1596,14 @@ class MockFabricService:
 def bound_definition(state, kind, config=None):
     resources = state["resources"]
     if kind == "notebook":
-        notebook = definition({"workspace": resources["workspace"]["id"],
-                               "lakehouse": resources["staging_lakehouse"]["id"],
-                               "lakehouse_name": resources["staging_lakehouse"]["name"],
-                               "environment": resources["environment_item"]["id"]})
+        content = notebook_content("expected")
+        binding = content["metadata"]["dependencies"]["lakehouse"]
+        binding.update(default_lakehouse=resources["staging_lakehouse"]["id"],
+                       default_lakehouse_name=resources["staging_lakehouse"]["name"],
+                       default_lakehouse_workspace_id=resources["workspace"]["id"],
+                       known_lakehouses=[{"id": resources["staging_lakehouse"]["id"]}])
+        content["metadata"]["dependencies"]["environment"]["environmentId"] = resources["environment_item"]["id"]
+        notebook = definition(content)
         notebook["format"] = "ipynb"
         return notebook
     return definition({"workspace": resources["workspace"]["id"], "notebook": resources["notebook"]["id"]},

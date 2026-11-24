@@ -235,13 +235,35 @@ completed pipeline jobs, and fresh exact Delta/dimension readback for every
 batch. Failed or unavailable evidence blocks the run. The hooks and their
 profile integration have not been verified in Fabric.
 
-After coordinated stopped-state verification, exclusively create
-`demo3-native-binding-state.json` with the existing resource IDs, generator
-fingerprint, `native_policy`, `native_policy_sha256`, the disabled graph and
-confirmed `guard_update`/`activator_update` readbacks. Preserve the fresh customer
-journal as `previous_journal` with its canonical `previous_journal_sha256`,
-and preserve its predecessor chain. Do not copy candidate actions into a
-success-shaped live journal. Set `demo-3.native_preflight:true`,
+`native_binding.py` is an offline-tested publisher for this specific owned
+binding; it has not been run against Fabric. It checks the stopped predecessor,
+ownership, target, job history and writer lock, records an intent before each
+update, and requires operation success and matching readback. A lost response
+without an operation identity remains blocked: do not resubmit it or create a
+success-shaped journal by hand. Keep the immutable candidate and all pinned
+inputs and journals together.
+
+After separate authorization and coordination, run from this directory with
+absolute paths to the immutable candidate, the native and fresh-run config
+files, and the original state directory:
+
+```powershell
+python native_binding.py --mode publish --candidate <candidate.json> --native-config <native.json> --previous-config <fresh.json> --state-dir <state-directory> --yes
+python native_binding.py --mode reconcile --candidate <candidate.json> --native-config <native.json> --previous-config <fresh.json> --state-dir <state-directory>
+python native_binding.py --mode resume --candidate <candidate.json> --native-config <native.json> --previous-config <fresh.json> --state-dir <state-directory> --yes
+python native_binding.py --mode proof --candidate <candidate.json> --native-config <native.json> --previous-config <fresh.json> --state-dir <state-directory> --output <new-proof.json>
+```
+
+Use `reconcile` only after an uncertain attempted update; it polls the recorded
+operation and never resubmits. `resume` only submits a rule update that was
+never attempted after a confirmed guard. Generate proof only after both
+confirmed readbacks; it cannot overwrite an existing file. These commands do
+not enable the rule or start jobs. They assume an exclusive operator: Fabric
+definition updates have no established conditional-write protection, so an
+external editor or writer can race the checks. A stopped rule, terminal job
+listing and absent lock do not prove the event queue is drained.
+
+Set `demo-3.native_preflight:true`,
 `native_binding_journal:"demo3-native-binding-state.json"` and `native_policy`
 in the common configuration; remove `customer_preflight`. Standard
 `deploy.py --mode validate-only ...` then verifies the native notebook, broad

@@ -32,6 +32,11 @@ run IDs and journal paths are not admitted. Rebinding the guard and disabled
 rule requires coordinated journaled updates and readback before admission;
 historical proofs do not establish new delivery.
 
+Customer credential requests have a 120-second limit with no automatic retry.
+Windows MSI installations use the bundled Azure CLI Python and temporary
+output handles to avoid CMD and inherited-pipe timeout delays. The isolated
+Azure configuration and existing tenant and principal checks are retained.
+
 `resolve-target-candidate` is local-only. It reads a confirmed
 `demo-3-state.json` under an exclusive `demo-3-state.lock` and creates a fresh
 `demo-3-target-candidate.json` beside the result without overwriting an existing

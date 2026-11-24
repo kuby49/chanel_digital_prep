@@ -124,7 +124,11 @@ using it as evidence. Never stage or ingest into an unverified target.
 `--state-dir`, and `--result` arguments. `dry-run` is a local plan. Deployment
 uses an owned-resource journal, verifies tenant and principal, publishes the
 pinned `environment.yml`, and refuses to adopt unknown resources or retry an
-ambiguous creation. `validate-only` can report ready after checking owned
+ambiguous creation. Host token acquisition has a 120-second timeout and no
+automatic retry. On Windows MSI installations it invokes the bundled Azure CLI
+Python directly to avoid a CMD wrapper holding captured pipes open. The
+isolated `AZURE_CONFIG_DIR` and token tenant and principal checks are retained.
+`validate-only` can report ready after checking owned
 definitions, selected target metadata and direct workspace write roles;
 this is an admission check, not proof of actual notebook runtime identity or
 delivery. `cleanup` remains blocked. The

@@ -38,6 +38,8 @@ flowchart LR
 - An active Fabric capacity and permission to create and run items in the
   dedicated demo workspace. Authenticate to the intended tenant; the scripts
   respect the existing `AZURE_CONFIG_DIR` and do not switch a global profile.
+  On Windows, token requests invoke the Azure CLI MSI Python directly; other
+  batch launchers are blocked because their timeouts cannot be guaranteed.
 - Python 3 and the packages in `requirements.txt` for local deployment and SDK
   checks. The producer's Fabric environment must also contain the Kusto SDK:
   the default runtime used for the MCAP probe did not. A later no-sales probe
@@ -109,12 +111,14 @@ selected destination. `submitted` means queued, not ingested.
    producer runs. The orchestrator uses the track's `start-monitor`,
    `monitor-status`, `wait-monitor` and `stop-monitor` modes with the same
    config and state directory.
-   The monitor deadline is `W*T + D + 1050 + V` seconds after submission,
+   The monitor deadline is `W*T + D + 1170 + V` seconds after submission,
    where `W = max(4, ceil(4/C) + 1)`, `C` is the configured admission
    concurrency, `T` is the track timeout, `D` is the producer's maximum
    duration, and `V` is the verification timeout. The four validators cover
    up to three demos and the producer; the extra wave covers monitor status.
-   Earlier `4*T + D + 1050 + V` and `2*T + D + V` records remain reconcilable.
+   The additional 120 seconds covers producer admission token acquisition.
+   Earlier `W*T + D + 1050 + V`, `4*T + D + 1050 + V`, and `2*T + D + V`
+   records remain reconcilable.
 3. Run the producer for the selected, ready demos. The monitor independently
    reads its durable manifest and launches bounded shortcut-verification jobs;
    Spark waiting does not block the one-minute generator. Each batch deadline
@@ -241,8 +245,10 @@ coordinated window and other dimension writers stopped:
    through KQL and the shortcut, including all dimension joins. The job
    records the exact run, generator, target, batch and Delta transaction-log
    snapshots. Repeated validation rechecks those snapshots, live metadata,
-   roles and query access without starting another Spark job. Snapshot drift
-   requires a new verification when no monitor or other Spark writer is active.
+   roles and query access. During producer admission, add
+   `--require-existing-proof` to fail closed without starting another Spark job
+   if that proof is missing or stale. Snapshot drift requires a new verification
+   when no monitor or other Spark writer is active.
 
 The measured verifier is bound to the selected dimensions and its monitor
 definition pins the exact owned synthetic target; neither is the old synthetic

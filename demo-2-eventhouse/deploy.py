@@ -56,6 +56,7 @@ MONITOR_START_FILE = "demo-2-monitor-start.json"
 ONELAKE = "https://onelake.blob.fabric.microsoft.com"
 MAX_SECONDS = 2**31 - 1
 MONITOR_STARTUP_HEADROOM_SECONDS = 1050
+MONITOR_ADMISSION_TOKEN_HEADROOM_SECONDS = 120
 PREFIX = re.compile(r"[a-z0-9][a-z0-9-]{0,39}\Z")
 KUSTO_HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.kusto\.fabric\.microsoft\.com\Z")
 
@@ -546,6 +547,21 @@ def _fabric_url(path):
     return url
 
 
+def _azure_cli_command():
+    az = shutil.which("az")
+    if not az:
+        raise Blocked("Azure CLI is unavailable; sign in using the intended isolated Azure configuration.")
+    if sys.platform == "win32" and Path(az).suffix.lower() in (".cmd", ".bat"):
+        launcher = Path(az)
+        python = launcher.parent.parent / "python.exe"
+        if (launcher.name.lower() != "az.cmd" or launcher.parent.name.lower() != "wbin"
+                or not python.is_file()):
+            raise Blocked("The Azure CLI batch launcher is not a supported MSI installation; "
+                          "a bounded token request cannot be guaranteed.")
+        return [str(python), "-IBm", "azure.cli"], {**os.environ, "AZ_INSTALLER": "MSI"}
+    return [az], None
+
+
 class FabricClient:
     def __init__(self, tenant_id, deadline):
         if tenant_id is None:
@@ -563,14 +579,15 @@ class FabricClient:
         if cached is not None and time.time() < cached[1]:
             return cached[0]
         self._tokens.pop(key, None)
-        az = shutil.which("az")
-        if not az:
-            raise Blocked("Azure CLI is unavailable; sign in using the intended isolated Azure configuration.")
+        command, env = _azure_cli_command()
+        options = {"capture_output": True, "text": True, "timeout": self.deadline.remaining(), "check": False}
+        if env is not None:
+            options["env"] = env
         try:
             proc = subprocess.run(
-                [az, "account", "get-access-token", "--resource", audience,
+                command + ["account", "get-access-token", "--resource", audience,
                  "--tenant", self.tenant_id, "--output", "json", "--only-show-errors"],
-                capture_output=True, text=True, timeout=self.deadline.remaining(), check=False,
+                **options,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Blocked("Azure CLI token acquisition failed or timed out.") from exc
@@ -1640,6 +1657,8 @@ class Deployment:
         return True
 
     def validate(self, *, allow_spark=True, allow_fact_drift=False):
+        if not allow_spark and not self.s["reuse_synthetic_target"]:
+            raise Blocked("A reusable exact verification proof is unavailable for this target.")
         if self.s["reuse_synthetic_target"]:
             self.verify_target_ownership()
             self.reused_synthetic_target()
@@ -2002,9 +2021,12 @@ def _monitor_binding(targets, generator_digest, producer_config):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _monitor_duration(track_timeout, max_duration, verification_timeout, max_concurrency, *, legacy=False):
+def _monitor_duration(track_timeout, max_duration, verification_timeout, max_concurrency, *,
+                      legacy=False, token_headroom=True):
     waves = max(4, (4 + max_concurrency - 1) // max_concurrency + 1)
     headroom = 2 * track_timeout if legacy else waves * track_timeout + MONITOR_STARTUP_HEADROOM_SECONDS
+    if not legacy and token_headroom:
+        headroom += MONITOR_ADMISSION_TOKEN_HEADROOM_SECONDS
     return headroom + max_duration + verification_timeout
 
 
@@ -2228,9 +2250,12 @@ class Monitor:
             deadline = _utc(start["deadline_utc"], "deadline")
             durations = {
                 _monitor_duration(start["track_timeout_seconds"], start["max_duration_seconds"],
-                                  start["verification_timeout_seconds"], concurrency, legacy=legacy_duration)
-                for concurrency, legacy_duration in ((start["max_concurrent_batches"], False),
-                                                      (4, False), (4, True))
+                                  start["verification_timeout_seconds"], concurrency,
+                                  legacy=legacy_duration, token_headroom=token_headroom)
+                for concurrency, legacy_duration, token_headroom in (
+                    (start["max_concurrent_batches"], False, True),
+                    (start["max_concurrent_batches"], False, False),
+                    (4, False, False), (4, True, False))
             }
             if (start["duration_seconds"] not in durations
                     or submitted + timedelta(seconds=start["duration_seconds"]) != deadline):
@@ -3044,6 +3069,8 @@ def _run(args, settings):
         _load_monitor_builder()
     deadline = Deadline(settings["track_timeout"], label="track")
     if args.mode == "validate-only" and not (args.state_dir / STATE_FILE).exists():
+        if args.require_existing_proof:
+            raise Blocked("An ownership ledger and exact verification proof are required.")
         client = FabricClient(settings["tenant_id"], deadline)
         ReadOnlyDeployment(settings, client, deadline).validate()
         raise Blocked("Read-only validation did not establish all readiness evidence.")
@@ -3159,7 +3186,7 @@ def _run(args, settings):
             deployment.deploy()
             return "pass", True, ["Deployment and fresh readiness checks passed."]
         if args.mode == "validate-only":
-            deployment.validate()
+            deployment.validate(allow_spark=not args.require_existing_proof)
             return "pass", True, ["Fresh readiness checks passed."]
         deployment.cleanup()
         return "pass", False, ["The empty, recorded Demo 2 workspace was deleted and its absence confirmed."]
@@ -3180,11 +3207,14 @@ def main(argv=None):
     parser.add_argument("--result", required=True, type=Path)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--selected-demos")
+    parser.add_argument("--require-existing-proof", action="store_true")
     args = parser.parse_args(argv)
     result = {"contract_version": 1, "track": "demo-2", "mode": args.mode,
               "status": "fail", "ready": False, "diagnostics": []}
     safe_result = args.result.is_absolute()
     try:
+        if args.require_existing_proof and args.mode != "validate-only":
+            raise Failure("--require-existing-proof is only valid for validate-only")
         protected = {(args.state_dir / name).resolve() for name in
                      (STATE_FILE, LOCK_FILE, MONITOR_FILE, MONITOR_START_FILE)}
         lock_path = (args.state_dir / LOCK_FILE).resolve()

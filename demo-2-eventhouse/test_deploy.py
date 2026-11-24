@@ -579,12 +579,20 @@ class DeployTests(unittest.TestCase):
                     for key in ("DimDate", "DimProduct", "DimCustomer", "shortcut")}
         with mock.patch.object(deploy, "verify_producer_access", return_value=None), \
                 mock.patch.object(deploy, "_customer_delta_snapshot", side_effect=lambda *_: copy.deepcopy(snapshot)):
+            _, missing = self.cli("validate-only", prefix=prefix, selected=selected, require_existing_proof=True)
+            self.assertEqual((missing["status"], missing["ready"]), ("blocked", False), missing)
+            self.assertEqual(len(self.backend.maintenance_jobs), 1)
             _, validated = self.cli("validate-only", prefix=prefix, selected=selected)
             self.assertEqual((validated["status"], validated["ready"]), ("pass", True), validated)
             self.assertEqual(len(self.backend.maintenance_jobs), 2)
-            _, repeated = self.cli("validate-only", prefix=prefix, selected=selected)
+            _, repeated = self.cli("validate-only", prefix=prefix, selected=selected, require_existing_proof=True)
             self.assertEqual((repeated["status"], repeated["ready"]), ("pass", True), repeated)
             self.assertEqual(len(self.backend.maintenance_jobs), 2)
+            snapshot["DimDate"]["etag"] = "changed"
+            _, stale = self.cli("validate-only", prefix=prefix, selected=selected, require_existing_proof=True)
+            self.assertEqual((stale["status"], stale["ready"]), ("blocked", False), stale)
+            self.assertEqual(len(self.backend.maintenance_jobs), 2)
+            snapshot["DimDate"]["etag"] = "etag"
             _, running = self.cli("start-monitor", prefix=prefix, selected=selected)
             self.assertEqual((running["status"], running["ready"]), ("pass", True), running)
             _, while_running = self.cli("validate-only", prefix=prefix, selected=selected)
@@ -609,6 +617,15 @@ class DeployTests(unittest.TestCase):
         self.assertEqual((current["verifier_notebook_id"], current["monitor_notebook_id"]),
                          (MEASURED_NOTEBOOK, MEASURED_MONITOR_NOTEBOOK))
         self.assertEqual(archived.read_bytes(), old_start)
+
+    def test_existing_proof_option_blocks_non_reuse_and_other_modes(self):
+        self.deploy_success()
+        self.backend.calls.clear()
+        _, unsupported = self.cli("validate-only", require_existing_proof=True)
+        self.assertEqual((unsupported["status"], unsupported["ready"]), ("blocked", False), unsupported)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.backend.calls))
+        _, wrong_mode = self.cli("dry-run", require_existing_proof=True)
+        self.assertEqual((wrong_mode["status"], wrong_mode["ready"]), ("fail", False), wrong_mode)
 
     def test_reuse_flag_cannot_bypass_synthetic_scope(self):
         self.config["demo-2"].update({"reuse_synthetic_target": True, "sales_table": "SyntheticFactSales"})
@@ -767,7 +784,8 @@ class DeployTests(unittest.TestCase):
         self.backend = FakeFabric()
         self.builder = FakeBuilder()
 
-    def cli(self, mode, *, yes=False, prefix="chanel", backend=None, builder=True, selected=None):
+    def cli(self, mode, *, yes=False, prefix="chanel", backend=None, builder=True, selected=None,
+            require_existing_proof=False):
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         args = ["--mode", mode, "--config", str(self.config_path), "--prefix", prefix,
                 "--state-dir", str(self.state), "--result", str(self.result)]
@@ -775,6 +793,8 @@ class DeployTests(unittest.TestCase):
             args.append("--yes")
         if selected is not None:
             args.extend(["--selected-demos", selected])
+        if require_existing_proof:
+            args.append("--require-existing-proof")
         backend = backend or self.backend
         output = io.StringIO()
         builder_patch = mock.patch.object(deploy, "_load_builder", return_value=(self.builder, ROOT / "generator.py"))
@@ -1696,7 +1716,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(evidence["manifest_uri"], manifest)
         self.assertEqual(evidence["state_uri"], state_uri)
         self.assertEqual((deploy._utc(evidence["deadline_utc"], "deadline")
-                          - deploy._utc(evidence["submitted_at_utc"], "submitted")).total_seconds(), 1240)
+                          - deploy._utc(evidence["submitted_at_utc"], "submitted")).total_seconds(), 1360)
         submissions = [call for call in self.backend.calls
                        if call[0] == "POST" and f"/notebooks/{MONITOR_NOTEBOOK}/jobs/execute/" in call[1]]
         self.assertEqual(len(submissions), 1)
@@ -2577,7 +2597,7 @@ class DeployTests(unittest.TestCase):
         self.monitor_setup()
         self.config["execution"].update(track_timeout_seconds=600, verification_timeout_seconds=900)
         self.config["data"]["max_duration_seconds"] = 1800
-        for concurrency, expected in ((1, 6750), (2, 6150), (3, 6150), (4, 6150)):
+        for concurrency, expected in ((1, 6870), (2, 6270), (3, 6270), (4, 6270)):
             with self.subTest(concurrency=concurrency):
                 self.config["execution"]["max_concurrency"] = concurrency
                 settings = deploy.validate_config(self.config, "chanel")
@@ -2588,7 +2608,7 @@ class DeployTests(unittest.TestCase):
         self.monitor_setup()
         self.config["execution"]["max_concurrency"] = 1
         evidence = self.start_monitor()
-        self.assertEqual(evidence["duration_seconds"], 1250)
+        self.assertEqual(evidence["duration_seconds"], 1370)
         paths = (self.state / deploy.MONITOR_START_FILE, self.state / deploy.MONITOR_FILE,
                  self.state / deploy.STATE_FILE)
 
@@ -2608,6 +2628,10 @@ class DeployTests(unittest.TestCase):
         set_duration(171)
         _, invalid = self.cli("monitor-status")
         self.assertEqual((invalid["status"], invalid["ready"]), ("blocked", False), invalid)
+
+        set_duration(1250)
+        _, prior_serial = self.cli("monitor-status")
+        self.assertEqual((prior_serial["status"], prior_serial["ready"]), ("pass", True), prior_serial)
 
         set_duration(1240)
         _, previous = self.cli("monitor-status")
@@ -3054,6 +3078,51 @@ else:
         self.assertNotIn("env", kwargs)
         self.assertNotIn("shell", kwargs)
         self.assertNotIn("login", args[0])
+
+    def test_windows_msi_azure_cli_uses_direct_python_and_preserves_config(self):
+        response = types.SimpleNamespace(returncode=0, stdout=json.dumps({
+            "tenant": TENANT, "accessToken": "token-for-test-only",
+        }))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launcher = root / "wbin" / "az.cmd"
+            launcher.parent.mkdir()
+            launcher.touch()
+            python = root / "python.exe"
+            python.touch()
+            with mock.patch.object(deploy.sys, "platform", "win32"), \
+                    mock.patch.object(deploy.shutil, "which", return_value=str(launcher)), \
+                    mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": "isolated"}), \
+                    mock.patch.object(deploy.subprocess, "run", return_value=response) as run:
+                client = deploy.FabricClient(TENANT, deploy.Deadline(30))
+                self.assertEqual(client._token(deploy.FABRIC), "token-for-test-only")
+            args, kwargs = run.call_args
+            self.assertEqual(args[0][:3], [str(python), "-IBm", "azure.cli"])
+            self.assertEqual(kwargs["env"]["AZ_INSTALLER"], "MSI")
+            self.assertEqual(kwargs["env"]["AZURE_CONFIG_DIR"], "isolated")
+            self.assertGreater(kwargs["timeout"], 0)
+            self.assertLessEqual(kwargs["timeout"], 30)
+
+    def test_windows_unknown_batch_launcher_is_blocked_without_invocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            launcher = Path(temporary) / "az.cmd"
+            launcher.touch()
+            with mock.patch.object(deploy.sys, "platform", "win32"), \
+                    mock.patch.object(deploy.shutil, "which", return_value=str(launcher)), \
+                    mock.patch.object(deploy.subprocess, "run") as run:
+                client = deploy.FabricClient(TENANT, deploy.Deadline(30))
+                with self.assertRaises(deploy.Blocked):
+                    client._token(deploy.FABRIC)
+                run.assert_not_called()
+
+    def test_direct_azure_cli_timeout_returns_without_waiting_for_child(self):
+        command = [sys.executable, "-c", "import time; time.sleep(20)"]
+        with mock.patch.object(deploy, "_azure_cli_command", return_value=(command, None)):
+            client = deploy.FabricClient(TENANT, deploy.Deadline(0.5))
+            started = time.monotonic()
+            with self.assertRaises(deploy.Blocked):
+                client._token(deploy.FABRIC)
+            self.assertLess(time.monotonic() - started, 5)
 
     def test_wrong_tenant_token_is_blocked_without_leaking_it(self):
         response = types.SimpleNamespace(returncode=0, stdout=json.dumps({

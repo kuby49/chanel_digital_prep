@@ -165,6 +165,22 @@ class FreshAdmissionTests(unittest.TestCase):
                 deploy._invoke_fresh("demo-1", "validate-only", self.config_path, "sample",
                                      self.state, self.root, 5, ["demo-1"])
 
+    def test_demo2_admission_requires_existing_proof(self):
+        script = self.root / "track.py"
+        script.touch()
+        result = {"contract_version": 1, "track": "demo-2", "mode": "validate-only",
+                  "status": "pass", "ready": True, "diagnostics": []}
+
+        def completed(args, **kwargs):
+            self.assertIn("--require-existing-proof", args)
+            Path(args[args.index("--result") + 1]).write_text(json.dumps(result), encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+
+        with (mock.patch.dict(deploy.TRACK_SCRIPTS, {"demo-2": script}),
+              mock.patch.object(deploy.subprocess, "run", side_effect=completed)):
+            deploy._invoke_fresh("demo-2", "validate-only", self.config_path, "sample",
+                                 self.state, self.root, 5, ["demo-1", "demo-2"])
+
 
 class MeasuredSubmissionTests(unittest.TestCase):
     def setUp(self):
@@ -200,7 +216,7 @@ class MeasuredSubmissionTests(unittest.TestCase):
         binding = job.call_args.args[1]
         deadline = datetime.fromisoformat(binding["deadline_utc"])
         expected = 2 * 600 + self.document["data"]["max_duration_seconds"] + \
-            deploy.STARTUP_HEADROOM_SECONDS + deploy.STOP_CHILD_WAIT_SECONDS
+            deploy.STARTUP_HEADROOM_SECONDS + deploy.STOP_CHILD_WAIT_SECONDS + deploy.AZURE_CLI_TOKEN_TIMEOUT_SECONDS
         self.assertGreaterEqual((deadline - start).total_seconds(), expected)
         self.assertLess((deadline - start).total_seconds(), expected + 5)
 

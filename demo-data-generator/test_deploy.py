@@ -1401,6 +1401,14 @@ class DeploymentFlowTests(unittest.TestCase):
 
 
 class TokenTests(unittest.TestCase):
+    def setUp(self):
+        platform = mock.patch.object(deploy.sys, "platform", "linux")
+        executable = mock.patch.object(deploy.shutil, "which", return_value="/usr/bin/az")
+        platform.start()
+        executable.start()
+        self.addCleanup(platform.stop)
+        self.addCleanup(executable.stop)
+
     def jwt(self, tenant=TENANT, identity=IDENTITY):
         payload = base64.urlsafe_b64encode(json.dumps({"tid": tenant, "oid": identity}).encode()).decode().rstrip("=")
         return "header." + payload + ".signature"
@@ -1408,19 +1416,64 @@ class TokenTests(unittest.TestCase):
     def test_token_uses_cli_tenant_and_inherits_isolated_config_without_mutating_it(self):
         token = self.jwt()
         completed = SimpleNamespace(returncode=0, stdout=json.dumps({"accessToken": token}), stderr="secret")
-        with (mock.patch.object(deploy.shutil, "which", return_value="az.cmd"),
-              mock.patch.object(deploy.subprocess, "run", return_value=completed) as run,
+        with (mock.patch.object(deploy.subprocess, "run", return_value=completed) as run,
               mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": r"C:\isolated-azure"})):
             before = dict(os.environ)
             self.assertEqual(deploy.azure_cli_token(TENANT, IDENTITY), token)
             self.assertEqual(dict(os.environ), before)
         command = run.call_args.args[0]
-        self.assertEqual(command[0], "az.cmd")
+        self.assertEqual(command[0], "/usr/bin/az")
         self.assertEqual(command[1:3], ["account", "get-access-token"])
         self.assertIn(TENANT, command)
         self.assertIn(deploy.API_ROOT, command)
-        self.assertNotIn("env", run.call_args.kwargs)
-        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertIsNone(run.call_args.kwargs["env"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
+        run.assert_called_once()
+
+    def test_windows_msi_uses_direct_python_and_preserves_isolated_environment(self):
+        token = self.jwt()
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps({"accessToken": token}), stderr="secret")
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "python.exe"
+            runtime.touch()
+            launcher = runtime.parent / "wbin" / "az.CMD"
+            with (mock.patch.object(deploy.sys, "platform", "win32"),
+                  mock.patch.object(deploy.shutil, "which", return_value=str(launcher)),
+                  mock.patch.object(deploy.subprocess, "run", return_value=completed) as run,
+                  mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": "isolated", "AZ_INSTALLER": "original"})):
+                before = dict(os.environ)
+                self.assertEqual(deploy.azure_cli_token(TENANT, IDENTITY), token)
+                self.assertEqual(dict(os.environ), before)
+            self.assertEqual(run.call_args.args[0][:3], [str(runtime), "-IBm", "azure.cli"])
+            self.assertEqual(run.call_args.args[0][3:5], ["account", "get-access-token"])
+            self.assertEqual(run.call_args.kwargs["env"], {**before, "AZ_INSTALLER": "MSI"})
+            self.assertEqual(run.call_args.kwargs["timeout"], 120)
+            run.assert_called_once()
+
+            runtime.unlink()
+            with (mock.patch.object(deploy.sys, "platform", "win32"),
+                  mock.patch.object(deploy.shutil, "which", return_value=str(launcher)),
+                  mock.patch.object(deploy.subprocess, "run") as run):
+                with self.assertRaisesRegex(deploy.Blocked, "repair the MSI"):
+                    deploy.azure_cli_token(TENANT, IDENTITY)
+            run.assert_not_called()
+
+    def test_windows_msi_timeout_does_not_retry_or_expose_command_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "python.exe"
+            runtime.touch()
+            launcher = runtime.parent / "wbin" / "az.cmd"
+            timeout = subprocess.TimeoutExpired(cmd=["sensitive"], timeout=120,
+                                                output="sensitive", stderr="sensitive")
+            with (mock.patch.object(deploy.sys, "platform", "win32"),
+                  mock.patch.object(deploy.shutil, "which", return_value=str(launcher)),
+                  mock.patch.object(deploy.subprocess, "run", side_effect=timeout) as run):
+                with self.assertRaisesRegex(deploy.Blocked, "120s") as caught:
+                    deploy.azure_cli_token(TENANT, IDENTITY)
+            self.assertNotIn("sensitive", str(caught.exception))
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertEqual(run.call_args.args[0][:3], [str(runtime), "-IBm", "azure.cli"])
+            run.assert_called_once()
 
     def test_wrong_tenant_or_identity_is_blocked_without_leaking_token(self):
         for token in (self.jwt(tenant=WORKSPACE), self.jwt(identity=WORKSPACE), "secret.invalid.token"):
@@ -1452,7 +1505,7 @@ class TokenTests(unittest.TestCase):
     def test_cli_errors_and_timeouts_are_sanitized(self):
         failures = (
             SimpleNamespace(returncode=1, stdout="sensitive", stderr="sensitive"),
-            subprocess.TimeoutExpired(cmd=["az"], timeout=30, output="sensitive"),
+            subprocess.TimeoutExpired(cmd=["az"], timeout=120, output="sensitive"),
         )
         for failure in failures:
             with self.subTest(failure=type(failure).__name__):
@@ -1464,6 +1517,7 @@ class TokenTests(unittest.TestCase):
                     with self.assertRaises(deploy.Blocked) as caught:
                         deploy.azure_cli_token(TENANT, IDENTITY)
                 self.assertNotIn("sensitive", str(caught.exception))
+                run.assert_called_once()
 
 
 if __name__ == "__main__":

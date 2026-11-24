@@ -172,7 +172,7 @@ class SharedManifestIntegrationTest(unittest.TestCase):
                 self.assertEqual(duration, eventhouse_binding["duration"])
                 waves = 5 if concurrency == 1 else 4
                 self.assertEqual(duration, waves * config["execution"]["track_timeout_seconds"]
-                                 + config["data"]["max_duration_seconds"] + 1050
+                                 + config["data"]["max_duration_seconds"] + 1170
                                  + config["execution"]["verification_timeout_seconds"])
 
     def test_orchestrator_binds_mocked_demo1_candidate_without_cloud_calls(self):

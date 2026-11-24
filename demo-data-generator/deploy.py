@@ -51,6 +51,7 @@ HERE = Path(__file__).resolve().parent
 ENVIRONMENT_YML = HERE / "environment.yml"
 API_ROOT = "https://api.fabric.microsoft.com"
 STORAGE_RESOURCE = "https://storage.azure.com/"
+AZURE_CLI_TOKEN_TIMEOUT_SECONDS = 120
 STATE_NAME = "shared-producer-v1.json"
 LOCK_NAME = ".shared-producer-v1.lock"
 CANDIDATE_NAME = "shared-producer-candidate-ids.json"
@@ -605,17 +606,36 @@ def _token_claims(token):
 def azure_cli_token(tenant_id, identity_id, *, resource=API_ROOT):
     if resource not in (API_ROOT, STORAGE_RESOURCE):
         raise ContractError("Unsupported Azure token resource.")
-    command = [shutil.which("az") or "az", "account", "get-access-token", "--resource", resource,
-               "--tenant", tenant_id, "--output", "json", "--only-show-errors"]
+    executable = shutil.which("az")
+    environment = None
+    command = [executable or "az"]
+    if sys.platform == "win32":
+        if not executable:
+            raise Blocked("Azure CLI is unavailable; sign in using the intended isolated configuration.")
+        launcher = Path(executable)
+        if launcher.suffix.lower() in (".cmd", ".bat"):
+            runtime = launcher.parent.parent / "python.exe"
+            if launcher.name.lower() != "az.cmd" or not runtime.is_file():
+                raise Blocked("Azure CLI Windows launcher has no supported bundled Python runtime; "
+                              "repair the MSI installation.")
+            # A CMD child can retain captured pipes after the wrapper's timeout.
+            command = [str(runtime), "-IBm", "azure.cli"]
+            environment = {**os.environ, "AZ_INSTALLER": "MSI"}
+    command += ["account", "get-access-token", "--resource", resource,
+                "--tenant", tenant_id, "--output", "json", "--only-show-errors"]
     try:
         completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
-                                   timeout=30, check=False)
+                                   env=environment, timeout=AZURE_CLI_TOKEN_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        raise Blocked(f"Azure CLI token acquisition timed out after {AZURE_CLI_TOKEN_TIMEOUT_SECONDS}s; "
+                      "no automatic retry was made.") from None
     except FileNotFoundError:
         raise Blocked("Azure CLI is unavailable; sign in using the intended isolated configuration.") from None
     except (OSError, UnicodeError, subprocess.SubprocessError):
-        raise Blocked("Azure CLI token acquisition failed or timed out.") from None
+        raise Blocked("Azure CLI token acquisition failed; no automatic retry was made.") from None
     if completed.returncode != 0:
-        raise Blocked("Azure CLI token acquisition failed; verify the intended tenant login.") from None
+        raise Blocked(f"Azure CLI token acquisition exited with code {completed.returncode}; "
+                      "verify the intended tenant login. Command output is withheld.") from None
     try:
         response = json.loads(completed.stdout)
         token = response["accessToken"]
@@ -1258,6 +1278,8 @@ def _invoke_fresh(track, mode, config_path, prefix, state_dir, directory, timeou
             "--prefix", prefix, "--state-dir", str(state_dir), "--result", str(result_path)]
     if track == "shared" or mode == "monitor-status":
         args += ["--selected-demos", ",".join(selected)]
+    if track == "demo-2" and mode == "validate-only":
+        args.append("--require-existing-proof")
     try:
         completed = subprocess.run(args, cwd=HERE.parent, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    timeout=timeout, check=False)
@@ -1517,7 +1539,7 @@ def _run_measured(config, plan, state_dir, selected_demos):
     validator_count = len(selected) + 1
     admission_waves = (validator_count + concurrency - 1) // concurrency
     total = timeout * (admission_waves + ("demo-2" in selected)) + duration + \
-        STARTUP_HEADROOM_SECONDS + STOP_CHILD_WAIT_SECONDS
+        STARTUP_HEADROOM_SECONDS + STOP_CHILD_WAIT_SECONDS + AZURE_CLI_TOKEN_TIMEOUT_SECONDS
     try:
         deadline = datetime.now(timezone.utc) + timedelta(seconds=total)
     except OverflowError:

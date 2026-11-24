@@ -146,6 +146,27 @@ is unresolved even when KQL totals match.
 The monitor launches independent on-demand notebook jobs; they do not need to
 share a high-concurrency Spark session.
 
+For the native producer, `native_demo2.py` uses the producer-allocated run ID
+and its existing manifest path. The producer must bundle `monitor_controller.py`,
+`lakehouse_validation.py`, and `eventhouse_core.py` alongside it. At profile
+publication, pin the measured verifier and monitor item IDs and the SHA-256
+digests of their trusted ipynb projections (`definition_sha256`), the target
+Lakehouse and shortcut, and an existing bootstrap batch. Do not derive the
+expected digests from unreviewed live notebook definitions. The hooks check the
+live definitions, run a bootstrap verification, and require a fresh owned
+monitor heartbeat before the first sale. Producer transport completion alone
+is not pipeline success: the hooks independently reconcile every measured
+batch and the whole-run verifier output. They do not rebind notebook definitions
+per run.
+
+The native job journal is `Files/producer/runs/<run_id>/demo2-native-jobs.json`
+in the producer staging Lakehouse. On cooperative stop, reconcile the recorded
+monitor first, then its exact child jobs and writer lock. A lost submission
+receipt or unconfirmed child termination retains the producer's native run lock;
+never resubmit or clear it blindly. A hard termination may bypass cooperative
+cleanup. The profile and this lifecycle require coordinated live verification
+before they can be presented as repeatable.
+
 The producer's staging helper copies each closed OneLake file to driver-local
 storage and checks its SHA-256 before calling `EventhouseAdapter.submit`. This
 path was verified for the bounded synthetic run below, not for a measured run.

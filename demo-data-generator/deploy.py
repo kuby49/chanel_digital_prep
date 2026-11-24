@@ -675,6 +675,24 @@ def _retry_after(headers, default=1):
     return max(1, int(value.strip()))
 
 
+def _operation_location(location, operation_id):
+    operation_id = _uuid(operation_id, "operation ID", Blocked)
+    if not isinstance(location, str) or any(ord(char) < 33 or ord(char) == 127 for char in location):
+        raise Blocked("Fabric operation Location is missing or unsafe; reconcile without retry.")
+    try:
+        parts = parse.urlsplit(location)
+        hostname = parts.hostname
+        if (parts.scheme != "https" or parts.username is not None or parts.password is not None
+                or parts.port is not None or parts.netloc != hostname or parts.query or parts.fragment
+                or parts.path != f"/v1/operations/{operation_id}"
+                or not (hostname == "api.fabric.microsoft.com" or
+                        re.fullmatch(r"wabi-[a-z0-9-]+\.analysis\.windows\.net", hostname or ""))):
+            raise ValueError
+    except ValueError:
+        raise Blocked("Fabric operation Location is missing or unsafe; reconcile without retry.") from None
+    return location
+
+
 class FabricClient:
     def __init__(self, token, opener=None, clock=None, sleep=None, *, skill="spark-cli"):
         if skill not in ("spark-cli", "eventhouse-cli"):
@@ -699,7 +717,14 @@ class FabricClient:
     def request(self, method, path, payload=None, timeout=30):
         if method not in ("GET", "POST"):
             raise Blocked("Unsupported Fabric request method.")
-        url = self._url(path)
+        if method == "GET" and isinstance(path, str) and path.startswith("https://wabi-"):
+            match = re.fullmatch(r"https://wabi-[a-z0-9-]+\.analysis\.windows\.net/v1/operations/"
+                                 r"([a-f0-9-]{36})", path)
+            if not match:
+                raise Blocked("Fabric operation Location is missing or unsafe; reconcile without retry.")
+            url = _operation_location(path, match.group(1))
+        else:
+            url = self._url(path)
         data = None if method == "GET" else (
             b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         headers = {"Accept": "application/json", "Authorization": "Bearer " + self._token,
@@ -805,10 +830,12 @@ class FabricClient:
                 return values
         raise Blocked("Fabric pagination exceeded its page limit.")
 
-    def poll(self, operation_id, retry_after=1, timeout=600, require_result=True):
+    def poll(self, operation_id, retry_after=1, timeout=600, require_result=True, *, location=None):
         operation_id = _uuid(operation_id, "operation ID", Blocked)
         deadline = self._clock() + timeout
-        path = f"/v1/operations/{operation_id}"
+        if location is not None and require_result:
+            raise Blocked("A definition-update operation cannot request a result endpoint.")
+        path = _operation_location(location, operation_id) if location is not None else f"/v1/operations/{operation_id}"
         delay = retry_after
         while True:
             self._wait(delay, deadline)
@@ -827,12 +854,24 @@ class FabricClient:
                 raise Blocked("Fabric returned an unknown operation state; reconcile before retrying.")
             delay = _retry_after(headers)
 
-    def post_operation(self, path, payload=None, on_accepted=None, require_result=True):
+    def post_operation(self, path, payload=None, on_accepted=None, require_result=True, *, exact_location=False):
+        if exact_location and (on_accepted is None or require_result):
+            raise Blocked("Definition updates require a durable operation receipt before polling.")
         status, headers, body = self.request("POST", path, payload)
         if status != 202:
             return status, body
         operation_id = _uuid(_header(headers, "x-ms-operation-id"), "operation ID", Blocked)
         delay = _retry_after(headers)
+        if exact_location:
+            try:
+                location = _operation_location(_header(headers, "Location"), operation_id)
+            except Blocked:
+                if on_accepted is not None:
+                    on_accepted(operation_id, delay, None)
+                raise
+            if on_accepted is not None:
+                on_accepted(operation_id, delay, location)
+            return 202, self.poll(operation_id, delay, require_result=require_result, location=location)
         if on_accepted is not None:
             on_accepted(operation_id, delay)
         return 202, self.poll(operation_id, delay, require_result=require_result)
@@ -1281,10 +1320,10 @@ def _definition_update_record(store):
     try:
         value = strict_json_loads(raw)
         binding = value["binding"]
+        required = {"version", "binding", "phase", "operation_id", "retry_after"}
+        optional = {"response_status", "location_required", "operation_location"}
         if (not isinstance(binding, dict)
-                or set(value) not in (
-                    {"version", "binding", "phase", "operation_id", "retry_after"},
-                    {"version", "binding", "phase", "operation_id", "retry_after", "response_status"})
+                or not required <= set(value) or set(value) - required - optional
                 or type(value["version"]) is not int or value["version"] != 1
                 or value["phase"] not in ("pending", "completed")
                 or set(binding) != {"kind", "item_id", "workspace_id", "tenant_id", "before_sha256",
@@ -1300,9 +1339,18 @@ def _definition_update_record(store):
                          or type(value["retry_after"]) is not int or value["retry_after"] < 0))
                 or ("response_status" in value
                     and (type(value["response_status"]) is not int or value["response_status"] != 200
-                         or value["operation_id"] is not None))):
+                         or value["operation_id"] is not None))
+                or ("location_required" in value and value["location_required"] is not True)
+                or (value.get("location_required") is True and value["phase"] == "completed"
+                    and value["operation_id"] is not None and "operation_location" not in value)
+                or (value.get("location_required") is True and value["phase"] == "completed"
+                    and value["operation_id"] is None and value.get("response_status") != 200)
+                or ("operation_location" in value
+                    and (value.get("location_required") is not True or value["operation_id"] is None
+                         or _operation_location(value["operation_location"], value["operation_id"])
+                         != value["operation_location"]))):
             raise ValueError
-    except (KeyError, TypeError, ValueError, RecursionError):
+    except (Blocked, KeyError, TypeError, ValueError, RecursionError):
         raise Blocked("Definition-update journal is invalid; reconcile before continuing.") from None
     return value
 
@@ -1371,6 +1419,10 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
                 and record.get("response_status") != 200):
             raise Blocked("Definition update POST outcome unknown; manual reconciliation is required. "
                           "No POST was retried.")
+        if (matches and record["phase"] == "pending" and record.get("location_required") is True
+                and record["operation_id"] is not None and "operation_location" not in record):
+            raise Blocked("Definition update operation Location is unconfirmed; manual reconciliation is required. "
+                          "No POST was retried.")
         _require_idle_producer(client, store, state, plan["tenant_id"])
         path = store.directory / DEFINITION_UPDATE_NAME
 
@@ -1379,7 +1431,11 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
 
         if matches:
             if record["phase"] == "pending" and record["operation_id"] is not None:
-                client.poll(record["operation_id"], record["retry_after"], require_result=False)
+                if record.get("location_required") is True:
+                    client.poll(record["operation_id"], record["retry_after"], require_result=False,
+                                location=record["operation_location"])
+                else:
+                    client.poll(record["operation_id"], record["retry_after"], require_result=False)
         elif _definition_digest(actual) != before_sha256:
             raise Blocked(f"Live {kind} baseline differs from approved SHA-256; observed "
                           f"{_definition_digest(actual)}. No POST was attempted.")
@@ -1388,19 +1444,23 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
             if _definition_digest(current_parts) != before_sha256 or _platform_digest(current) != binding["platform_sha256"]:
                 raise Blocked("Live definition changed during admission; no POST was attempted.")
             record = {"version": 1, "binding": binding, "phase": "pending",
-                      "operation_id": None, "retry_after": None}
+                      "operation_id": None, "retry_after": None, "location_required": True}
             persist()
 
-            def accepted(operation_id, delay):
+            def accepted(operation_id, delay, location):
                 record.update(operation_id=operation_id, retry_after=delay)
+                if location is not None:
+                    record["operation_location"] = location
                 persist()
 
             try:
                 status, _ = client.post_operation(_definition_path(state, kind) + "/updateDefinition?updateMetadata=false",
-                                                  {"definition": target}, on_accepted=accepted, require_result=False)
+                                                  {"definition": target}, on_accepted=accepted, require_result=False,
+                                                  exact_location=True)
             except (FabricHttpError, FabricTransportError, Blocked, OSError):
                 raise Blocked("Definition update is unconfirmed; reconcile the same intent. No POST was retried.") from None
-            if (status not in (200, 202) or status == 202 and record["operation_id"] is None
+            if (status not in (200, 202) or status == 202 and (
+                    record["operation_id"] is None or "operation_location" not in record)
                     or status == 200 and record["operation_id"] is not None):
                 raise Blocked("Definition update returned an unconfirmed response; no POST will be retried.")
             if status == 200:

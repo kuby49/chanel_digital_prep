@@ -267,14 +267,70 @@ producer quiescence immediately before publication.
 If publication is interrupted, rerun the **same command** with
 the same config and approved baseline. The durable
 `shared-producer-definition-update-v1.json` intent records the target and any
-accepted Fabric operation ID. The controller polls only that ID or checks
-exact readback after a durably recorded synchronous HTTP 200. If the POST
+accepted Fabric operation ID and its validated exact Location. New HTTP 202
+updates poll only that recorded Fabric or WABI operation Location. Missing or
+unsafe Locations remain blocked without resubmission; legacy pending receipts
+without a Location retain their prior operation-ID polling behavior. The
+controller checks exact readback after a durably recorded synchronous HTTP
+200. If the POST
 outcome is unknown, even matching readback cannot prove an operation has
 terminated: keep the journal and reconcile manually; the controller never
 retries the POST. Legacy completed records remain compatible, but a completed
 record without an operation ID or synchronous receipt does not independently
 prove that a previously ambiguous operation terminated. Successful publication
 does not declare demo readiness or start a producer.
+
+The journal holds one update. Before a pipeline update replaces a completed
+notebook receipt, preserve a byte-identical copy under the same authoritative
+state lock, in a sole-operator maintenance window. Fill in the reviewed values
+below and run it from the repository root; the exclusive destination must not
+already exist. Stop on any error or evidence mismatch, and retain any partial
+copy for manual reconciliation. The copied receipt is evidence, not a
+replacement for the active journal; do not reset or modify the active journal.
+
+```python
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / "demo-data-generator"))
+from deploy import DEFINITION_UPDATE_NAME, StateStore, _definition_update_record
+
+state_dir = Path(r"<absolute authoritative state directory>")
+expected_workspace = "<reviewed workspace ID>"
+expected_notebook = "<reviewed notebook ID>"
+expected_before = "<approved notebook baseline SHA-256>"
+expected_after = "<verified notebook result SHA-256>"
+if not state_dir.is_absolute():
+    raise ValueError("state directory must be absolute")
+store = StateStore(state_dir)
+source = state_dir / DEFINITION_UPDATE_NAME
+copy_path = state_dir / "shared-producer-notebook-update-receipt.json"
+with store.lock():
+    record = _definition_update_record(store)
+    if not record or record["phase"] != "completed":
+        raise ValueError("notebook update is not confirmed complete")
+    binding = record["binding"]
+    if (binding["kind"], binding["workspace_id"], binding["item_id"],
+        binding["before_sha256"], binding["after_sha256"]) != (
+            "notebook", expected_workspace, expected_notebook, expected_before, expected_after):
+        raise ValueError("notebook receipt binding does not match the reviewed update")
+    if not (record.get("response_status") == 200 or
+            (record.get("operation_id") and record.get("operation_location"))):
+        raise ValueError("notebook receipt lacks a confirmed response or operation Location")
+    original = source.read_bytes()
+    with copy_path.open("xb") as dest:
+        dest.write(original)
+        dest.flush()
+        os.fsync(dest.fileno())
+    if copy_path.read_bytes() != original or source.read_bytes() != original:
+        raise ValueError("receipt copy verification failed")
+    print(copy_path, hashlib.sha256(original).hexdigest())
+```
+
+Confirm the live notebook and both journal/copy bytes again before the pipeline
+update, and stop if any actor may have changed them during this window.
 
 ## Isolated Demo 2 synthetic staging
 

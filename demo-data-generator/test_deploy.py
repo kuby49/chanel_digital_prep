@@ -24,6 +24,7 @@ LAKEHOUSE = "22222222-2222-4222-8222-222222222222"
 NOTEBOOK = "33333333-3333-4333-8333-333333333333"
 PIPELINE = "44444444-4444-4444-8444-444444444444"
 OPERATION = "55555555-5555-4555-8555-555555555555"
+OPERATION_LOCATION = f"https://wabi-west-us3-redirect.analysis.windows.net/v1/operations/{OPERATION}"
 DEPLOYMENT = "66666666-6666-4666-8666-666666666666"
 ENVIRONMENT = "77777777-7777-4777-8777-777777777777"
 PUBLISHED_VERSION = "88888888-8888-4888-8888-888888888888"
@@ -162,13 +163,15 @@ class DefinitionUpdateTests(unittest.TestCase):
         digest = self.digest("notebook")
 
         def interrupted(kind, target, accepted):
-            accepted(OPERATION, 6)
-            self.assertEqual(deploy._definition_update_record(self.store)["operation_id"], OPERATION)
+            accepted(OPERATION, 6, OPERATION_LOCATION)
+            journal = deploy._definition_update_record(self.store)
+            self.assertEqual((journal["operation_id"], journal["operation_location"]),
+                             (OPERATION, OPERATION_LOCATION))
             self.target = target
             raise deploy.FabricTransportError("poll disconnected")
 
-        def poll(operation_id, delay, *, require_result):
-            self.assertEqual((operation_id, delay, require_result), (OPERATION, 6, False))
+        def poll(operation_id, delay, *, require_result, location):
+            self.assertEqual((operation_id, delay, require_result, location), (OPERATION, 6, False, OPERATION_LOCATION))
             self.live["notebook"] = self.target
 
         self.behavior = interrupted
@@ -177,7 +180,47 @@ class DefinitionUpdateTests(unittest.TestCase):
             self.update("notebook", digest)
         self.update("notebook", digest)
         self.assertEqual(self.calls, ["notebook"])
+        self.client.poll.assert_called_once_with(OPERATION, 6, require_result=False, location=OPERATION_LOCATION)
+
+    def test_accepted_operation_missing_location_never_polls_or_reposts(self):
+        digest = self.digest("notebook")
+
+        def missing(kind, target, accepted):
+            self.target = target
+            accepted(OPERATION, 1, None)
+            raise deploy.Blocked("Location unavailable")
+
+        self.behavior = missing
+        with self.assertRaisesRegex(deploy.Blocked, "unconfirmed"):
+            self.update("notebook", digest)
+        self.live["notebook"] = self.target
+        with self.assertRaisesRegex(deploy.Blocked, "Location is unconfirmed"):
+            self.update("notebook", digest)
+        journal = deploy._definition_update_record(self.store)
+        self.assertEqual(journal["operation_id"], OPERATION)
+        self.assertNotIn("operation_location", journal)
+        self.assertEqual(self.calls, ["notebook"])
+        self.client.poll.assert_not_called()
+
+    def test_legacy_pending_operation_id_still_polls_legacy_endpoint(self):
+        digest = self.digest("notebook")
+
+        def interrupted(kind, target, accepted):
+            accepted(OPERATION, 6, OPERATION_LOCATION)
+            self.target = target
+            raise deploy.FabricTransportError("poll disconnected")
+
+        self.behavior = interrupted
+        with self.assertRaises(deploy.Blocked):
+            self.update("notebook", digest)
+        journal = deploy._definition_update_record(self.store)
+        journal.pop("location_required")
+        journal.pop("operation_location")
+        deploy._atomic_json(self.store.directory / deploy.DEFINITION_UPDATE_NAME, journal)
+        self.client.poll.side_effect = lambda *args, **kwargs: self.live.update(notebook=self.target)
+        self.update("notebook", digest)
         self.client.poll.assert_called_once_with(OPERATION, 6, require_result=False)
+        self.assertEqual(self.calls, ["notebook"])
 
     def test_unknown_post_never_retries_or_completes_from_matching_readback(self):
         digest = self.digest("notebook")
@@ -259,11 +302,30 @@ class DefinitionUpdateTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.Blocked, "journal is invalid"):
             deploy._definition_update_record(self.store)
 
+    def test_malformed_operation_location_journal_fails_closed(self):
+        digest = self.digest("notebook")
+
+        def interrupted(kind, target, accepted):
+            accepted(OPERATION, 6, OPERATION_LOCATION)
+            raise deploy.FabricTransportError("poll disconnected")
+
+        self.behavior = interrupted
+        with self.assertRaises(deploy.Blocked):
+            self.update("notebook", digest)
+        journal = deploy._definition_update_record(self.store)
+        path = self.store.directory / deploy.DEFINITION_UPDATE_NAME
+        for value in (OPERATION_LOCATION + "?x=1", OPERATION_LOCATION.replace(OPERATION, NOTEBOOK),
+                      "https://attacker.invalid/v1/operations/" + OPERATION):
+            deploy._atomic_json(path, {**journal, "operation_location": value})
+            with self.assertRaisesRegex(deploy.Blocked, "journal is invalid"):
+                deploy._definition_update_record(self.store)
+
     def test_legacy_completed_record_remains_compatible(self):
         digest = self.digest("notebook")
         self.update("notebook", digest)
         journal = deploy._definition_update_record(self.store)
         journal.pop("response_status")
+        journal.pop("location_required")
         deploy._atomic_json(self.store.directory / deploy.DEFINITION_UPDATE_NAME, journal)
         self.update("notebook", digest)
         self.assertEqual(self.calls, ["notebook"])
@@ -1381,6 +1443,55 @@ class FabricClientTests(unittest.TestCase):
                 with self.assertRaises(deploy.Blocked):
                     self.client(opener).post_operation("/v1/workspaces", {})
                 self.assertEqual(len(opener.requests), 1)
+
+    def test_definition_lro_records_and_polls_exact_wabi_location(self):
+        clock = Clock()
+        opener = Opener(Response(202, headers={"x-ms-operation-id": OPERATION, "Retry-After": "2",
+                                               "Location": OPERATION_LOCATION}),
+                        Response(body={"status": "Running"}, headers={"Retry-After": "3"}),
+                        Response(body={"status": "Succeeded"}))
+        accepted = mock.Mock()
+        status, response = self.client(opener, clock).post_operation(
+            "/v1/workspaces", {}, on_accepted=accepted, require_result=False, exact_location=True)
+        self.assertEqual((status, response), (202, None))
+        accepted.assert_called_once_with(OPERATION, 2, OPERATION_LOCATION)
+        self.assertEqual([req.full_url for req, _ in opener.requests][1:], [OPERATION_LOCATION] * 2)
+        self.assertEqual(clock.delays, [2, 3])
+        for req, _ in opener.requests:
+            self.assertEqual(dict((key.lower(), value) for key, value in req.header_items())
+                             ["x-ms-fabric-skill"], "spark-cli")
+
+    def test_definition_lro_rejects_missing_or_unsafe_location_without_retry(self):
+        for location in (None, "https://attacker.invalid/v1/operations/" + OPERATION,
+                         OPERATION_LOCATION + "?access_token=secret",
+                         OPERATION_LOCATION + "/result",
+                         OPERATION_LOCATION.replace(OPERATION, NOTEBOOK),
+                         OPERATION_LOCATION.replace("https://", "http://"),
+                         OPERATION_LOCATION.replace("wabi-west", "user@wabi-west"),
+                         OPERATION_LOCATION.replace(".net/", ".net:443/")):
+            with self.subTest(location=location):
+                headers = {"x-ms-operation-id": OPERATION, "Retry-After": "1"}
+                if location is not None:
+                    headers["Location"] = location
+                opener = Opener(Response(202, headers=headers))
+                accepted = mock.Mock()
+                with self.assertRaises(deploy.Blocked):
+                    self.client(opener).post_operation(
+                        "/v1/workspaces", {}, on_accepted=accepted, require_result=False, exact_location=True)
+                accepted.assert_called_once_with(OPERATION, 1, None)
+                self.assertEqual(len(opener.requests), 1)
+
+    def test_wabi_access_is_limited_to_validated_operation_reads(self):
+        for method, url in (("POST", OPERATION_LOCATION), ("GET", OPERATION_LOCATION + "/result"),
+                            ("GET", OPERATION_LOCATION + "?query=x")):
+            opener = Opener()
+            with self.assertRaises(deploy.Blocked):
+                self.client(opener).request(method, url)
+            self.assertEqual(opener.requests, [])
+        opener = Opener()
+        with self.assertRaises(deploy.Blocked):
+            self.client(opener).post_operation("/v1/workspaces", {}, require_result=False, exact_location=True)
+        self.assertEqual(opener.requests, [])
 
     def test_publish_lro_does_not_require_a_result_endpoint(self):
         clock = Clock()

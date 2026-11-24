@@ -769,7 +769,7 @@ class NativeBindingTests(unittest.TestCase):
         self.assertEqual(state["actions"]["run"]["status"], "confirmed-readback")
         return state
 
-    def test_rebound_proof_admits_only_second_cycle_and_preserves_every_part(self):
+    def test_rebound_second_cycle_preserves_every_part(self):
         rebound, live, graph, _, old_proof, _ = self.rebound_setup()
         first_path = self.root / native_binding.RULE_JOURNAL
         first_bytes = first_path.read_bytes()
@@ -809,6 +809,70 @@ class NativeBindingTests(unittest.TestCase):
         rule.change("disable")
         with self.assertRaisesRegex(CandidateBlocked, "cannot be admitted again"):
             rebound._proof_readback(rebound._published(), allow_running=True)
+
+    def test_third_cycle_requires_stopped_second_and_pins_both_predecessors(self):
+        rebound, _, _, _, _, _ = self.rebound_setup()
+        self.finish_access(rebound)
+        rebound.update()
+        proof_path = self.root / "new-proof.json"
+        proof = rebound.proof(proof_path)
+        second = native_rule.NativeRule(rebound, cycle=2)
+        third = native_rule.NativeRule(rebound, cycle=3)
+        second.change("enable", proof_path)
+        with self.assertRaisesRegex(CandidateBlocked, "Second rule cycle must have confirmed"):
+            third._predecessor(third._binding_hash())
+        second.change("disable")
+        second_bytes = second.journal.read_bytes()
+        first_bytes = second.predecessor.read_bytes()
+        self.assertEqual(rebound._proof_readback(
+            rebound._published(), allow_running=True, rule_cycle=3), proof)
+        state = third.change("enable", proof_path)
+        self.assertEqual(state["previous_journal"], second.journal.name)
+        self.assertEqual(state["previous_journal_sha256"], native_binding._sha(second_bytes))
+        self.assertEqual(rebound._proof_readback(
+            rebound._published(), allow_running=True, rule_cycle=3), proof)
+        with self.assertRaisesRegex(CandidateBlocked, "third rule cycle has already"):
+            rebound._proof_readback(rebound._published(), allow_running=True)
+        second.predecessor.write_bytes(first_bytes + b"\n")
+        with self.assertRaisesRegex(CandidateBlocked, "pinned staging rebind input or predecessor changed"):
+            third.change("disable")
+        second.predecessor.write_bytes(first_bytes)
+        second.journal.write_bytes(second_bytes + b"\n")
+        with self.assertRaisesRegex(CandidateBlocked, "Second rule-cycle journal changed"):
+            third.change("disable")
+        second.journal.write_bytes(second_bytes)
+        third.change("disable")
+        self.assertEqual(second.journal.read_bytes(), second_bytes)
+        self.assertEqual(second.predecessor.read_bytes(), first_bytes)
+        with self.assertRaisesRegex(CandidateBlocked, "cannot be admitted again"):
+            rebound._proof_readback(rebound._published(), allow_running=True, rule_cycle=3)
+
+    def test_third_cycle_rejects_stopped_definition_drift_before_sending_update(self):
+        rebound, _, _, _, _, _ = self.rebound_setup()
+        self.finish_access(rebound)
+        rebound.update()
+        proof_path = self.root / "new-proof.json"
+        rebound.proof(proof_path)
+        second = native_rule.NativeRule(rebound, cycle=2)
+        second.change("enable", proof_path)
+        second.change("disable")
+        third = native_rule.NativeRule(rebound, cycle=3)
+        original_read = native_binding._reflex_definition.side_effect
+
+        def changed_read(api):
+            definition = original_read(api)
+            part = next(item for item in definition["parts"] if item["path"] == "resources/keep.bin")
+            part["payload"] = base64.b64encode(b"unrelated-change").decode()
+            return definition
+
+        native_binding._reflex_definition.side_effect = changed_read
+        submissions = self.api.request.call_count
+        with self.assertRaisesRegex(CandidateBlocked, "Complete native rule definition changed"):
+            third.change("enable", proof_path)
+        with self.assertRaisesRegex(CandidateBlocked, "Complete native rule definition changed"):
+            rebound._proof_readback(rebound._published(), allow_running=True, rule_cycle=3)
+        self.assertEqual(self.api.request.call_count, submissions)
+        self.assertFalse(third.journal.exists())
 
     def test_definition_parts_are_strict_and_unrelated_payloads_are_compared(self):
         _, live, _, _, _, _ = self.rebound_setup()

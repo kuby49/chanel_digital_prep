@@ -30,6 +30,7 @@ _BASE = "/v1/workspaces/" + check.WORKSPACE
 _ACTIONS = ("guard_update", "activator_update")
 RULE_JOURNAL = "demo3-native-rule-state.json"
 RULE_SECOND_JOURNAL = "demo3-native-rule-cycle-2-state.json"
+RULE_THIRD_JOURNAL = "demo3-native-rule-cycle-3-state.json"
 HC_JOURNAL = "demo3-native-guard-hc-state.json"
 ACCESS_REBIND_JOURNAL = "demo3-native-staging-access-rebind-state.json"
 REBIND_JOURNAL = "demo3-native-staging-rebind-state.json"
@@ -637,6 +638,7 @@ class NativeBinding:
         output = Path(output)
         protected = (self.candidate_path, self.native_config_path, self.previous_config_path,
                      self.journal, self.root / RULE_JOURNAL, self.root / RULE_SECOND_JOURNAL,
+                     self.root / RULE_THIRD_JOURNAL,
                      self.root / HC_JOURNAL, self.root / ACCESS_REBIND_JOURNAL,
                      self.root / REBIND_JOURNAL,
                      self.root / _PREVIOUS, self.root / check.JOURNAL)

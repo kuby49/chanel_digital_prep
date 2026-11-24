@@ -1,4 +1,4 @@
-"""Journal up to two explicitly selected cycles for a published Demo 3 native rule."""
+"""Journal explicitly selected cycles for a published Demo 3 native rule."""
 
 import argparse
 import base64
@@ -15,21 +15,24 @@ from ownership import FabricControl
 
 _RESOURCE = binding._BASE + "/reflexes/" + check.REFLEX
 _SKILL = "activator-cli"
+_JOURNALS = (binding.RULE_JOURNAL, binding.RULE_SECOND_JOURNAL, binding.RULE_THIRD_JOURNAL)
 
 
 class NativeRule:
     def __init__(self, publisher, *, cycle=1):
-        if type(cycle) is not int or cycle not in (1, 2):
-            raise ValueError("Only rule cycles 1 and 2 are supported.")
-        if getattr(publisher, "rebound", False) and cycle != 2:
-            raise ValueError("A staging rebind is eligible only for rule cycle 2.")
+        if type(cycle) is not int or cycle not in (1, 2, 3):
+            raise ValueError("Only rule cycles 1, 2 and 3 are supported.")
+        rebound = getattr(publisher, "rebound", False)
+        if rebound and cycle == 1:
+            raise ValueError("A staging rebind is eligible only for rule cycle 2 or 3.")
+        if cycle == 3 and not rebound:
+            raise ValueError("Rule cycle 3 requires the confirmed staging rebind.")
         self.publisher = publisher
         self.api = publisher.api
         self.graph = publisher.graph
         self.cycle = cycle
-        self.predecessor = publisher.root / binding.RULE_JOURNAL
-        self.journal = publisher.root / (binding.RULE_JOURNAL if cycle == 1
-                                          else binding.RULE_SECOND_JOURNAL)
+        self.predecessor = publisher.root / _JOURNALS[cycle - 2] if cycle > 1 else None
+        self.journal = publisher.root / _JOURNALS[cycle - 1]
 
     def _binding_hash(self):
         return check.config_sha256(self.publisher._published())
@@ -91,21 +94,35 @@ class NativeRule:
                 raise CandidateBlocked("Rebound rule predecessor definition changed.")
         return state
 
-    def _predecessor_hash(self, fingerprint):
+    def _predecessor(self, fingerprint):
         raw = binding._bytes(self.predecessor)
-        previous_fingerprint = self.publisher.predecessor_binding_hash()
-        if not getattr(self.publisher, "rebound", False) and previous_fingerprint != fingerprint:
-            raise CandidateBlocked("Native binding changed while checking the first rule cycle.")
-        previous = self._validate_state(binding._json_bytes(raw), previous_fingerprint)
+        previous = binding._json_bytes(raw)
+        if self.cycle == 3:
+            controller = NativeRule(self.publisher, cycle=2)
+            controller._validate_state(previous, fingerprint, rebound_definitions=True)
+            controller._assert_predecessor(previous, fingerprint)
+        else:
+            previous_fingerprint = self.publisher.predecessor_binding_hash()
+            if not getattr(self.publisher, "rebound", False) and previous_fingerprint != fingerprint:
+                raise CandidateBlocked("Native binding changed while checking the first rule cycle.")
+            self._validate_state(previous, previous_fingerprint)
         if (previous["actions"].get("enable", {}).get("status") != "confirmed-readback"
                 or previous["actions"].get("disable", {}).get("status") != "confirmed-readback"):
-            raise CandidateBlocked("First rule cycle must have confirmed enable and disable.")
-        return binding._sha(raw)
+            label = "First" if self.cycle == 2 else "Second"
+            raise CandidateBlocked(f"{label} rule cycle must have confirmed enable and disable.")
+        return previous, binding._sha(raw)
 
     def _assert_predecessor(self, state, fingerprint):
-        if self.cycle == 2 and (state.get("previous_journal") != binding.RULE_JOURNAL
-                                or state.get("previous_journal_sha256") != self._predecessor_hash(fingerprint)):
-            raise CandidateBlocked("First rule-cycle journal changed; reconcile manually.")
+        if self.cycle > 1:
+            previous, digest = self._predecessor(fingerprint)
+            if (state.get("previous_journal") != self.predecessor.name
+                    or state.get("previous_journal_sha256") != digest
+                    or (self.cycle == 3 and (
+                        previous["proof_sha256"] != state["proof_sha256"]
+                        or not binding._same_reflex_definition(
+                            state["actions"]["enable"]["before"], previous["actions"]["disable"]["target"])))):
+                label = "First" if self.cycle == 2 else "Second"
+                raise CandidateBlocked(f"{label} rule-cycle journal changed; reconcile manually.")
 
     def _state(self, fingerprint):
         state = self._validate_state(
@@ -151,27 +168,35 @@ class NativeRule:
         enabled = action == "enable"
         with _state_lock(self.publisher.root):
             fingerprint = self._binding_hash()
+            expected_before = None
             if enabled:
                 if self.journal.exists():
                     raise CandidateBlocked("Native rule enable was already attempted; never resubmit.")
                 if proof_path is None or not proof_path.is_absolute():
                     raise ValueError("Enable requires an absolute confirmed proof path.")
+                predecessor = self._predecessor(fingerprint) if self.cycle == 3 else None
                 proof_sha = self._verify_proof(proof_path)
                 state = {"binding_sha256": fingerprint, "proof_sha256": proof_sha, "actions": {}}
-                if self.cycle == 2:
-                    state.update(previous_journal=binding.RULE_JOURNAL,
-                                 previous_journal_sha256=self._predecessor_hash(fingerprint))
+                if self.cycle > 1:
+                    if predecessor is None:
+                        predecessor = self._predecessor(fingerprint)
+                    state.update(previous_journal=self.predecessor.name,
+                                 previous_journal_sha256=predecessor[1])
+                    if self.cycle == 3:
+                        if predecessor[0]["proof_sha256"] != proof_sha:
+                            raise CandidateBlocked("Second rule cycle is bound to a different proof.")
+                        expected_before = predecessor[0]["actions"]["disable"]["target"]
             else:
                 state = self._state(fingerprint)
                 if "disable" in state["actions"] or state["actions"]["enable"]["status"] != "confirmed-readback":
                     raise CandidateBlocked("Disable already attempted or enable unconfirmed; reconcile first.")
-            before = self._readback(not enabled)
+            before = (self._readback(not enabled) if expected_before is None
+                      else self._readback(not enabled, expected_before))
             if (not enabled and getattr(self.publisher, "rebound", False)
                     and not binding._same_reflex_definition(before, state["actions"]["enable"]["target"])):
                 raise CandidateBlocked("Complete enabled rule definition changed before disable.")
             if self._binding_hash() != fingerprint:
                 raise CandidateBlocked("Native binding changed before the rule update.")
-            self._assert_predecessor(state, fingerprint)
             record = {"status": "in-flight", "time_utc": binding._utc()}
             if getattr(self.publisher, "rebound", False):
                 target = self._rebound_target(before, enabled)
@@ -187,6 +212,7 @@ class NativeRule:
                         "payload": base64.b64encode(json.dumps(graph).encode("utf-8")).decode("ascii")}
                 body = {"definition": {"parts": [part]}}
             state["actions"][action] = record
+            self._assert_predecessor(state, fingerprint)
             if enabled:
                 binding._create(self.journal, state)
             binding._save(self.journal, state)
@@ -238,7 +264,7 @@ def main(argv=None):
     for arg in ("candidate", "native-config", "previous-config", "state-dir"):
         parser.add_argument("--" + arg, required=True, type=Path)
     parser.add_argument("--proof", type=Path)
-    parser.add_argument("--cycle", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--cycle", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--rebind-spec", type=Path)
     parser.add_argument("--previous-proof", type=Path)
     parser.add_argument("--yes", action="store_true")
@@ -248,8 +274,10 @@ def main(argv=None):
     if (args.mode == "enable") != (args.proof is not None):
         parser.error("--proof is required only for enable")
     if (args.rebind_spec is None) != (args.previous_proof is None) or (
-            args.rebind_spec is not None and args.cycle != 2):
-        parser.error("--rebind-spec and --previous-proof must be supplied together for cycle 2")
+            args.rebind_spec is not None and args.cycle == 1):
+        parser.error("--rebind-spec and --previous-proof must be supplied together for cycle 2 or 3")
+    if args.cycle == 3 and args.rebind_spec is None:
+        parser.error("--cycle 3 requires --rebind-spec and --previous-proof")
     api = FabricControl.from_cli(check.TENANT, timeout=120)
     publisher = binding.NativeBinding(args.state_dir, args.candidate, args.native_config,
                                       args.previous_config, api)

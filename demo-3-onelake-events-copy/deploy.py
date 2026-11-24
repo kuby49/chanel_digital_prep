@@ -191,6 +191,7 @@ def main(argv=None):
                  args.state_dir / "demo3-native-binding-state.json",
                  args.state_dir / "demo3-native-rule-state.json",
                  args.state_dir / "demo3-native-rule-cycle-2-state.json",
+                 args.state_dir / "demo3-native-rule-cycle-3-state.json",
                  args.state_dir / "demo3-native-guard-hc-state.json",
                  args.state_dir / "demo3-native-staging-access-rebind-state.json",
                  args.state_dir / "demo3-native-staging-rebind-state.json",

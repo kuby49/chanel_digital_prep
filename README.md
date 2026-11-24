@@ -27,9 +27,19 @@ pagination and bodyless-request fixes were not published to the old notebook.
 They have been read back in a replacement notebook in the new workspace; its
 pipeline defaults to blocked until its new profile and destination access are
 verified.
+The replacement pipeline's no-sales diagnostic initially failed before an
+activity started. A controlled comparison changing only its activity timeout
+from an expression to a literal completed the parent and notebook; the notebook
+exit nevertheless reported blocked readiness. A separate conditional-storage
+probe passed under the replacement runtime principal. Demo 2's target roles were
+independently verified, and Demo 3's rebound profile passed a point-in-time
+readiness check against the replacement staging Lakehouse and enabled rule.
+These checks do not establish end-to-end sales delivery. The final producer
+bundle uses a literal timeout covering the native run window plus startup.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
-run requires a separately confirmed schedule and updated profile.
-The first-cycle Demo 3 rule was also disabled and read back. A requested
+bounded schedule and updated profile were subsequently confirmed. The
+first-cycle Demo 3 rule was disabled and read back; its second cycle was
+enabled after rebinding the guard to the replacement staging Lakehouse. A requested
 capacity restart was completed after the user accepted interruption of the
 shared capacity, and it was subsequently scaled to F32. The capacity was
 read back Active at F32; the requested live retry remains incomplete.

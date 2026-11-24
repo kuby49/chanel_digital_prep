@@ -264,6 +264,9 @@ def _notebook_definition(api, item_id):
     if status != 200 or not isinstance(document, dict):
         raise CandidateBlocked("Complete notebook definition read was not confirmed.")
     definition = document.get("definition")
+    if not isinstance(definition, dict) or definition.get("format", "ipynb") != "ipynb":
+        raise CandidateBlocked("Notebook definition format differs from the requested ipynb.")
+    definition = {**definition, "format": "ipynb"}
     _notebook_parts(definition)
     return definition
 

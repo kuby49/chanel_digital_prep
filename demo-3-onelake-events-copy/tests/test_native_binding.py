@@ -331,6 +331,21 @@ class NativeBindingTests(unittest.TestCase):
         self.assertEqual([calls[1].args[1], calls[2].args[1]], [location, location + "/result"])
         self.assertTrue(all(call.kwargs["skill"] == "activator-cli" for call in calls))
 
+    def test_notebook_definition_accepts_absent_format_from_ipynb_read(self):
+        part = lambda name, value: {"path": name, "payloadType": "InlineBase64",
+                                    "payload": base64.b64encode(json.dumps(value).encode()).decode()}
+        definition = {"parts": [part("notebook-content.ipynb", self.binding.notebook),
+                                part(".platform", {"metadata": {"type": "Notebook"}})]}
+        self.api.request.return_value = (200, {}, {"definition": definition})
+        actual = native_binding._notebook_definition(self.api, check.NOTEBOOK)
+        self.assertEqual(actual, {**definition, "format": "ipynb"})
+        self.assertEqual(self.api.request.call_args.args[1],
+                         native_binding._BASE + "/items/" + check.NOTEBOOK + "/getDefinition?format=ipynb")
+        self.assertEqual(self.api.request.call_args.kwargs["skill"], "spark-cli")
+        self.api.request.return_value = (200, {}, {"definition": {**definition, "format": "other"}})
+        with self.assertRaisesRegex(CandidateBlocked, "format differs"):
+            native_binding._notebook_definition(self.api, check.NOTEBOOK)
+
     def test_changed_predecessor_cannot_be_accepted_on_new_process(self):
         self.write(check.JOURNAL, {"runtime_stop": "different", "actions": {}})
         with self.assertRaisesRegex(ValueError, "predecessor chain"):

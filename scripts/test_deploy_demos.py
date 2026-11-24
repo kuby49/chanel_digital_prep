@@ -157,6 +157,37 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(set(summary["phases"]["deploy"]), {"demo-1", "demo-3", "shared"})
         self.assertEqual({event["mode"] for event in events}, {"deploy"})
 
+    def test_demo2_owned_scope_is_used_for_candidates_and_monitor(self):
+        owned = self.root / "demo2-owned"
+        owned.mkdir()
+        self.config["demo-2"] = {
+            "deployment_prefix": "demo2synthetic-123456abcdef",
+            "deployment_state_dir": str(owned),
+        }
+        code, summary, events = self.run_cli("demo-2,demo-3", "--deploy", "--run-data")
+        self.assertEqual(code, 0, summary)
+        demo2_events = [event for event in events if event["track"] == "demo-2"]
+        self.assertTrue(any(event["mode"] == "resolve-target-candidate" for event in demo2_events))
+        self.assertTrue(any(event["mode"] == "wait-monitor" for event in demo2_events))
+        self.assertTrue(all(event["state_dir"] == str(owned) and
+                            event["argument_prefix"] == "demo2synthetic-123456abcdef"
+                            for event in demo2_events))
+        self.assertTrue(all(event["state_dir"] != str(owned) and event["argument_prefix"] == "chanel"
+                            for event in events if event["track"] != "demo-2"))
+
+    def test_demo2_scope_requires_both_valid_fields_and_existing_absolute_directory(self):
+        for settings in ({"deployment_prefix": "owned"},
+                         {"deployment_state_dir": str(self.root)},
+                         {"deployment_prefix": "owned", "deployment_state_dir": "relative"},
+                         {"deployment_prefix": "../unsafe", "deployment_state_dir": str(self.root)},
+                         {"deployment_prefix": "owned", "deployment_state_dir": str(self.root / "missing")}):
+            with self.subTest(settings=settings):
+                self.config["demo-2"] = settings
+                code, summary, events = self.run_cli("demo-2", "--deploy")
+                self.assertEqual(code, 2)
+                self.assertIsNone(summary)
+                self.assertEqual(events, [])
+
     def test_reruns_reuse_durable_state_but_not_results(self):
         code, _, first = self.run_cli("demo-1", "--deploy")
         self.assertEqual(code, 0)

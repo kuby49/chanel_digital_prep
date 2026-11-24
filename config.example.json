@@ -42,6 +42,8 @@
   },
   "demo-2": {
     "workspace_name": "{prefix}-demo2-eventhouse",
+    "deployment_prefix": null,
+    "deployment_state_dir": null,
     "workspace_id": null,
     "lakehouse_name": null,
     "lakehouse_id": null,

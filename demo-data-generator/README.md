@@ -176,6 +176,31 @@ ambiguous creation. `validate-only` performs readbacks but still reports
 blocked while readiness is incomplete. `cleanup` and `run-data` are blocked;
 the notebook independently refuses `run-data`. No measured run is enabled.
 
+`job_lifecycle.py` contains local, not yet integrated, no-sales preflight
+pipeline job primitives. They persist submission intent before POST and the
+returned pipeline job identity before polling; ambiguous submissions are never
+repeated. Cancellation is journaled before requesting it and targets only
+that recorded job. A process-released lock serializes operations for one run;
+the journal survives launcher failure. Pipeline terminal status **does not**
+prove notebook child termination or reconcile in-flight deliveries. The
+primitives cannot submit `run-data`, do not provide the orchestrator's
+`producer-status` or `stop-producer` modes, and do not establish readiness.
+Windows power-loss durability is not established.
+
+The experimental notebook preflight accepts `runtime_evidence_json` separately
+from `run_config_json`, so its `effective_config_sha256` covers the latter's
+complete canonical JSON without including the probe nonce. It emits only
+runtime observations in its notebook exit value and always reports `blocked`.
+The observed job and caller-supplied definition and resource identities are
+not independently authenticated, and neither queue access nor effective
+ingestion authorization is proven. The updated notebook and pipeline
+definitions have not been deployed or verified in Fabric.
+
+The effective configuration may carry selected-only `shared.target_bindings`
+entries of `{workspace_id, item_id, fact}`. These are candidate bindings,
+not evidence of target ownership, permissions, allocator safety or monitor
+liveness. Fresh authoritative checks remain necessary before execution.
+
 For a fresh deployment, `deploy.py --mode resolve-candidate-ids` accepts the
 normal v1 arguments, reads and validates the owned `shared-producer-v1.json`
 journal under its lock, and atomically creates

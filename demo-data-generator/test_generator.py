@@ -147,9 +147,9 @@ class GeneratorTests(unittest.TestCase):
         for cell in notebook["cells"]:
             compile("".join(cell["source"]), "notebook", "exec")
         self.assertEqual(set(pipeline["properties"]["parameters"]),
-                         {"operation", "probe_id", "run_config_json", "selected_demos_json"})
+                         {"operation", "probe_id", "runtime_evidence_json", "run_config_json", "selected_demos_json"})
         self.assertEqual(set(pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]),
-                         {"operation", "probe_id", "run_config_json", "selected_demos_json"})
+                         {"operation", "probe_id", "runtime_evidence_json", "run_config_json", "selected_demos_json"})
 
     def test_deployment_assets_bind_actual_workspace_and_lakehouse(self):
         workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -218,7 +218,7 @@ class GeneratorTests(unittest.TestCase):
         )
         scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
                  "notebookutils": utils, "operation": "preflight", "probe_id": "probe-1",
-                 "run_config_json": '{"probe_marker":"unique"}', "selected_demos_json": "[]"}
+                 "runtime_evidence_json": "{}", "run_config_json": '{"probe_marker":"unique"}', "selected_demos_json": "[]"}
         exec("".join(notebook["cells"][1]["source"]), scope)
         stored = files["Files/preflight/probe-1.json"]
         self.assertNotIn(token, stored)
@@ -242,6 +242,130 @@ class GeneratorTests(unittest.TestCase):
         evidence = json.loads(files["Files/preflight/probe-missing-sdk.json"])
         self.assertFalse(evidence["kusto_sdk_available"])
         self.assertEqual(evidence["kusto_principal_oid"], "test-object")
+
+    def test_runtime_evidence_is_job_bound_blocked_and_token_free(self):
+        from test_fabric_ledger import MemoryStore
+
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        lakehouse = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        notebook_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        tenant = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        identity = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        other = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        claims = {"oid": identity, "tid": tenant}
+        token = "header." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".signature"
+        mismatch = "header." + base64.urlsafe_b64encode(json.dumps(dict(claims, oid=other)).encode()).decode().rstrip("=") + ".signature"
+        producer = {"workspace_id": workspace, "staging_lakehouse_id": lakehouse,
+                    "notebook_id": notebook_id, "environment_id": other, "definition_sha256": "a" * 64}
+        target = {"workspace_id": workspace, "item_id": other, "database": "Sales",
+                  "fact": "FactSales", "mapping": "SalesCsvV1",
+                  "query_service_uri": "https://query.kusto.fabric.microsoft.com",
+                  "ingestion_service_uri": "https://ingest.kusto.fabric.microsoft.com"}
+        request = {"nonce": "0123456789abcdef", "run_id": "run-1", "tenant_id": tenant,
+                   "identity_id": identity, "producer": producer, "demo-2": target}
+        config = {"arbitrary_config": "private-value-é"}
+        captured = []
+        token_by_audience = {"pbi": token, "storage": token, "kusto": token}
+        utils = SimpleNamespace(
+            runtime=SimpleNamespace(context={"isForPipeline": True, "currentWorkspaceId": workspace,
+                                             "defaultLakehouseId": lakehouse, "currentNotebookId": notebook_id,
+                                             "currentRunId": other}),
+            credentials=SimpleNamespace(getToken=lambda audience: token_by_audience[audience]),
+            notebook=SimpleNamespace(exit=captured.append))
+        scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
+                 "notebookutils": utils, "operation": "preflight", "probe_id": "probe-1",
+                 "runtime_evidence_json": json.dumps(request),
+                 "run_config_json": json.dumps(config), "selected_demos_json": '["demo-3","demo-2","demo-1"]'}
+
+        queries = []
+        class FakeClient:
+            def __init__(self, connection):
+                pass
+
+            def execute_query(self, database, query):
+                queries.append((database, query))
+                return SimpleNamespace(primary_results=[[{"ProducerRuntimeProbe": 1}]])
+
+            def execute_mgmt(self, database, query):
+                return SimpleNamespace(primary_results=[[{"metadata": "available"}]])
+
+        fake_data = SimpleNamespace(KustoClient=FakeClient,
+                                    KustoConnectionStringBuilder=SimpleNamespace(with_token_provider=lambda *args: None))
+        store = MemoryStore()
+        with patch.dict(sys.modules, {"azure": SimpleNamespace(), "azure.kusto": SimpleNamespace(),
+                                     "azure.kusto.data": fake_data}), patch("fabric_storage.OneLakeStore", return_value=store):
+            exec("".join(notebook["cells"][1]["source"]), scope)
+            token_by_audience["kusto"] = mismatch
+            utils.runtime.context["currentRunId"] = "do-not-emit-secret"
+            scope["selected_demos_json"] = '["demo-1","demo-3","demo-2"]'
+            exec("".join(notebook["cells"][1]["source"]), scope)
+        class UnguardedStore(MemoryStore):
+            def replace(self, path, value, etag):
+                return super().replace(path, value, self.files[path][1])
+
+        token_by_audience["kusto"] = token
+        utils.runtime.context["currentRunId"] = other
+        with patch.dict(sys.modules, {"azure": SimpleNamespace(), "azure.kusto": SimpleNamespace(),
+                                     "azure.kusto.data": fake_data}), patch("fabric_storage.OneLakeStore", return_value=UnguardedStore()):
+            exec("".join(notebook["cells"][1]["source"]), scope)
+        first, second, third = map(json.loads, captured)
+        self.assertEqual(len(queries), 2)
+        self.assertNotIn(token, captured[0])
+        self.assertNotIn("private-value", captured[0])
+        self.assertNotIn("do-not-emit-secret", captured[1])
+        self.assertEqual(first["status"], "blocked")
+        self.assertIsNone(first["producer"]["job_id"])
+        self.assertEqual(first["producer"]["observed_run_id"], other)
+        self.assertEqual(first["selected_demos"], ["demo-1", "demo-2", "demo-3"])
+        self.assertEqual(second["selected_demos"], first["selected_demos"])
+        self.assertEqual(second["effective_config_sha256"], first["effective_config_sha256"])
+        self.assertEqual(first["effective_config_sha256"],
+                         hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                                   allow_nan=False).encode()).hexdigest())
+        self.assertGreater(datetime.fromisoformat(first["expires_at_utc"]),
+                           datetime.fromisoformat(first["issued_at_utc"]))
+        checks = first["targets"]["demo-2"]["checks"]
+        self.assertEqual(next(x for x in checks if x["capability"] == "conditional-storage")["result"], "passed")
+        self.assertEqual(next(x for x in checks if x["capability"] == "effective-ingestion-authorization")["result"], "unverified")
+        self.assertEqual(store.files, {})
+        checks = second["targets"]["demo-2"]["checks"]
+        self.assertEqual(next(x for x in checks if x["capability"] == "runtime-binding")["result"], "failed")
+        self.assertEqual(next(x for x in checks if x["capability"] == "token-identity" and x["resource"] == "kusto")["result"], "failed")
+        self.assertEqual(next(x for x in third["targets"]["demo-2"]["checks"]
+                              if x["capability"] == "conditional-storage")["result"], "failed")
+
+    def test_runtime_evidence_rejects_untrusted_target_and_missing_nonce(self):
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        request = {"nonce": "0123456789abcdef", "run_id": "run-1", "tenant_id": identifier,
+                   "identity_id": identifier,
+                   "producer": {"workspace_id": identifier, "staging_lakehouse_id": identifier,
+                                "notebook_id": identifier, "environment_id": identifier, "definition_sha256": "a" * 64},
+                   "demo-2": {"workspace_id": identifier, "item_id": identifier, "database": "Sales",
+                              "fact": "FactSales", "mapping": "SalesCsvV1",
+                              "query_service_uri": "https://query.kusto.fabric.microsoft.com",
+                              "ingestion_service_uri": "https://ingest.kusto.fabric.microsoft.com"}}
+        scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
+                 "operation": "preflight", "probe_id": "probe-1", "selected_demos_json": '["demo-2"]',
+                 "runtime_evidence_json": json.dumps(request), "run_config_json": "{}"}
+        for field in ("query_service_uri", "ingestion_service_uri"):
+            original = request["demo-2"][field]
+            for endpoint in ("https://attacker.example",
+                             "https://query.kusto.fabric.microsoft.com.attacker.example",
+                             "https://user:password@query.kusto.fabric.microsoft.com",
+                             "https://query.kusto.fabric.microsoft.com:443",
+                             "https://query.kusto.fabric.microsoft.com/path",
+                             "https://query.kusto.fabric.microsoft.com/?token=secret"):
+                request["demo-2"][field] = endpoint
+                scope["runtime_evidence_json"] = json.dumps(request)
+                with self.subTest(field=field, endpoint=endpoint), self.assertRaisesRegex(ValueError, "Fabric Kusto"):
+                    exec("".join(notebook["cells"][1]["source"]), scope)
+            request["demo-2"][field] = original
+        request["nonce"] = ""
+        scope["runtime_evidence_json"] = json.dumps(request)
+        with self.assertRaisesRegex(ValueError, "nonce"):
+            exec("".join(notebook["cells"][1]["source"]), scope)
 
     def test_preflight_exercises_conditional_storage_and_removes_sentinel(self):
         from test_fabric_ledger import MemoryStore
@@ -273,7 +397,7 @@ class GeneratorTests(unittest.TestCase):
         )
         scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
                  "notebookutils": utils, "operation": "preflight", "probe_id": "storage-probe",
-                 "run_config_json": '{"probe_storage":true}', "selected_demos_json": "[]"}
+                 "runtime_evidence_json": "{}", "run_config_json": '{"probe_storage":true}', "selected_demos_json": "[]"}
         store = MemoryStore()
         with patch("fabric_storage.OneLakeStore", return_value=store):
             exec("".join(notebook["cells"][1]["source"]), scope)
@@ -338,7 +462,7 @@ class GeneratorTests(unittest.TestCase):
                   "destination_access_probe": {"workspace_id": workspace, "lakehouse_id": lakehouse}}
         scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
                  "notebookutils": utils, "operation": "preflight", "probe_id": "probe-2",
-                 "run_config_json": json.dumps(config), "selected_demos_json": "[]"}
+                 "runtime_evidence_json": "{}", "run_config_json": json.dumps(config), "selected_demos_json": "[]"}
         exec("".join(notebook["cells"][1]["source"]), scope)
         evidence = json.loads(files["Files/preflight/probe-2.json"])
         self.assertNotIn(token, json.dumps(evidence))

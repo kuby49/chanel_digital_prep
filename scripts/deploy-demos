@@ -139,7 +139,8 @@ def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout,
             "--prefix", prefix, "--state-dir", str(state_dir), "--result", str(result_path)]
     if yes:
         args.append("--yes")
-    if mode in {"run-data", "start-monitor", "monitor-status", "wait-monitor", "stop-monitor"}:
+    if (mode in {"run-data", "start-monitor", "monitor-status", "wait-monitor", "stop-monitor"}
+            or track == "shared" and mode == "validate-only"):
         args += ["--selected-demos", ",".join(selected)]
     try:
         with log_path.open("w", encoding="utf-8") as log:

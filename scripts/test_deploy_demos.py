@@ -491,6 +491,19 @@ class OrchestrationTests(unittest.TestCase):
                             for event in validations))
         self.assertNotIn("start-monitor", [event["mode"] for event in events])
 
+    def test_selected_demos_reach_shared_validation_only(self):
+        for mode in (("--validate-only",), ("--deploy", "--run-data")):
+            with self.subTest(mode=mode):
+                code, _, events = self.run_cli("demo-3,demo-1", *mode)
+                self.assertEqual(code, 0)
+                validations = [event for event in events if event["mode"] == "validate-only"]
+                shared = next(event for event in validations if event["track"] == "shared")
+                self.assertEqual(shared["selected"], "demo-3,demo-1")
+                self.assertEqual(shared["shared"]["target_bindings"],
+                                 {name: TARGETS[name] for name in ("demo-3", "demo-1")})
+                self.assertTrue(all(event["selected"] is None for event in validations
+                                    if event["track"] != "shared"))
+
     def test_validate_only_resolution_failure_reports_other_track_results_but_fails(self):
         self.config["shared"]["workspace_id"] = None
         self.config["behavior"] = {"shared:resolve-candidate-ids": {"status": "blocked", "ready": False}}
@@ -499,6 +512,8 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(summary["phases"]["resolve-candidate-ids"]["shared"]["status"], "blocked")
         self.assertEqual(set(summary["phases"]["validate-only"]), {"demo-1", "shared"})
         self.assertEqual({event["mode"] for event in events}, {"resolve-candidate-ids", "validate-only"})
+        self.assertEqual(next(event["selected"] for event in events
+                              if event["track"] == "shared" and event["mode"] == "validate-only"), "demo-1")
 
     def test_failed_monitor_start_attempts_stop_and_blocks_producer(self):
         self.config["behavior"] = {"demo-2:start-monitor": {"status": "blocked", "ready": False}}

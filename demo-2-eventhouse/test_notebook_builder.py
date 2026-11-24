@@ -1,5 +1,6 @@
 import ast
 import base64
+import hashlib
 import json
 import sys
 import tempfile
@@ -72,7 +73,14 @@ class NotebookBuilderTests(unittest.TestCase):
         self.assertIsNone(json.loads(data_json)["run_id"])
         self.assertEqual(first_data["run_id"], "candidate_run")
         runtime = "".join(first["cells"][1]["source"])
-        self.assertIn("measured_batches(json.loads(MANIFEST_JSON))", runtime)
+        self.assertIn("measured_batches(manifest)", runtime)
+
+    def test_generator_binding_normalizes_only_line_endings(self):
+        self.generator.write_bytes(b"first = 1\r\nsecond = 2\rthird = 3\n")
+        runtime = "".join(build_notebook(self.generator, **self.options)["cells"][1]["source"])
+        normalized = b"first = 1\nsecond = 2\nthird = 3\n"
+        self.assertIn(base64.b64encode(normalized).decode("ascii"), runtime)
+        self.assertIn(f"GENERATOR_SHA256 = '{hashlib.sha256(normalized).hexdigest()}'", runtime)
 
     def test_reused_verifier_uses_each_current_manifest_not_prior_run(self):
         notebook = build_notebook(
@@ -80,16 +88,19 @@ class NotebookBuilderTests(unittest.TestCase):
         )
         runtime = "".join(notebook["cells"][1]["source"])
         setup, execution = runtime.split('if MODE == "preload":\n', 1)
-        for run_id in ("candidate_run", "fresh_run"):
+        generator_digest = hashlib.sha256(
+            self.generator.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+        for index, run_id in enumerate(("candidate_run", "fresh_run")):
             batch_id = f"{run_id}_0001"
             batch = {
-                "batch_id": batch_id, "batch_class": "measured", "sha256": "a" * 64,
+                "batch_id": batch_id, "batch_number": 1, "batch_class": "measured", "sha256": "a" * 64,
                 "row_count": 1, "sales_amount_minor_units": 5,
                 "amount_by_date": {"2026-01-01": 5},
                 "amount_by_product_category": {"Beauty": 5},
                 "amount_by_customer_region": {"Europe": 5},
             }
-            results, verified = [], []
+            results, verified, reservations = [], [], []
             scope = {
                 "spark": types.SimpleNamespace(conf=types.SimpleNamespace(set=lambda *_: None)),
                 "notebookutils": types.SimpleNamespace(
@@ -100,16 +111,28 @@ class NotebookBuilderTests(unittest.TestCase):
                 exec("".join(notebook["cells"][0]["source"]), scope)
                 scope["MODE"] = "verify_run_keys"
                 scope["MANIFEST_JSON"] = json.dumps({
-                    "contract_version": 1,
+                    "contract_version": 1, "run_id": run_id,
+                    "sales_line_id_reservation": {
+                        "version": 1, "allocator_id": "a" * 64, "run_id": run_id,
+                        "batch_class": "measured", "start": str(100 + index),
+                        "end": str(100 + index), "count": "1",
+                        "generator_sha256": generator_digest, "fingerprint": str(index + 1) * 64,
+                    },
                     "batches": {"1": batch, "bootstrap": {
                         "batch_id": "bootstrap_0001", "batch_class": "bootstrap",
                     }},
                 })
                 exec(setup, scope)
                 scope["verify_dimensions"] = lambda _spark, data, *_args: self.assertIsNone(data["run_id"])
-                scope["verify_run_keys"] = lambda _spark, batches, *_args: verified.extend(batches)
+                def verify_keys(_spark, batches, *_args, reservation):
+                    verified.extend(batches)
+                    reservations.append(reservation)
+
+                scope["verify_run_keys"] = verify_keys
                 exec('if MODE == "preload":\n' + execution, scope)
             self.assertEqual([item["batch_id"] for item in verified], [batch_id])
+            self.assertEqual(reservations[0]["run_id"], run_id)
+            self.assertEqual(reservations[0]["start"], str(100 + index))
             self.assertEqual(results, [{
                 "mode": "verify_run_keys", "status": "verified", "batch_ids": [batch_id],
                 "row_count": 1, "sales_amount_minor_units": 5,

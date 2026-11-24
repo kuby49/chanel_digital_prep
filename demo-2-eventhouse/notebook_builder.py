@@ -1,6 +1,7 @@
 """Package the Demo 2 verification notebook with its checked-in dependencies."""
 
 import base64
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -61,10 +62,14 @@ def build_notebook(
     )
     poll_interval_seconds = _positive_integer(poll_interval_seconds, "poll_interval_seconds")
 
+    generator_source = (
+        Path(generator_path).read_bytes().decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    )
+    generator_sha256 = hashlib.sha256(generator_source.encode("utf-8")).hexdigest()
     sources = {
         "eventhouse_core": (_HERE / "eventhouse_core.py").read_text(encoding="utf-8"),
         "lakehouse_validation": (_HERE / "lakehouse_validation.py").read_text(encoding="utf-8"),
-        "chanel_generator": Path(generator_path).read_text(encoding="utf-8"),
+        "chanel_generator": generator_source,
     }
     encoded = {
         name: base64.b64encode(source.encode("utf-8")).decode("ascii")
@@ -98,11 +103,12 @@ for name, payload in {encoded!r}.items():
 
 import chanel_generator as generator
 from lakehouse_validation import (
-    measured_batches, preload_dimensions, verify_batch_with_timeout,
+    measured_batches, measured_reservation, preload_dimensions, verify_batch_with_timeout,
     verify_dimensions, verify_run_keys,
 )
 
 spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")
+GENERATOR_SHA256 = {generator_sha256!r}
 if type(VERIFICATION_TIMEOUT_SECONDS) is not int or VERIFICATION_TIMEOUT_SECONDS <= 0:
     raise ValueError("VERIFICATION_TIMEOUT_SECONDS must be a positive integer")
 if type(POLL_INTERVAL_SECONDS) is not int or POLL_INTERVAL_SECONDS <= 0:
@@ -124,8 +130,10 @@ elif MODE == "verify_batch":
     result = {{"mode": MODE, "status": "verified", "batch": verify_batch(json.loads(BATCH_JSON))}}
 elif MODE == "verify_run_keys":
     verify_dimensions(spark, data, generator, LAKEHOUSE_NAME, schema)
-    batches = measured_batches(json.loads(MANIFEST_JSON))
-    verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema)
+    manifest = json.loads(MANIFEST_JSON)
+    batches = measured_batches(manifest)
+    reservation = measured_reservation(manifest, batches, GENERATOR_SHA256)
+    verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema, reservation=reservation)
     result = {{
         "mode": MODE, "status": "verified",
         "batch_ids": sorted(batch["batch_id"] for batch in batches),
@@ -134,9 +142,11 @@ elif MODE == "verify_run_keys":
     }}
 elif MODE == "verify_run":
     verify_dimensions(spark, data, generator, LAKEHOUSE_NAME, schema)
-    batches = measured_batches(json.loads(MANIFEST_JSON))
+    manifest = json.loads(MANIFEST_JSON)
+    batches = measured_batches(manifest)
+    reservation = measured_reservation(manifest, batches, GENERATOR_SHA256)
     results = [verify_batch(batch) for batch in batches]
-    verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema)
+    verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema, reservation=reservation)
     result = {{"mode": MODE, "status": "verified", "batches": results}}
 else:
     raise ValueError("Unsupported Demo 2 notebook mode")

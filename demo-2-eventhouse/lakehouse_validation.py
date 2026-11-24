@@ -158,6 +158,68 @@ def measured_batches(manifest):
     return measured
 
 
+def reservation_bounds(reservation):
+    if not isinstance(reservation, dict):
+        raise VerificationError("A sales-line reservation is required")
+    values = []
+    for field in ("start", "end", "count"):
+        value = reservation.get(field)
+        pattern = r"[1-9][0-9]*" if field == "count" else r"(?:0|-?[1-9][0-9]*)"
+        if (
+            not isinstance(value, str)
+            or len(value.lstrip("-")) > 20
+            or not re.fullmatch(pattern, value)
+        ):
+            raise VerificationError(f"Reservation {field} must be a canonical decimal string")
+        values.append(int(value))
+    start, end, count = values
+    if not -(2**63) <= start <= end < 2**63 or end - start + 1 != count:
+        raise VerificationError("Reservation range is not a valid inclusive BIGINT range")
+    return start, end, count
+
+
+def _validate_reservation_batches(reservation, batches):
+    if (
+        not isinstance(reservation, dict)
+        or type(reservation.get("version")) is not int
+        or reservation["version"] != 1
+        or reservation.get("batch_class") != "measured"
+        or not isinstance(reservation.get("run_id"), str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", reservation["run_id"])
+    ):
+        raise VerificationError("Measured reservation identity is invalid")
+    for batch in batches:
+        number = batch.get("batch_number") if isinstance(batch, dict) else None
+        if (
+            type(number) is not int
+            or number < 1
+            or batch.get("batch_id") != f"{reservation['run_id']}_{number:04d}"
+        ):
+            raise VerificationError("Measured batch identity does not match the reserved run")
+
+
+def measured_reservation(manifest, batches, generator_sha256):
+    reservation = manifest.get("sales_line_id_reservation") if isinstance(manifest, dict) else None
+    _validate_reservation_batches(reservation, batches)
+    if (
+        not isinstance(manifest.get("run_id"), str)
+        or reservation["run_id"] != manifest["run_id"]
+        or not isinstance(generator_sha256, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", generator_sha256)
+        or reservation.get("generator_sha256") != generator_sha256
+        or any(
+            not isinstance(reservation.get(field), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", reservation[field])
+            for field in ("allocator_id", "fingerprint")
+        )
+    ):
+        raise VerificationError("Measured reservation does not match the run and packaged generator")
+    _, _, count = reservation_bounds(reservation)
+    if count != sum(batch["row_count"] for batch in batches):
+        raise VerificationError("Reservation count does not match the measured run")
+    return reservation
+
+
 def _grouped_amounts(frame, column):
     from pyspark.sql import functions as F
 
@@ -266,18 +328,22 @@ def verify_batch_with_timeout(
             sleep(min(poll_interval_seconds, remaining))
 
 
-def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None):
+def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None, *, reservation):
     if not batches or any(
         not isinstance(batch, dict) or batch.get("batch_class") != "measured"
         for batch in batches
     ):
         raise VerificationError("Run key verification accepts measured batches only")
+    _validate_reservation_batches(reservation, batches)
     from pyspark.sql import functions as F
 
     all_facts = spark.table(_table_name(lakehouse, shortcut, schema))
     batch_ids = [batch["batch_id"] for batch in batches]
     facts = all_facts.where(F.col("BatchID").isin(batch_ids))
     expected = sum(batch["row_count"] for batch in batches)
+    start, end, count = reservation_bounds(reservation)
+    if count != expected:
+        raise VerificationError("Reservation count does not match the measured run")
     keys = facts.select("SalesLineID")
     if (
         facts.count() != expected
@@ -285,6 +351,10 @@ def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None):
         or keys.distinct().count() != expected
     ):
         raise VerificationError("Measured run has missing or duplicate sales-line keys")
+    if facts.where(
+        (F.col("SalesLineID") < F.lit(start)) | (F.col("SalesLineID") > F.lit(end))
+    ).limit(1).count():
+        raise VerificationError("Measured run has sales-line keys outside its reserved range")
     other_keys = all_facts.where(
         F.col("BatchID").isNull() | ~F.col("BatchID").isin(batch_ids)
     ).select("SalesLineID")

@@ -83,6 +83,11 @@ class SparkVerificationTests(unittest.TestCase):
             ))
         cls.facts = cls.spark.createDataFrame(rows, schema).cache()
         cls.facts.count()
+        cls.reservation = {
+            "version": 1, "run_id": config.run_id, "batch_class": "measured",
+            "start": str(min(row[0] for row in rows)), "end": str(max(row[0] for row in rows)),
+            "count": str(len(rows)),
+        }
         cls.dimensions = {
             name: frame.cache()
             for name, frame in _dimension_frames(cls.spark, cls.data, cls.generator).items()
@@ -108,7 +113,10 @@ class SparkVerificationTests(unittest.TestCase):
         )
         self.assertEqual(result["row_count"], self.batch["row_count"])
         self.assertEqual(result["sales_amount_minor_units"], self.batch["sales_amount_minor_units"])
-        verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
+        verify_run_keys(
+            self.spark, [self.batch], "global_temp", "EventhouseFactSales",
+            reservation=self.reservation,
+        )
 
     def test_incomplete_or_duplicate_facts_do_not_pass(self):
         self.facts.limit(1).createOrReplaceGlobalTempView("EventhouseFactSales")
@@ -128,20 +136,48 @@ class SparkVerificationTests(unittest.TestCase):
             "SalesLineID", F.col("SalesLineID") + 2000000
         )
         self.facts.union(bootstrap).union(other_run).createOrReplaceGlobalTempView("EventhouseFactSales")
-        verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
+        verify_run_keys(
+            self.spark, [self.batch], "global_temp", "EventhouseFactSales",
+            reservation=self.reservation,
+        )
 
         collision = self.facts.withColumn("BatchID", F.lit("other_run_0002"))
         self.facts.union(bootstrap).union(collision).createOrReplaceGlobalTempView("EventhouseFactSales")
         with self.assertRaisesRegex(VerificationError, "another batch or run"):
-            verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
+            verify_run_keys(
+                self.spark, [self.batch], "global_temp", "EventhouseFactSales",
+                reservation=self.reservation,
+            )
 
-        second = dict(self.batch, batch_id="spark_contract_0002")
+        second = dict(self.batch, batch_id="spark_contract_0002", batch_number=2)
         duplicate = self.facts.withColumn("BatchID", F.lit(second["batch_id"]))
         self.facts.union(bootstrap).union(other_run).union(duplicate).createOrReplaceGlobalTempView(
             "EventhouseFactSales"
         )
         with self.assertRaises(VerificationError):
-            verify_run_keys(self.spark, [self.batch, second], "global_temp", "EventhouseFactSales")
+            verify_run_keys(
+                self.spark, [self.batch, second], "global_temp", "EventhouseFactSales",
+                reservation={
+                    "version": 1, "run_id": self.reservation["run_id"], "batch_class": "measured",
+                    "start": self.reservation["start"],
+                    "end": str(int(self.reservation["start"]) + 2 * self.batch["row_count"] - 1),
+                    "count": str(2 * self.batch["row_count"]),
+                },
+            )
+
+    def test_run_keys_reject_distinct_facts_outside_the_reserved_range(self):
+        from pyspark.sql import functions as F
+
+        self.facts.withColumn(
+            "SalesLineID",
+            F.when(F.col("SalesLineID") == int(self.reservation["start"]),
+                   F.lit(int(self.reservation["end"]) + 1)).otherwise(F.col("SalesLineID")),
+        ).createOrReplaceGlobalTempView("EventhouseFactSales")
+        with self.assertRaisesRegex(VerificationError, "outside its reserved range"):
+            verify_run_keys(
+                self.spark, [self.batch], "global_temp", "EventhouseFactSales",
+                reservation=self.reservation,
+            )
 
     def test_orphaned_dimension_is_rejected(self):
         from pyspark.sql import functions as F

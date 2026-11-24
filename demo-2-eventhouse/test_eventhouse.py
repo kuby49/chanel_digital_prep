@@ -19,7 +19,8 @@ from eventhouse_core import (
 )
 from ingestion import EventhouseAdapter
 from lakehouse_validation import (
-    NotVisible, VerificationError, measured_batches, verify_batch_with_timeout, verify_run_keys,
+    NotVisible, VerificationError, measured_batches, measured_reservation, reservation_bounds,
+    verify_batch_with_timeout, verify_run_keys,
 )
 
 
@@ -297,7 +298,45 @@ class ManifestTests(unittest.TestCase):
 
     def test_run_key_verification_rejects_non_measured_batches(self):
         with self.assertRaises(VerificationError):
-            verify_run_keys(None, [self.batch(batch_class="bootstrap")], "Lakehouse", "Facts")
+            verify_run_keys(
+                None, [self.batch(batch_class="bootstrap")], "Lakehouse", "Facts", reservation={}
+            )
+
+    def test_reservation_requires_canonical_inclusive_bigint_range(self):
+        self.assertEqual(reservation_bounds({"start": "-1", "end": "1", "count": "3"}), (-1, 1, 3))
+        invalid = (
+            {"start": "01", "end": "1", "count": "1"},
+            {"start": "-0", "end": "1", "count": "2"},
+            {"start": 1, "end": "1", "count": "1"},
+            {"start": "1", "end": "1", "count": "01"},
+            {"start": "1", "end": "2", "count": "1"},
+            {"start": "2", "end": "1", "count": "1"},
+            {"start": "1", "end": str(2**63), "count": str(2**63)},
+            {"start": "9" * 5000, "end": "9" * 5000, "count": "1"},
+        )
+        for reservation in invalid:
+            with self.subTest(reservation=reservation), self.assertRaises(VerificationError):
+                reservation_bounds(reservation)
+
+    def test_measured_reservation_binds_run_generator_and_count(self):
+        batch = {**self.batch(), "batch_number": 1}
+        reservation = {
+            "version": 1, "allocator_id": "a" * 64, "run_id": "run",
+            "batch_class": "measured", "start": "10", "end": "10", "count": "1",
+            "generator_sha256": "b" * 64, "fingerprint": "c" * 64,
+        }
+        manifest = {"run_id": "run", "sales_line_id_reservation": reservation}
+        self.assertEqual(measured_reservation(manifest, [batch], "b" * 64), reservation)
+        for changes in (
+            {"run_id": "another_run"}, {"batch_class": "bootstrap"},
+            {"generator_sha256": "d" * 64}, {"fingerprint": "invalid"},
+            {"start": "10", "end": "11", "count": "2"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(VerificationError):
+                measured_reservation(
+                    {**manifest, "sales_line_id_reservation": {**reservation, **changes}},
+                    [batch], "b" * 64,
+                )
 
     def test_shared_generator_csv_and_manifest_contract(self):
         default = Path(__file__).resolve().parent.parent / "demo-data-generator" / "generator.py"

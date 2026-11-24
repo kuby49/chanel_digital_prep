@@ -78,10 +78,12 @@ python demo-2-eventhouse\deploy.py --mode validate-only --config C:\demo\config.
 
 Deployment must report `blocked`, not ready, if an artifact, permission,
 dimension, ingestion path, policy, shortcut, or runtime check is unverified.
-The current CLI always blocks deployment readiness until a fresh,
-authoritative producer-runtime identity and permission probe is integrated.
-Monitor readiness also remains blocked until that proof is bound to the
-verified artifacts, dimensions and effective configuration.
+For explicitly reused synthetic targets, readiness checks the Azure CLI
+tokens against the configured producer principal, its direct workspace write
+role, and Kusto query access. The producer notebook must independently recheck
+its actual runtime identity, role, target and queue access before staging; a
+CLI check does not claim that runtime has already executed. Other monitor
+targets remain blocked without a complete readiness binding.
 The manually created MCAP workspace also lacks the CLI's ownership ledger and
 markers; it is not automatically adopted.
 `resolve-target-candidate` holds the deployment ledger lock while reading the
@@ -232,13 +234,21 @@ coordinated window and other dimension writers stopped:
    `check-dimension-gaps` is the read-only alternative. No existing row is
    updated. If a maintenance outcome is uncertain or failed, reconcile its
    exact journaled job and dimensions before attempting another write.
+3. Supply a complete existing `demo-2.verification_batch` and run
+   `validate-only` before starting the monitor. Its verifier checks that batch
+   through KQL and the shortcut, including all dimension joins. The job
+   records the exact run, generator, target, batch and Delta transaction-log
+   snapshots. Repeated validation rechecks those snapshots, live metadata,
+   roles and query access without starting another Spark job. Snapshot drift
+   requires a new verification when no monitor or other Spark writer is active.
 
 The measured verifier is bound to the selected dimensions and its monitor
 definition pins the exact owned synthetic target; neither is the old synthetic
-notebook. Measured execution still requires fresh producer-runtime
-authorization and readiness for that target. Keep the retained bootstrap and
-authorization rows out of results by filtering to the measured manifest's
-batch IDs.
+notebook. `wait-monitor` permits the expected shortcut changes from ingestion,
+but requires unchanged dimension snapshots and independently verifies the
+measured batches and run. The bootstrap batch is readiness evidence, not a
+customer result: filter retained bootstrap and authorization rows out using
+the measured manifest's batch IDs.
 
 The producer uses `SalesLineID` values 1 through the row count in each batch,
 reusing those values across batches and on replay. The fact key is

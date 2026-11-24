@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import deploy
 from eventhouse_core import CSV_COLUMNS
@@ -432,14 +432,21 @@ class FakeMeasuredReuseFabric(FakeMonitorFabric):
         execute = f"/v1/workspaces/{WORKSPACE}/notebooks/{MEASURED_NOTEBOOK}/jobs/execute/instances"
         if method == "POST" and path == execute + "?beta=false":
             self.calls.append((method, path, copy.deepcopy(body)))
-            mode = next(param["value"] for param in body["parameters"] if param["name"] == "MODE")
+            parameters = {param["name"]: param["value"] for param in body["parameters"]}
+            mode = parameters["MODE"]
             before = {"SalesLakehouse.DimDate": 361, "SalesLakehouse.DimProduct": 17,
                       "SalesLakehouse.DimCustomer": 97}
             result = {"mode": mode, "status": "verified"}
             if mode == "dimension_gaps":
                 result["missing"] = before
-            else:
+            elif mode == "expand_dimensions":
                 result.update(missing_before=before, missing_after=dict.fromkeys(before, 0))
+            elif mode == "verify_batch":
+                batch = json.loads(parameters["BATCH_JSON"])
+                result["batch"] = {key: batch[key] for key in
+                                   ("batch_id", "row_count", "sales_amount_minor_units")}
+            else:
+                raise AssertionError(f"Unexpected measured notebook mode {mode}")
             job_id = str(uuid.UUID(int=500 + len(self.maintenance_jobs)))
             self.maintenance_jobs[job_id] = {"id": job_id, "itemId": MEASURED_NOTEBOOK,
                                              "status": "Completed",
@@ -563,10 +570,39 @@ class DeployTests(unittest.TestCase):
 
         _, blocked = self.cli("start-monitor", prefix=prefix, selected=selected)
         self.assertEqual((blocked["status"], blocked["ready"]), ("blocked", False), blocked)
-        self.assertIn("producer-runtime identity", blocked["diagnostics"][0])
-        with mock.patch.object(deploy, "verify_monitor_readiness", return_value=None):
+        self.assertIn("verification_batch", blocked["diagnostics"][0])
+        self.config["demo-2"]["verification_batch"] = verification_batch()
+        self.backend.kql_batches["bootstrap_0001"] = [{
+            "RowCount": 1, "DistinctSalesLineIDs": 1, "AmountMinorUnits": 246, "InvalidRows": 0,
+        }]
+        snapshot = {key: {"version": "0" * 20, "etag": "etag", "history_sha256": "a" * 64}
+                    for key in ("DimDate", "DimProduct", "DimCustomer", "shortcut")}
+        with mock.patch.object(deploy, "verify_producer_access", return_value=None), \
+                mock.patch.object(deploy, "_customer_delta_snapshot", side_effect=lambda *_: copy.deepcopy(snapshot)):
+            _, validated = self.cli("validate-only", prefix=prefix, selected=selected)
+            self.assertEqual((validated["status"], validated["ready"]), ("pass", True), validated)
+            self.assertEqual(len(self.backend.maintenance_jobs), 2)
+            _, repeated = self.cli("validate-only", prefix=prefix, selected=selected)
+            self.assertEqual((repeated["status"], repeated["ready"]), ("pass", True), repeated)
+            self.assertEqual(len(self.backend.maintenance_jobs), 2)
             _, running = self.cli("start-monitor", prefix=prefix, selected=selected)
-        self.assertEqual((running["status"], running["ready"]), ("pass", True), running)
+            self.assertEqual((running["status"], running["ready"]), ("pass", True), running)
+            _, while_running = self.cli("validate-only", prefix=prefix, selected=selected)
+            self.assertEqual((while_running["status"], while_running["ready"]), ("pass", True), while_running)
+            self.assertEqual(len(self.backend.maintenance_jobs), 2)
+            snapshot["DimDate"]["etag"] = "changed"
+            _, drifted = self.cli("validate-only", prefix=prefix, selected=selected)
+            self.assertEqual((drifted["status"], drifted["ready"]), ("blocked", False), drifted)
+            self.assertEqual(len(self.backend.maintenance_jobs), 2)
+            snapshot["DimDate"]["etag"] = "etag"
+            snapshot["shortcut"]["version"] = "0" * 19 + "1"
+            settings = deploy.validate_config(self.config, prefix)
+            with deploy.Ledger(self.state, settings) as ledger:
+                deployment = deploy.Deployment(settings, self.backend, deploy.Deadline(10), ledger)
+                self.assertFalse(deployment._customer_verification_is_current(snapshot))
+                self.assertTrue(deployment._customer_verification_is_current(snapshot, allow_fact_drift=True))
+                snapshot["DimDate"]["etag"] = "changed"
+                self.assertFalse(deployment._customer_verification_is_current(snapshot, allow_fact_drift=True))
         current = json.loads((self.state / deploy.MONITOR_START_FILE).read_text(encoding="utf-8"))
         self.assertEqual(current["run_id"], "customer_demo_20261124_e0c409cc05ef")
         self.assertEqual(current["producer_config"]["batch_class"], "measured")
@@ -1035,8 +1071,7 @@ class DeployTests(unittest.TestCase):
         code, result = self.cli("deploy")
         self.assertEqual(code, 1)
         self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
-        self.assertIn("producer-runtime identity", result["diagnostics"][0])
-        self.assertIn("ingestion/query", result["diagnostics"][0])
+        self.assertIn("target binding", result["diagnostics"][0])
 
     def test_validation_requires_fresh_schema_mapping_policy_path_contents_and_notebook(self):
         self.deploy_success()
@@ -2703,6 +2738,140 @@ with deploy.Ledger(Path(sys.argv[1]), settings):
             after = lease.stat()
             self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
         self.assertTrue(lease.is_file())
+
+
+class CustomerReadinessTests(unittest.TestCase):
+    @staticmethod
+    def token(tenant=TENANT, identity=PRODUCER_IDENTITY, expires=None):
+        claims = {"tid": tenant, "oid": identity, "exp": int(time.time()) + 3600 if expires is None else expires}
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"header.{payload}.signature"
+
+    def setUp(self):
+        config = configuration()
+        config["demo-2"]["workspace_id"] = WORKSPACE
+        config["shared"].update({
+            "identity_id": PRODUCER_IDENTITY, "identity_type": "User",
+            "target_bindings": {"demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE,
+                                             "fact": "FactSales"}},
+        })
+        self.settings = deploy.validate_config(config, "chanel")
+        self.database = {"id": DATABASE, "name": "SalesDatabase", "query_uri": QUERY_URI}
+        self.client = mock.MagicMock()
+        self.tokens = {audience: self.token() for audience in
+                       (deploy.FABRIC, deploy.KUSTO_AUDIENCE, deploy.STORAGE_AUDIENCE)}
+        self.client._token.side_effect = lambda audience: self.tokens[audience]
+        self.role = {"role": "Contributor", "principal": {"id": PRODUCER_IDENTITY, "type": "User"}}
+        self.client.pages.return_value = [self.role]
+        self.client.kusto.return_value = [{"ProducerRuntimeProbe": 1}]
+
+    def test_producer_access_checks_each_token_direct_role_and_query(self):
+        deploy.verify_producer_access(self.settings, self.client, self.database)
+        self.assertEqual(self.client._token.call_count, 3)
+        self.client.pages.assert_called_once_with(f"/v1/workspaces/{WORKSPACE}/roleAssignments")
+        self.client.kusto.assert_called_once_with(
+            QUERY_URI, "SalesDatabase", "print ProducerRuntimeProbe=1", query=True,
+        )
+        for audience in self.tokens:
+            with self.subTest(audience=audience):
+                original = self.tokens[audience]
+                self.tokens[audience] = self.token(identity=DATABASE)
+                self.client.pages.reset_mock()
+                with self.assertRaises(deploy.Blocked) as error:
+                    deploy.verify_producer_access(self.settings, self.client, self.database)
+                self.assertNotIn(self.tokens[audience], str(error.exception))
+                self.client.pages.assert_not_called()
+                self.tokens[audience] = original
+        for token in (self.token(tenant=DATABASE), self.token(expires=0), "not-a-token"):
+            with self.subTest(token="invalid identity or expiry"):
+                self.tokens[deploy.FABRIC] = token
+                with self.assertRaises(deploy.Blocked):
+                    deploy.verify_producer_access(self.settings, self.client, self.database)
+        self.tokens[deploy.FABRIC] = self.token()
+        for role in (
+            {"role": "Viewer", "principal": {"id": PRODUCER_IDENTITY, "type": "User"}},
+            {"role": "Admin", "principal": {"id": DATABASE, "type": "User"}},
+            {"role": "Admin", "principal": {"id": PRODUCER_IDENTITY, "type": "Group"}},
+            {"role": "Admin", "principal": {"id": PRODUCER_IDENTITY, "type": "ServicePrincipal"}},
+        ):
+            with self.subTest(role=role):
+                self.client.pages.return_value = [role]
+                with self.assertRaises(deploy.Blocked):
+                    deploy.verify_producer_access(self.settings, self.client, self.database)
+        self.client.pages.return_value = [self.role]
+        self.client.kusto.return_value = [{"ProducerRuntimeProbe": 0}]
+        with self.assertRaises(deploy.Blocked):
+            deploy.verify_producer_access(self.settings, self.client, self.database)
+
+    def test_delta_snapshot_pages_and_rejects_ambiguous_commits(self):
+        resources = {"workspace": {"id": WORKSPACE}, "lakehouse": {"id": LAKEHOUSE}}
+        settings = {**self.settings, "schema": None, "shortcut": "EventhouseFactSales"}
+
+        def listing(_method, url, audience):
+            self.assertEqual(audience, deploy.STORAGE_AUDIENCE)
+            self.assertEqual(urlsplit(url).hostname, "onelake.dfs.fabric.microsoft.com")
+            query = parse_qs(urlsplit(url).query)
+            directory = query["directory"][0]
+            second = "continuation" in query
+            version = 1 if second else 0
+            entry = {"name": f"{directory}/{version:020d}.json", "etag": f"etag-{version}"}
+            headers = {"x-ms-continuation": "next"} if directory.endswith("/dimdate/_delta_log") and not second else {}
+            return 200, headers, {"paths": [entry]}
+
+        self.client._request.side_effect = listing
+        snapshot = deploy._customer_delta_snapshot(settings, self.client, resources)
+        self.assertEqual(snapshot["DimDate"]["version"], "0" * 19 + "1")
+        self.assertEqual(snapshot["DimDate"]["etag"], "etag-1")
+        self.assertEqual(len(snapshot["DimDate"]["history_sha256"]), 64)
+        self.assertEqual(set(snapshot), {"DimDate", "DimProduct", "DimCustomer", "shortcut"})
+
+        def duplicate(method, url, audience):
+            status, headers, data = listing(method, url, audience)
+            if "continuation=" in url:
+                data["paths"][0]["name"] = data["paths"][0]["name"].replace("00000000000000000001.json",
+                                                                            "00000000000000000000.json")
+            return status, headers, data
+
+        self.client._request.side_effect = duplicate
+        with self.assertRaises(deploy.Blocked):
+            deploy._customer_delta_snapshot(settings, self.client, resources)
+        self.client._request.side_effect = None
+        self.client._request.return_value = (200, {}, {"paths": []})
+        with self.assertRaises(deploy.Blocked):
+            deploy._customer_delta_snapshot(settings, self.client, resources)
+
+    def test_completed_verification_recovery_journals_only_the_unchanged_snapshot(self):
+        binding = {"run_id": "customer", "monitor_binding_sha256": "a" * 64, "batch_sha256": "b" * 64,
+                   "workspace_id": WORKSPACE, "lakehouse_id": LAKEHOUSE, "notebook_id": MEASURED_NOTEBOOK}
+        snapshot = {"DimDate": {"version": "0" * 20, "etag": "etag", "history_sha256": "c" * 64}}
+        intent = {**binding, "delta_snapshots": snapshot}
+        batch = verification_batch()
+        pending = {"kind": "notebook-job", "mode": "verify_batch", "notebook_id": MEASURED_NOTEBOOK,
+                   "batch": batch, "job_id": CHILD_JOB, "customer_verification": intent}
+        ledger = mock.MagicMock()
+        ledger.data = {"pending": pending, "owner_marker": "test", "resources": {
+            "workspace": {"id": WORKSPACE}, "measured_notebook": {"id": MEASURED_NOTEBOOK}}}
+        self.client.fabric.return_value = (200, {}, {
+            "id": CHILD_JOB, "itemId": MEASURED_NOTEBOOK, "status": "Completed",
+            "properties": {"exitValue": json.dumps({"mode": "verify_batch", "status": "verified",
+                "batch": {key: batch[key] for key in ("batch_id", "row_count", "sales_amount_minor_units")}})},
+        })
+        deployment = deploy.Deployment({**self.settings, "reuse_synthetic_target": True},
+                                       self.client, mock.MagicMock(), ledger)
+        with mock.patch.object(deploy, "_customer_verification_binding", return_value=binding), \
+                mock.patch.object(deploy, "_customer_delta_snapshot", return_value=snapshot):
+            deployment._poll_notebook_job(CHILD_JOB, "verify_batch", batch)
+        self.assertEqual(ledger.data["resources"]["measured_verification"]["job_id"], CHILD_JOB)
+        ledger.finish.assert_called_once()
+
+        ledger.finish.reset_mock()
+        del ledger.data["resources"]["measured_verification"]
+        with mock.patch.object(deploy, "_customer_verification_binding", return_value=binding), \
+                mock.patch.object(deploy, "_customer_delta_snapshot", return_value={}):
+            with self.assertRaises(deploy.Blocked):
+                deployment._poll_notebook_job(CHILD_JOB, "verify_batch", batch)
+        self.assertNotIn("measured_verification", ledger.data["resources"])
+        ledger.finish.assert_called_once()
 
 
 class ProtocolTests(unittest.TestCase):

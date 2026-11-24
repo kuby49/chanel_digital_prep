@@ -7,6 +7,7 @@ Existing resources are never adopted for modification or cleanup by name alone.
 
 import argparse
 import base64
+import binascii
 import contextlib
 import functools
 import hashlib
@@ -25,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 from email.utils import format_datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 if __name__ == "__main__":
@@ -266,6 +267,9 @@ def validate_config(config, prefix):
     schema = demo.get("lakehouse_schema")
     if schema is not None:
         schema = _optional_name(schema, None, "lakehouse schema")
+    identity_type = shared.get("identity_type")
+    if identity_type is not None and identity_type not in ("User", "ServicePrincipal"):
+        raise Failure("shared.identity_type must be User or ServicePrincipal")
     return {
         "prefix": prefix,
         "tenant_id": _optional_uuid(config.get("tenant_id"), "tenant_id"),
@@ -296,6 +300,7 @@ def validate_config(config, prefix):
         "query_endpoint": query_endpoint,
         "expected_location": expected_location,
         "producer_identity": _optional_uuid(shared.get("identity_id"), "shared.identity_id"),
+        "producer_identity_type": identity_type,
         "target_bindings": shared.get("target_bindings"),
         "synthetic_proof": config.get("synthetic_proof"),
         "shared_workspace_id": _optional_uuid(shared.get("workspace_id"), "shared.workspace_id"),
@@ -914,24 +919,142 @@ def _spark_operation(method):
     return wrapped
 
 
+def _token_identity(client, audience, tenant, identity):
+    token_source = getattr(client, "_token", None)
+    if not callable(token_source):
+        raise Blocked("The producer-runtime identity cannot be checked against the Azure CLI tokens.")
+    try:
+        token = token_source(audience)
+        parts = token.split(".")
+        if len(parts) != 3 or not parts[1]:
+            raise ValueError
+        payload = parts[1].encode("ascii")
+        payload += b"=" * (-len(payload) % 4)
+        claims = json.loads(base64.b64decode(payload, altchars=b"-_", validate=True))
+        if (not isinstance(claims, dict) or _uuid(claims["tid"], "token tenant") != tenant
+                or _uuid(claims["oid"], "token principal") != identity
+                or type(claims["exp"]) is not int or claims["exp"] <= time.time()):
+            raise ValueError
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError, binascii.Error, Failure) as exc:
+        raise Blocked("The Azure CLI token tenant or principal does not match the configured producer identity.") from exc
+
+
 def verify_producer_access(settings, client, database):
-    """Integration seam for a fresh probe executed as the actual producer identity."""
-    if settings["producer_identity"] is None:
-        raise Blocked("The producer's actual Kusto identity is unknown; ingestion and query permissions are unverified.")
-    raise Blocked(
-        "shared.identity_id is configured, but no fresh producer-runtime identity and effective "
-        "ingestion/query permission probe is available; configured identity alone is not proof."
-    )
+    """Verify the configured principal's live access; the producer rechecks its runtime before staging."""
+    identity = settings["producer_identity"]
+    tenant = settings["tenant_id"]
+    workspace = settings["workspace_id"]
+    if identity is None or tenant is None:
+        raise Blocked("The producer-runtime identity and tenant are required to verify access.")
+    try:
+        target = _targets(settings["target_bindings"])["demo-2"]
+    except (KeyError, TargetBindingError) as exc:
+        raise Blocked("The producer's exact Demo 2 target binding is required to verify access.") from exc
+    if (workspace is not None and workspace != target["workspace_id"]
+            or database["id"] != target["item_id"] or settings["table"] != target["fact"]):
+        raise Blocked("The producer's target binding differs from the verified Demo 2 database.")
+    for audience in (FABRIC, KUSTO_AUDIENCE, STORAGE_AUDIENCE):
+        _token_identity(client, audience, tenant, identity)
+    roles = client.pages(f"/v1/workspaces/{target['workspace_id']}/roleAssignments")
+    expected_type = settings.get("producer_identity_type")
+    if not any(
+        isinstance(role, dict) and role.get("role") in ("Admin", "Member", "Contributor")
+        and isinstance(role.get("principal"), dict)
+        and role["principal"].get("id") == identity
+        and role["principal"].get("type") in ("User", "ServicePrincipal")
+        and (expected_type is None or role["principal"]["type"] == expected_type)
+        for role in roles
+    ):
+        raise Blocked("The configured producer principal lacks a direct write role on the Demo 2 workspace.")
+    rows = client.kusto(database["query_uri"], database["name"], "print ProducerRuntimeProbe=1", query=True)
+    try:
+        if _integer(_one(rows, "Producer query probe")["ProducerRuntimeProbe"]) != 1:
+            raise ValueError
+    except (KeyError, ValueError) as exc:
+        raise Blocked("The configured producer principal's Kusto query probe did not succeed.") from exc
 
 
-def verify_monitor_readiness(deployment):
-    """Require fresh producer proof and an authenticated overall readiness binding."""
+def _customer_delta_snapshot(settings, client, resources):
+    """Read immutable Delta log heads for the verified dimensions and shortcut."""
+    if settings["schema"] is not None:
+        raise Blocked("Snapshot reuse is only supported for the owned non-schema Lakehouse.")
+    workspace = _uuid(resources["workspace"]["id"], "workspace ID")
+    lakehouse = _uuid(resources["lakehouse"]["id"], "Lakehouse ID")
+    tables = {"DimDate": "dimdate", "DimProduct": "dimproduct",
+              "DimCustomer": "dimcustomer", "shortcut": settings["shortcut"]}
+    snapshots = {}
+    for name, table in tables.items():
+        directory = f"{lakehouse}/Tables/{table}/_delta_log"
+        token = None
+        seen = set()
+        versions = {}
+        while True:
+            query = {"resource": "filesystem", "directory": directory,
+                     "recursive": "false", "maxResults": "5000"}
+            if token is not None:
+                query["continuation"] = token
+            url = f"https://onelake.dfs.fabric.microsoft.com/{workspace}?{urlencode(query)}"
+            status, headers, data = client._request("GET", url, STORAGE_AUDIENCE)
+            if status != 200 or not isinstance(data, dict) or not isinstance(data.get("paths"), list):
+                raise Blocked("OneLake did not return a usable Delta transaction-log listing.")
+            for entry in data["paths"]:
+                if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                    raise Blocked("OneLake returned an invalid Delta transaction-log entry.")
+                match = re.fullmatch(re.escape(directory) + r"/([0-9]{20})\.json", entry["name"])
+                if match is None:
+                    continue
+                version = match.group(1)
+                etag = entry.get("etag")
+                if not isinstance(etag, str) or not etag or version in versions:
+                    raise Blocked("The Delta transaction-log identity is missing or ambiguous.")
+                versions[version] = etag
+            token = headers.get("x-ms-continuation")
+            if not token:
+                break
+            if not isinstance(token, str) or token in seen or len(seen) >= 100:
+                raise Blocked("OneLake returned an invalid Delta transaction-log continuation.")
+            seen.add(token)
+        if not versions:
+            raise Blocked(f"The {name} Delta transaction log has no visible commit.")
+        latest = max(versions)
+        history = json.dumps(sorted(versions.items()), separators=(",", ":")).encode("utf-8")
+        snapshots[name] = {"version": latest, "etag": versions[latest],
+                           "history_sha256": hashlib.sha256(history).hexdigest()}
+    return snapshots
+
+
+def _customer_verification_binding(settings, resources):
+    try:
+        selected = set(_targets(settings["target_bindings"]))
+        monitor = _monitor_config(settings, selected)
+        batch = settings["batch"]
+        if batch is None:
+            raise ValueError
+        batch_bytes = json.dumps(batch, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                 allow_nan=False).encode("utf-8")
+        return {
+            "run_id": monitor["run_id"],
+            "monitor_binding_sha256": monitor["monitor_binding_sha256"],
+            "batch_sha256": hashlib.sha256(batch_bytes).hexdigest(),
+            "workspace_id": resources["workspace"]["id"],
+            "lakehouse_id": resources["lakehouse"]["id"],
+            "notebook_id": resources["measured_notebook"]["id"],
+        }
+    except (KeyError, TypeError, ValueError, TargetBindingError) as exc:
+        raise Blocked("The customer verification cannot be bound to the exact run, batch and notebook.") from exc
+
+
+def verify_monitor_readiness(deployment, *, allow_fact_drift=False):
+    """Recheck live access and an exact, previously verified customer snapshot."""
     database = deployment.verify_target_ownership()
-    verify_producer_access(deployment.s, deployment.client, database)
-    raise Blocked(
-        "A fresh authenticated binding of Demo 2 artifacts, dimensions, configuration and producer "
-        "permissions is unavailable; a monitor heartbeat cannot establish overall readiness."
-    )
+    if not deployment.s["reuse_synthetic_target"]:
+        verify_producer_access(deployment.s, deployment.client, database)
+        raise Blocked(
+            "A fresh authenticated binding of Demo 2 artifacts, dimensions, configuration and producer "
+            "permissions is unavailable; a monitor heartbeat cannot establish overall readiness."
+        )
+    deployment.validate(allow_spark=False, allow_fact_drift=allow_fact_drift)
+    deployment.monitor_notebook(False)
 
 
 def verify_synthetic_runtime_access(deployment, monitor_config):
@@ -1380,7 +1503,7 @@ class Deployment:
                 raise Blocked("A recorded notebook job is active or has an unknown state; dimension maintenance is blocked.")
 
     @_spark_operation
-    def run_notebook(self, mode, batch=None, *, synthetic_preparation=None):
+    def run_notebook(self, mode, batch=None, *, synthetic_preparation=None, customer_verification=None):
         ws = self.resources["workspace"]["id"]
         notebook_id = self.resources[_notebook_key(self.s)]["id"]
         jobs_path = f"/v1/workspaces/{ws}/items/{notebook_id}/jobs/instances"
@@ -1396,6 +1519,8 @@ class Deployment:
         fields = {"mode": mode, "notebook_id": notebook_id, "batch": expected}
         if synthetic_preparation is not None:
             fields["synthetic_preparation"] = synthetic_preparation
+        if customer_verification is not None:
+            fields["customer_verification"] = customer_verification
         self.ledger.intent("notebook-job", **fields)
         status, headers, _ = self.client.fabric(
             "POST", f"/v1/workspaces/{ws}/notebooks/{notebook_id}/jobs/execute/instances?beta=false",
@@ -1427,6 +1552,7 @@ class Deployment:
             if state == "Completed":
                 pending = self.ledger.data["pending"]
                 preparation = pending.get("synthetic_preparation")
+                customer_verification = pending.get("customer_verification")
                 try:
                     result = _verify_notebook_exit(job, mode, batch)
                     if mode in ("dimension_gaps", "expand_dimensions"):
@@ -1448,6 +1574,21 @@ class Deployment:
                             or self.resources.get("synthetic_preparation") is not None):
                         raise Blocked("The synthetic preload job does not match its preparation intent.")
                     self.resources["synthetic_preparation"] = {**expected, "job_id": job_id}
+                if customer_verification is not None:
+                    binding = _customer_verification_binding(self.s, self.resources)
+                    if (mode != "verify_batch" or not self.s["reuse_synthetic_target"]
+                            or pending.get("job_id") != job_id
+                            or not isinstance(customer_verification, dict)
+                            or any(customer_verification.get(key) != value for key, value in binding.items())
+                            or set(customer_verification) != set(binding) | {"delta_snapshots"}):
+                        raise Blocked("The customer verification job does not match its recorded intent.")
+                    snapshot = _customer_delta_snapshot(self.s, self.client, self.resources)
+                    if snapshot != customer_verification["delta_snapshots"]:
+                        self.ledger.finish()
+                        raise Blocked("A Delta snapshot changed during the customer verification job.")
+                    self.resources["measured_verification"] = {
+                        **customer_verification, "job_id": job_id, "verified_at_utc": _stamp(_now()),
+                    }
                 self.ledger.finish()
                 return result
             if state in ("Failed", "Cancelled", "Deduped"):
@@ -1460,7 +1601,48 @@ class Deployment:
                 raise Failure("The notebook job returned an unknown state.")
             self.deadline.wait(_retry_delay(headers.get("retry-after"), self.s["poll"]))
 
-    def validate(self):
+    def _customer_verification_is_current(self, snapshot, *, allow_fact_drift=False):
+        proof = self.resources.get("measured_verification")
+        binding = _customer_verification_binding(self.s, self.resources)
+        if not isinstance(proof, dict) or any(proof.get(key) != value for key, value in binding.items()):
+            return False
+        recorded = proof.get("delta_snapshots")
+        if not isinstance(recorded, dict) or set(recorded) != set(snapshot):
+            return False
+        for name, value in snapshot.items():
+            saved = recorded[name]
+            if (not isinstance(saved, dict) or set(saved) != {"version", "etag", "history_sha256"}
+                    or not isinstance(saved["version"], str) or re.fullmatch(r"[0-9]{20}", saved["version"]) is None
+                    or not isinstance(saved["etag"], str) or not saved["etag"]
+                    or not isinstance(saved["history_sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", saved["history_sha256"]) is None):
+                return False
+            if name == "shortcut" and allow_fact_drift:
+                continue
+            if saved != value:
+                return False
+        try:
+            job_id = _uuid(proof["job_id"], "verification job ID")
+            if job_id != proof["job_id"]:
+                raise ValueError
+        except (Failure, KeyError, TypeError, ValueError):
+            return False
+        ws = binding["workspace_id"]
+        notebook_id = binding["notebook_id"]
+        with _spark_client(self.client):
+            status, _, job = self.client.fabric(
+                "GET", f"/v1/workspaces/{ws}/notebooks/{notebook_id}/jobs/execute/instances/{job_id}?beta=true"
+            )
+        if (status != 200 or not isinstance(job, dict) or job.get("id") != job_id
+                or job.get("itemId") != notebook_id or job.get("status") != "Completed"):
+            raise Blocked("The recorded customer verification job is not confirmed completed.")
+        _verify_notebook_exit(job, "verify_batch", self.s["batch"])
+        return True
+
+    def validate(self, *, allow_spark=True, allow_fact_drift=False):
+        if self.s["reuse_synthetic_target"]:
+            self.verify_target_ownership()
+            self.reused_synthetic_target()
         self.workspace(False)
         self.item("eventhouse", "Eventhouse", self.s["eventhouse_name"], False)
         self.item("lakehouse", "Lakehouse", self.s["lakehouse_name"], False)
@@ -1475,9 +1657,26 @@ class Deployment:
             raise Blocked("A complete existing bootstrap or measured demo-2.verification_batch is required "
                           "to verify KQL and shortcut contents; none was supplied.")
         with self.verification_deadline():
+            reuse = self.s["reuse_synthetic_target"]
+            if reuse:
+                verify_producer_access(self.s, self.client, database)
+                before = _customer_delta_snapshot(self.s, self.client, self.resources)
             self.verify_batch(database, batch)
             self.notebook(False)
-            self.run_notebook("verify_batch", batch)
+            if reuse:
+                current = self._customer_verification_is_current(before, allow_fact_drift=allow_fact_drift)
+                if not current:
+                    if not allow_spark:
+                        raise Blocked("An exact, completed customer verification is required before monitor readiness.")
+                    self.ensure_dimension_quiescent()
+                    intent = {**_customer_verification_binding(self.s, self.resources),
+                              "delta_snapshots": before}
+                    self.run_notebook("verify_batch", batch, customer_verification=intent)
+                after = _customer_delta_snapshot(self.s, self.client, self.resources)
+                if before != after:
+                    raise Blocked("A verified Delta snapshot changed during readiness validation.")
+            else:
+                self.run_notebook("verify_batch", batch)
             verify_producer_access(self.s, self.client, database)
             self.deadline.remaining()
 
@@ -2926,7 +3125,10 @@ def _run(args, settings):
                     else:
                         deployment.verify_target_ownership()
                 else:
-                    verify_monitor_readiness(deployment)
+                    if monitor_mode == "wait-monitor":
+                        verify_monitor_readiness(deployment, allow_fact_drift=True)
+                    else:
+                        verify_monitor_readiness(deployment)
             with _spark_client(client):
                 batch_label = "synthetic bootstrap" if synthetic else "measured"
                 if monitor_mode == "start-monitor":

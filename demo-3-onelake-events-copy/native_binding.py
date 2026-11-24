@@ -31,6 +31,8 @@ _ACTIONS = ("guard_update", "activator_update")
 RULE_JOURNAL = "demo3-native-rule-state.json"
 RULE_SECOND_JOURNAL = "demo3-native-rule-cycle-2-state.json"
 HC_JOURNAL = "demo3-native-guard-hc-state.json"
+ACCESS_REBIND_JOURNAL = "demo3-native-staging-access-rebind-state.json"
+REBIND_JOURNAL = "demo3-native-staging-rebind-state.json"
 HC_FLAG = 'spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")\n'
 
 
@@ -249,6 +251,155 @@ def _definition(api, resource, path, *, skill="spark-cli", suffix=""):
     if len(parts) != 1:
         raise CandidateBlocked("Fabric definition part is missing or ambiguous.")
     return _json_bytes(base64.b64decode(parts[0]["payload"], validate=True))
+
+
+def _notebook_definition(api, item_id):
+    status, headers, document = api.request(
+        "POST", _BASE + "/items/" + _guid(item_id) + "/getDefinition?format=ipynb", {},
+        skill="spark-cli")
+    if status == 202:
+        operation, location = _operation_location(headers)
+        _poll(api, location, operation, "spark-cli")
+        status, _, document = _operation_get(api, location + "/result", "spark-cli", 20)
+    if status != 200 or not isinstance(document, dict):
+        raise CandidateBlocked("Complete notebook definition read was not confirmed.")
+    definition = document.get("definition")
+    _notebook_parts(definition)
+    return definition
+
+
+def _item_parts(definition, content_path, item_type):
+    if (not isinstance(definition, dict) or not isinstance(definition.get("parts"), list)
+            or not definition["parts"]):
+        raise CandidateBlocked("Item definition envelope is invalid.")
+    parts = {}
+    for part in definition["parts"]:
+        if not isinstance(part, dict):
+            raise CandidateBlocked("Item definition part is invalid.")
+        name, payload = part.get("path"), part.get("payload")
+        if (not isinstance(name, str) or not name or name.startswith("/")
+                or "\\" in name or any(segment in ("", ".", "..") for segment in name.split("/"))
+                or name in parts or part.get("payloadType") != "InlineBase64"
+                or not isinstance(payload, str)):
+            raise CandidateBlocked("Item definition contains an unsafe or duplicate part.")
+        try:
+            data = base64.b64decode(payload, validate=True)
+            if base64.b64encode(data).decode("ascii") != payload:
+                raise ValueError("noncanonical base64")
+        except (ValueError, UnicodeError) as exc:
+            raise CandidateBlocked("Item definition has an invalid part payload.") from exc
+        parts[name] = (part, data)
+    if content_path not in parts or ".platform" not in parts:
+        raise CandidateBlocked("Item content or platform part is missing.")
+    try:
+        content = _json_bytes(parts[content_path][1])
+        platform = _json_bytes(parts[".platform"][1])
+    except (ValueError, UnicodeError) as exc:
+        raise CandidateBlocked("Item content or platform metadata is invalid.") from exc
+    metadata = platform.get("metadata") if isinstance(platform, dict) else None
+    if not isinstance(metadata, dict) or metadata.get("type") != item_type:
+        raise CandidateBlocked("Item platform identity is invalid.")
+    return parts, content
+
+
+def _notebook_parts(definition):
+    if not isinstance(definition, dict) or definition.get("format") != "ipynb":
+        raise CandidateBlocked("Notebook definition envelope is invalid.")
+    parts, notebook = _item_parts(definition, "notebook-content.ipynb", "Notebook")
+    if not isinstance(notebook, dict):
+        raise CandidateBlocked("Notebook content is invalid.")
+    return parts, notebook
+
+
+def _reflex_definition(api):
+    status, headers, document = api.request(
+        "POST", _BASE + "/reflexes/" + check.REFLEX + "/getDefinition", {}, skill="activator-cli")
+    if status == 202:
+        operation, location = _operation_location(headers)
+        _poll(api, location, operation, "activator-cli")
+        status, _, document = _operation_get(api, location + "/result", "activator-cli", 20)
+    if status != 200 or not isinstance(document, dict):
+        raise CandidateBlocked("Complete Activator definition read was not confirmed.")
+    definition = document.get("definition")
+    _reflex_parts(definition)
+    return definition
+
+
+def _reflex_parts(definition):
+    parts, graph = _item_parts(definition, "ReflexEntities.json", "Reflex")
+    if not isinstance(graph, list):
+        raise CandidateBlocked("Activator graph is invalid.")
+    return parts, graph
+
+
+def _replace_reflex(definition, graph):
+    _reflex_parts(definition)
+    result = copy.deepcopy(definition)
+    part = next(item for item in result["parts"] if item["path"] == "ReflexEntities.json")
+    part["payload"] = base64.b64encode(json.dumps(
+        graph, ensure_ascii=False, allow_nan=False).encode("utf-8")).decode("ascii")
+    _reflex_parts(result)
+    return result
+
+
+def _same_reflex_definition(actual, expected):
+    actual_parts, actual_graph = _reflex_parts(actual)
+    expected_parts, expected_graph = _reflex_parts(expected)
+    if ({key: value for key, value in actual.items() if key != "parts"} !=
+            {key: value for key, value in expected.items() if key != "parts"}
+            or set(actual_parts) != set(expected_parts)
+            or check._canonical(actual_graph) != check._canonical(expected_graph)):
+        return False
+    for name in actual_parts:
+        left, right = actual_parts[name][0], expected_parts[name][0]
+        if name == "ReflexEntities.json":
+            left = {key: value for key, value in left.items() if key != "payload"}
+            right = {key: value for key, value in right.items() if key != "payload"}
+        if left != right:
+            return False
+    return True
+
+
+def _reflex_update_body(definition):
+    _reflex_parts(definition)
+    payload = copy.deepcopy(definition)
+    payload["parts"] = [part for part in payload["parts"] if part["path"] != ".platform"]
+    return {"definition": payload}
+
+
+def _replace_notebook(definition, notebook):
+    _notebook_parts(definition)
+    result = copy.deepcopy(definition)
+    part = next(item for item in result["parts"] if item["path"] == "notebook-content.ipynb")
+    part["payload"] = base64.b64encode(json.dumps(
+        notebook, ensure_ascii=False, allow_nan=False).encode("utf-8")).decode("ascii")
+    _notebook_parts(result)
+    return result
+
+
+def _same_notebook_definition(actual, expected):
+    actual_parts, actual_notebook = _notebook_parts(actual)
+    expected_parts, expected_notebook = _notebook_parts(expected)
+    if ({key: value for key, value in actual.items() if key != "parts"} !=
+            {key: value for key, value in expected.items() if key != "parts"}
+            or set(actual_parts) != set(expected_parts) or actual_notebook != expected_notebook):
+        return False
+    for name in actual_parts:
+        left, right = actual_parts[name][0], expected_parts[name][0]
+        if name == "notebook-content.ipynb":
+            left = {key: value for key, value in left.items() if key != "payload"}
+            right = {key: value for key, value in right.items() if key != "payload"}
+        if left != right:
+            return False
+    return True
+
+
+def _notebook_update_body(definition):
+    _notebook_parts(definition)
+    payload = copy.deepcopy(definition)
+    # Fabric accepts .platform on update only with updateMetadata=true.
+    payload["parts"] = [part for part in payload["parts"] if part["path"] != ".platform"]
+    return {"definition": payload}
 
 
 def _graph(api):
@@ -483,7 +634,8 @@ class NativeBinding:
         output = Path(output)
         protected = (self.candidate_path, self.native_config_path, self.previous_config_path,
                      self.journal, self.root / RULE_JOURNAL, self.root / RULE_SECOND_JOURNAL,
-                     self.root / HC_JOURNAL,
+                     self.root / HC_JOURNAL, self.root / ACCESS_REBIND_JOURNAL,
+                     self.root / REBIND_JOURNAL,
                      self.root / _PREVIOUS, self.root / check.JOURNAL)
         if not output.is_absolute() or any(output.resolve() == path.resolve() for path in protected):
             raise ValueError("proof output must be a distinct absolute path")
@@ -498,6 +650,9 @@ class NativeBinding:
         if any(state["actions"].get(action, {}).get("status") != "confirmed-readback" for action in _ACTIONS):
             raise CandidateBlocked("Both native updates require confirmed readbacks before proof.")
         return state
+
+    def predecessor_binding_hash(self):
+        return check.config_sha256(self._published())
 
     def _correction(self, state):
         correction = _load_json(self.root / HC_JOURNAL)

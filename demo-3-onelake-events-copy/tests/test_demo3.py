@@ -1065,7 +1065,10 @@ class NativeGuardTests(unittest.TestCase):
                   "source": f"/tenants/{tenant}/workspaces/{self.target.workspace_id}/items/{self.target.lakehouse_id}"}
         graph = activator.build_native_definition(
             tenant, self.target.workspace_id, self.target.lakehouse_id, pipeline_id, sample)
-        notebook = {"cells": [{"source": ["verified"]}],
+        settings = {"producer_workspace_id": self.authority.workspace_id,
+                    "producer_item_id": self.authority.lakehouse_id}
+        notebook = {"cells": [{"source": ["verified"]},
+                              {"source": [f"execute(spark, notebookutils, {settings!r}, inputs)\n"]}],
                     "metadata": {"trident": {"lakehouse": {"default_lakehouse": self.target.lakehouse_id}}}}
         pipeline = {"properties": {"guarded": True}}
         marker = "owned-marker-123"
@@ -1104,6 +1107,11 @@ class NativeGuardTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, modules):
             import native_demo3
 
+            generated = guarded_notebook.build_native_notebook(
+                self.producer_path.parent, self.policy, self.target.workspace_id, self.target.lakehouse_id,
+                "TestLakehouse", self.authority.workspace_id, self.authority.lakehouse_id)
+            self.assertEqual(native_demo3._guard_staging(generated),
+                             (self.authority.workspace_id, self.authority.lakehouse_id))
             proof = {"version": 1, "workspace_id": self.target.workspace_id,
                      "lakehouse_id": self.target.lakehouse_id, "guard_notebook_id": notebook_id,
                      "pipeline_id": pipeline_id, "reflex_id": reflex_id, "connection_id": connection_id,
@@ -1135,6 +1143,21 @@ class NativeGuardTests(unittest.TestCase):
             with mock.patch.object(native_demo3, "_dimensions"):
                 prepared = native_demo3.prepare(context)
             self.assertEqual(native_demo3.verify(context, prepared)["batch_count"], 2)
+            other_stage = str(uuid.uuid4())
+            document["shared"]["staging_lakehouse_id"] = other_stage
+            context["store"] = types.SimpleNamespace(workspace_id=self.authority.workspace_id,
+                                                      lakehouse_id=other_stage)
+            binding["producer"]["staging_lakehouse_id"] = other_stage
+            binding["config_sha256"] = native_demo3._digest(document)
+            binding["nonce"] = "native-" + binding["config_sha256"][:32]
+            with mock.patch.object(native_demo3, "_dimensions"), \
+                    self.assertRaisesRegex(RuntimeError, "staging bindings differ"):
+                native_demo3.prepare(context)
+            document["shared"]["staging_lakehouse_id"] = self.authority.lakehouse_id
+            context["store"] = self.authority
+            binding["producer"]["staging_lakehouse_id"] = self.authority.lakehouse_id
+            binding["config_sha256"] = native_demo3._digest(document)
+            binding["nonce"] = "native-" + binding["config_sha256"][:32]
             path = audit.RECORD_PREFIX + entry["batch_id"] + ".json"
             original = self.target.read(path)
             changed = json.loads(original[0])

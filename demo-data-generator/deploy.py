@@ -117,6 +117,10 @@ class FabricTransportError(Exception):
     pass
 
 
+class FabricTransientTransportError(FabricTransportError):
+    """A recognized transport failure that may be retried for an idempotent read."""
+
+
 def _uuid(value, field, exception=ContractError):
     if not isinstance(value, str):
         raise exception(f"{field} must be a UUID.")
@@ -741,7 +745,10 @@ class FabricClient:
             status, retry_after = int(exc.code), _header(exc.headers, "Retry-After")
             exc.close()
             raise FabricHttpError(method, status, retry_after) from None
-        except (error.URLError, OSError, TimeoutError):
+        except (error.URLError, OSError, TimeoutError) as exc:
+            reason = exc.reason if isinstance(exc, error.URLError) else exc
+            if isinstance(reason, (TimeoutError, ConnectionError)):
+                raise FabricTransientTransportError(f"Fabric {method} request failed or timed out.") from None
             raise FabricTransportError(f"Fabric {method} request failed or timed out.") from None
         if not 200 <= status < 300:
             raise FabricHttpError(method, status, _header(response_headers, "Retry-After"))
@@ -765,6 +772,7 @@ class FabricClient:
 
     def get(self, path, deadline=None):
         deadline = deadline if deadline is not None else self._clock() + 60
+        transport_retried = False
         for attempt in range(3):
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -777,8 +785,16 @@ class FabricClient:
                 self._wait(_retry_after({"Retry-After": exc.retry_after} if exc.retry_after is not None else {}),
                            deadline)
                 continue
+            except FabricTransientTransportError:
+                if transport_retried or attempt == 2:
+                    raise
+                transport_retried = True
+                self._wait(1, deadline)
+                continue
             if status != 200:
                 raise FabricTransportError("Fabric returned an unexpected status for a read.")
+            if self._clock() >= deadline:
+                raise Blocked("Fabric read exceeded its deadline.")
             return headers, body
         raise FabricTransportError("Fabric read could not be completed.")
 

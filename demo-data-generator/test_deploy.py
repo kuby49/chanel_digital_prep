@@ -3,9 +3,12 @@ import copy
 import io
 import json
 import os
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -1594,6 +1597,218 @@ class FabricClientTests(unittest.TestCase):
         self.assertEqual(self.client(opener, clock).list_all("/v1/workspaces"), [])
         self.assertEqual(clock.delays, [4])
         self.assertEqual(len(opener.requests), 2)
+
+    def test_get_retries_recognized_transient_errors_using_remaining_deadline(self):
+        failures = (TimeoutError("secret"), error.URLError(TimeoutError("secret")),
+                    ConnectionResetError("secret"), error.URLError(ConnectionRefusedError("secret")))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                clock = Clock()
+                opener = Opener(failure, Response(body={"value": []}))
+                original_open = opener.open
+
+                def timed_open(req, timeout):
+                    clock.value += 3
+                    return original_open(req, timeout)
+
+                opener.open = timed_open
+                _, body = self.client(opener, clock).get("/v1/workspaces", deadline=10)
+                self.assertEqual(body, {"value": []})
+                self.assertEqual([timeout for _, timeout in opener.requests], [10, 6])
+                self.assertEqual([req.method for req, _ in opener.requests], ["GET", "GET"])
+                self.assertEqual(clock.delays, [1])
+
+    def test_get_retries_timeout_during_response_read(self):
+        interrupted = Response(body={"value": []})
+        interrupted.read = mock.Mock(side_effect=TimeoutError("secret"))
+        opener = Opener(interrupted, Response(body={"value": []}))
+        clock = Clock()
+        _, body = self.client(opener, clock).get("/v1/workspaces")
+        self.assertEqual(body, {"value": []})
+        interrupted.read.assert_called_once()
+        self.assertEqual(len(opener.requests), 2)
+        self.assertEqual(clock.delays, [1])
+
+    def test_get_allows_only_one_transport_retry_and_sanitizes_traceback(self):
+        secret = "sensitive network failure details"
+        opener = Opener(error.URLError(TimeoutError(secret)), TimeoutError(secret), Response(body={}))
+        clock = Clock()
+        try:
+            self.client(opener, clock).get("/v1/workspaces")
+        except deploy.FabricTransientTransportError as exc:
+            self.assertIsInstance(exc, deploy.FabricTransportError)
+            rendered = traceback.format_exc()
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn("fake-sensitive-token", rendered)
+        else:
+            self.fail("A second transport failure must not be retried.")
+        self.assertEqual(len(opener.requests), 2)
+        self.assertEqual(clock.delays, [1])
+
+    def test_get_does_not_retry_unrecognized_transport_or_security_errors(self):
+        failures = (error.URLError("secret timeout string"),
+                    error.URLError(ssl.SSLCertVerificationError("secret")),
+                    error.URLError(socket.gaierror(socket.EAI_NONAME, "secret")),
+                    error.URLError(socket.gaierror(socket.EAI_AGAIN, "secret")),
+                    PermissionError("secret"), OSError("secret"))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                opener = Opener(failure, Response(body={}))
+                clock = Clock()
+                with self.assertRaises(deploy.FabricTransportError) as caught:
+                    self.client(opener, clock).get("/v1/workspaces")
+                self.assertNotIsInstance(caught.exception, deploy.FabricTransientTransportError)
+                self.assertNotIn("secret", str(caught.exception))
+                self.assertEqual(len(opener.requests), 1)
+                self.assertEqual(clock.delays, [])
+
+    def test_get_does_not_retry_invalid_responses_or_status_errors(self):
+        def raw_response(body):
+            response = Response()
+            response.body = body
+            return response
+
+        cases = (
+            ("invalid JSON", lambda: raw_response(b'{"value":'), deploy.FabricTransportError),
+            ("invalid UTF-8", lambda: raw_response(b"\xff"), deploy.FabricTransportError),
+            ("oversize", lambda: raw_response(b"x" * (8 * 1024 * 1024 + 1)), deploy.FabricTransportError),
+            ("unexpected success status", lambda: Response(201, body={}), deploy.FabricTransportError),
+            ("server error", lambda: Response(503), deploy.FabricHttpError),
+            ("HTTP error", lambda: error.HTTPError(deploy.API_ROOT + "/v1/workspaces", 403, "secret",
+                                                   {}, io.BytesIO(b"secret")), deploy.FabricHttpError),
+        )
+        for label, factory, expected in cases:
+            for after_timeout in (False, True):
+                with self.subTest(response=label, after_timeout=after_timeout):
+                    prefix = [TimeoutError("secret")] if after_timeout else []
+                    opener = Opener(*prefix, factory(), Response(body={}))
+                    clock = Clock()
+                    with self.assertRaises(expected) as caught:
+                        self.client(opener, clock).get("/v1/workspaces")
+                    self.assertNotIsInstance(caught.exception, deploy.FabricTransientTransportError)
+                    self.assertNotIn("secret", str(caught.exception))
+                    self.assertEqual(len(opener.requests), 1 + len(prefix))
+                    self.assertEqual(clock.delays, [1] if after_timeout else [])
+
+    def test_get_429_and_transport_retries_share_the_existing_attempt_limit(self):
+        def throttle(delay):
+            return error.HTTPError(deploy.API_ROOT + "/v1/workspaces", 429, "secret",
+                                   {"Retry-After": str(delay)}, io.BytesIO(b"secret"))
+
+        for failures, expected_delays in (
+            ([TimeoutError("secret"), throttle(2)], [1, 2]),
+            ([throttle(2), TimeoutError("secret")], [2, 1]),
+        ):
+            with self.subTest(delays=expected_delays):
+                clock = Clock()
+                opener = Opener(*failures, Response(body={"value": []}))
+                _, body = self.client(opener, clock).get("/v1/workspaces")
+                self.assertEqual(body, {"value": []})
+                self.assertEqual(len(opener.requests), 3)
+                self.assertEqual(clock.delays, expected_delays)
+
+        for failures, expected in (
+            ([throttle(1), throttle(1), throttle(1)], deploy.FabricHttpError),
+            ([throttle(1), throttle(1), TimeoutError("secret")], deploy.FabricTransientTransportError),
+            ([TimeoutError("secret"), throttle(1), throttle(1)], deploy.FabricHttpError),
+        ):
+            with self.subTest(final=expected.__name__):
+                clock = Clock()
+                opener = Opener(*failures, Response(body={}))
+                with self.assertRaises(expected):
+                    self.client(opener, clock).get("/v1/workspaces")
+                self.assertEqual(len(opener.requests), 3)
+                self.assertEqual(clock.delays, [1, 1])
+
+    def test_get_429_invalid_or_unaffordable_retry_after_is_not_retried(self):
+        for retry_after in ("invalid", "6"):
+            with self.subTest(retry_after=retry_after):
+                failure = error.HTTPError(deploy.API_ROOT + "/v1/workspaces", 429, "secret",
+                                          {"Retry-After": retry_after}, io.BytesIO(b"secret"))
+                clock = Clock()
+                opener = Opener(failure, Response(body={}))
+                with self.assertRaises(deploy.Blocked):
+                    self.client(opener, clock).get("/v1/workspaces", deadline=5)
+                self.assertEqual(len(opener.requests), 1)
+                self.assertEqual(clock.delays, [])
+
+    def test_get_transport_retry_never_starts_after_deadline(self):
+        for elapsed, delays in ((4, [1]), (4.5, [])):
+            with self.subTest(elapsed=elapsed):
+                clock = Clock()
+                opener = Opener(TimeoutError("secret"), Response(body={}))
+                original_open = opener.open
+
+                def timed_open(req, timeout):
+                    clock.value += elapsed
+                    return original_open(req, timeout)
+
+                opener.open = timed_open
+                with self.assertRaises(deploy.Blocked) as caught:
+                    self.client(opener, clock).get("/v1/workspaces", deadline=5)
+                self.assertNotIn("secret", "".join(traceback.format_exception(caught.exception)))
+                self.assertEqual(len(opener.requests), 1)
+                self.assertEqual(opener.requests[0][1], 5)
+                self.assertEqual(clock.delays, delays)
+
+    def test_poll_transport_retry_respects_the_parent_operation_deadline(self):
+        clock = Clock()
+        opener = Opener(TimeoutError("secret"), Response(body={"status": "Succeeded"}))
+        original_open = opener.open
+
+        def timed_open(req, timeout):
+            clock.value += 4
+            return original_open(req, timeout)
+
+        opener.open = timed_open
+        with self.assertRaises(deploy.Blocked):
+            self.client(opener, clock).poll(OPERATION, retry_after=1, timeout=5, require_result=False)
+        self.assertEqual([timeout for _, timeout in opener.requests], [4])
+        self.assertEqual(clock.delays, [1])
+
+    def test_get_rejects_late_success_without_masking_terminal_responses(self):
+        malformed = Response()
+        malformed.body = b"{"
+        for response, expected, message in (
+            (Response(body={}), deploy.Blocked, "deadline"),
+            (malformed, deploy.FabricTransportError, "invalid JSON"),
+            (Response(201, body={}), deploy.FabricTransportError, "unexpected status"),
+        ):
+            with self.subTest(message=message):
+                clock = Clock()
+                opener = Opener(response)
+                original_open = opener.open
+
+                def timed_open(req, timeout):
+                    clock.value += 6
+                    return original_open(req, timeout)
+
+                opener.open = timed_open
+                with self.assertRaisesRegex(expected, message):
+                    self.client(opener, clock).get("/v1/workspaces", deadline=5)
+                self.assertEqual(len(opener.requests), 1)
+
+    def test_post_is_not_retried_but_operation_poll_get_may_retry(self):
+        failures = (TimeoutError("secret"), error.URLError(TimeoutError("secret")),
+                    error.HTTPError(deploy.API_ROOT + "/v1/workspaces", 429, "secret",
+                                    {"Retry-After": "1"}, io.BytesIO(b"secret")))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                opener = Opener(failure, Response(body={}))
+                clock = Clock()
+                with self.assertRaises((deploy.FabricHttpError, deploy.FabricTransportError)):
+                    self.client(opener, clock).post_operation("/v1/workspaces", {})
+                self.assertEqual([req.method for req, _ in opener.requests], ["POST"])
+                self.assertEqual(clock.delays, [])
+
+        clock = Clock()
+        opener = Opener(Response(202, headers={"x-ms-operation-id": OPERATION, "Retry-After": "1"}),
+                        TimeoutError("secret"), Response(body={"status": "Succeeded"}))
+        status, body = self.client(opener, clock).post_operation(
+            "/v1/workspaces", {}, require_result=False)
+        self.assertEqual((status, body), (202, None))
+        self.assertEqual([req.method for req, _ in opener.requests], ["POST", "GET", "GET"])
+        self.assertEqual(clock.delays, [1, 1])
 
     def test_http_and_transport_errors_never_expose_response_or_credentials(self):
         for failure in (error.HTTPError(deploy.API_ROOT + "/v1/workspaces", 403, "secret",

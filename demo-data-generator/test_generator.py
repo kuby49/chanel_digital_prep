@@ -1,3 +1,4 @@
+import ast
 import csv
 import base64
 import hashlib
@@ -18,6 +19,7 @@ from urllib.request import url2pathname
 from generator import HEADER, RunConfig, batch_bytes, dimensions, generator_source_sha256, stage_batch
 from delivery import begin_submission, record_submission, record_verification
 from fabric_files import materialize_staged
+import fabric_assets
 from fabric_assets import notebook_definition, pipeline_definition
 from runner import Submission, run_batches
 
@@ -205,6 +207,57 @@ class GeneratorTests(unittest.TestCase):
 
         with patch.object(Path, "read_bytes", windows_checkout):
             self.assertEqual(notebook_definition(*args), expected)
+
+    def test_native_bundle_includes_complete_tracks_and_rejects_missing_or_colliding_companions(self):
+        companions = {
+            "demo-1-materialized-lake-views": ("native_demo1.py",),
+            "demo-3-onelake-events-copy": ("native_demo3.py", "native_stop.py", "native_guard.py", "audit.py",
+                                           "batch_gate.py", "delivery_runtime.py", "guard_spark.py"),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            producer = root / "demo-data-generator"
+            producer.mkdir()
+            for name in fabric_assets.PRODUCER_MODULES:
+                (producer / name).write_bytes(f"# producer {name}\n".encode())
+            for folder, names in companions.items():
+                peer = root / folder
+                peer.mkdir()
+                for name in names:
+                    (peer / name).write_bytes(f"# peer {name}\r\n".encode())
+            with patch.object(fabric_assets, "HERE", producer):
+                source = fabric_assets._bundle_cell()["source"][4]
+                bundled = ast.literal_eval(source.partition("=")[2].strip())
+                for names in companions.values():
+                    for name in names:
+                        self.assertEqual(base64.b64decode(bundled[name]), f"# peer {name}\n".encode())
+                missing = root / "demo-3-onelake-events-copy" / "guard_spark.py"
+                missing.unlink()
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    fabric_assets._bundle_cell()
+                missing.write_text("# restored\n", encoding="utf-8")
+                (producer / "audit.py").write_text("# different\n", encoding="utf-8")
+                with patch.object(fabric_assets, "PRODUCER_MODULES", fabric_assets.PRODUCER_MODULES + ("audit.py",)):
+                    with self.assertRaisesRegex(ValueError, "colliding import names"):
+                        fabric_assets._bundle_cell()
+
+    def test_notebook_bundle_imports_available_native_hooks(self):
+        root = Path(__file__).parent.parent
+        hook_paths = {
+            "demo-1": root / "demo-1-materialized-lake-views" / "native_demo1.py",
+            "demo-2": root / "demo-2-eventhouse" / "native_demo2.py",
+            "demo-3": root / "demo-3-onelake-events-copy" / "native_demo3.py",
+        }
+        selected = [name for name, path in hook_paths.items() if path.is_file()]
+        if not selected:
+            self.skipTest("Native track modules are not present in this worktree")
+        source = "".join(fabric_assets._bundle_cell()["source"])
+        script = source + f"\nimport native_lifecycle\nnative_lifecycle.load_hooks({selected!r})\n"
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ, TEMP=directory, TMP=directory, PYTHONDONTWRITEBYTECODE="1")
+            completed = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True,
+                                       env=environment, timeout=30, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_preflight_probe_persists_identity_without_the_token(self):
         notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))

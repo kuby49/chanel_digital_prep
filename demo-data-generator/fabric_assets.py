@@ -39,25 +39,35 @@ def _definition(content, part_path, format_name=None):
 def _bundle_cell():
     files = {name: (HERE / name).read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
              for name in PRODUCER_MODULES}
+
+    def add(path):
+        content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if path.name in files and files[path.name] != content:
+            raise ValueError("Native companion modules have colliding import names")
+        files[path.name] = content
+
     eventhouse = HERE.parent / "demo-2-eventhouse"
     peer_files = [eventhouse / "ingestion.py", eventhouse / "eventhouse_core.py"]
     if any(path.exists() for path in peer_files):
         if not all(path.is_file() for path in peer_files):
             raise ValueError("Both Eventhouse adapter modules are required")
-        files.update({path.name: path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-                      for path in peer_files})
+        for path in peer_files:
+            add(path)
     native_companions = {
+        "demo-1-materialized-lake-views": ("native_demo1.py",),
         "demo-2-eventhouse": ("native_demo2.py", "monitor_controller.py", "lakehouse_validation.py", "eventhouse_core.py"),
+        "demo-3-onelake-events-copy": ("native_demo3.py", "native_stop.py", "native_guard.py", "audit.py",
+                                       "batch_gate.py", "delivery_runtime.py", "guard_spark.py"),
     }
     for folder, names in native_companions.items():
         root = HERE.parent / folder
         if not (root / names[0]).is_file():
             continue
         for name in names:
-            content = (root / name).read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-            if name in files and files[name] != content:
-                raise ValueError("Native companion modules have colliding import names")
-            files[name] = content
+            path = root / name
+            if not path.is_file():
+                raise ValueError(f"Native companion modules are incomplete for {folder}")
+            add(path)
     encoded = {name: base64.b64encode(content).decode("ascii") for name, content in files.items()}
     source = [
         "import base64 as _bundle_base64\n",

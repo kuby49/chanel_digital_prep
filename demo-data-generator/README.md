@@ -98,13 +98,14 @@ Defaults are 10 files of 1,000 rows, 60s
 apart. The SHA-256 and exact stop nonce are derived again from the entire
 fresh projected runtime document, not reused from the template.
 
-**This is not yet a runnable all-demo launch.** Demo 1 needs its read-only
-hook and an approved one-time bounded control-plane schedule receipt;
+**This is not yet a runnable all-demo launch.** Demo 1's read-only hook
+requires an approved one-time bounded control-plane schedule receipt;
 notebook-resident MLV schedule mutations are not bundled. The shared setup
 schedule intentionally remains enabled between runs, and its remaining
 coverage must include the fresh run's complete verification deadline.
-Demo 3 needs complete native readiness, verification and cooperating-writer
-drain hooks. Missing or unsuccessful
+Demo 3's readiness, verification and cooperating-writer drain hooks require
+a confirmed deployment proof and enabled rule; their publisher and live
+integration remain unverified. Missing or unsuccessful
 hooks fail before sales, rather than assuming a manually started monitor
 or accepting recorded readiness. Demo 2's native hook must establish and
 observe its exact owned monitor/verifier jobs automatically. No live result

@@ -36,12 +36,13 @@ from urllib import error, parse, request
 from generator import RunConfig, strict_json_loads
 from job_lifecycle import JOURNAL_DIR_NAME, LifecycleBlocked, PipelineJob
 from sales_ids import canonical_bytes
-from target_readback import TargetReadbackBlocked, read_selected_targets, selected_candidates
+from target_readback import OneLakeTableClient, TargetReadbackBlocked, read_selected_targets, selected_candidates
 
 
 HERE = Path(__file__).resolve().parent
 ENVIRONMENT_YML = HERE / "environment.yml"
 API_ROOT = "https://api.fabric.microsoft.com"
+STORAGE_RESOURCE = "https://storage.azure.com/"
 STATE_NAME = "shared-producer-v1.json"
 LOCK_NAME = ".shared-producer-v1.lock"
 CANDIDATE_NAME = "shared-producer-candidate-ids.json"
@@ -581,8 +582,10 @@ def _token_claims(token):
         raise Blocked("Azure CLI did not return a token with verifiable tenant and identity claims.") from None
 
 
-def azure_cli_token(tenant_id, identity_id):
-    command = [shutil.which("az") or "az", "account", "get-access-token", "--resource", API_ROOT,
+def azure_cli_token(tenant_id, identity_id, *, resource=API_ROOT):
+    if resource not in (API_ROOT, STORAGE_RESOURCE):
+        raise ContractError("Unsupported Azure token resource.")
+    command = [shutil.which("az") or "az", "account", "get-access-token", "--resource", resource,
                "--tenant", tenant_id, "--output", "json", "--only-show-errors"]
     try:
         completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
@@ -599,7 +602,7 @@ def azure_cli_token(tenant_id, identity_id):
         if not isinstance(token, str) or not token or any(ord(char) < 33 or ord(char) > 126 for char in token):
             raise ValueError
     except (KeyError, TypeError, ValueError):
-        raise Blocked("Azure CLI returned an invalid Fabric token response.") from None
+        raise Blocked("Azure CLI returned an invalid token response.") from None
     # This is a routing guard; Fabric authenticates the token, and job identity needs runtime evidence.
     claims = _token_claims(token)
     if not _same_uuid(claims.get("tid"), tenant_id) or not _same_uuid(claims.get("oid"), identity_id):
@@ -1269,7 +1272,11 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
             clients = {name: client for name in selected}
             if "demo-2" in selected:
                 clients["demo-2"] = FabricClient(token, skill="eventhouse-cli")
-            observations = read_selected_targets(config, selected, clients)
+            table_client = None
+            if "demo-3" in selected:
+                storage_token = azure_cli_token(plan["tenant_id"], plan["identity_id"], resource=STORAGE_RESOURCE)
+                table_client = OneLakeTableClient(storage_token)
+            observations = read_selected_targets(config, selected, clients, table_client=table_client)
         return ["Owned workspace, item metadata, published Environment libraries and local definitions were read back successfully; runtime readiness remains unproven.", *observations, *BLOCKERS]
     if mode != "deploy":
         raise ContractError("Unsupported mode.")

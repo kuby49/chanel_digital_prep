@@ -1431,6 +1431,24 @@ class TokenTests(unittest.TestCase):
                         deploy.azure_cli_token(TENANT, IDENTITY)
                 self.assertNotIn(token, str(caught.exception))
 
+    def test_storage_token_uses_the_same_tenant_and_principal_with_a_fixed_audience(self):
+        token = self.jwt()
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps({"accessToken": token}), stderr="")
+        with mock.patch.object(deploy.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(deploy.azure_cli_token(TENANT, IDENTITY, resource=deploy.STORAGE_RESOURCE), token)
+        command = run.call_args.args[0]
+        self.assertIn(deploy.STORAGE_RESOURCE, command)
+        self.assertIn(TENANT, command)
+        wrong_identity = self.jwt(identity=WORKSPACE)
+        completed.stdout = json.dumps({"accessToken": wrong_identity})
+        with mock.patch.object(deploy.subprocess, "run", return_value=completed):
+            with self.assertRaises(deploy.Blocked):
+                deploy.azure_cli_token(TENANT, IDENTITY, resource=deploy.STORAGE_RESOURCE)
+        with mock.patch.object(deploy.subprocess, "run") as run:
+            with self.assertRaises(deploy.ContractError):
+                deploy.azure_cli_token(TENANT, IDENTITY, resource="https://attacker.invalid")
+        run.assert_not_called()
+
     def test_cli_errors_and_timeouts_are_sanitized(self):
         failures = (
             SimpleNamespace(returncode=1, stdout="sensitive", stderr="sensitive"),

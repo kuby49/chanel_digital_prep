@@ -211,12 +211,18 @@ those candidates and reads each workspace and typed target item with the CLI
 principal. It checks Demo 2's KQL database, Eventhouse parent and configured
 adapter endpoints, database, table and mapping; Demo 3's landing must name its
 candidate Lakehouse. Demo 1 may use a separate landing Lakehouse, whose item is
-read independently. Missing or mismatched bindings block validation.
+read independently. For Demo 3, a separate Azure Storage-audience token for the
+same CLI principal reads the [OneLake Delta metadata API](https://learn.microsoft.com/en-us/fabric/onelake/table-apis/delta-table-apis-overview).
+The single-page listing must contain exactly the case-sensitive candidate fact
+as a Delta table at its expected workspace and Lakehouse path. A continuation
+token or missing, malformed or mismatched metadata blocks this observation;
+pagination is not implemented. Missing or mismatched bindings block validation.
 
-These are metadata and configuration checks only: they do not prove the
-physical fact exists, the landing feeds that fact, owner provenance, the
-actual notebook principal's access, or a quiesced retained-key inventory. A
-successful read is not a readiness decision; `validate-only` remains blocked.
+These are point-in-time metadata and configuration checks only. Demo 1 and
+Demo 2 fact identities, table schemas or contents, the landing-to-fact linkage,
+owner provenance, the actual notebook principal's access and a complete,
+quiesced retained-key inventory remain unverified. A successful read is not a
+readiness decision; `validate-only` remains blocked.
 
 For a fresh deployment, `deploy.py --mode resolve-candidate-ids` accepts the
 normal v1 arguments, reads and validates the owned `shared-producer-v1.json`

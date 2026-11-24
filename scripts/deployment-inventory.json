@@ -148,6 +148,20 @@
   ],
   "reported_observations": [
     {
+      "track": "demo-1",
+      "source": "Shared integration CLI-principal selected-target metadata readback",
+      "recorded_utc": "2026-11-24T02:48:25Z",
+      "candidate_fact_binding": {"workspace_id": "14080576-9158-4326-8014-427c8009ce12", "item_id": "aeb1cd2c-bc1f-4bf0-960c-d716ed7d5659", "fact": "silver.sales_joined"},
+      "note": "A read-only selected-target helper call using a provisional candidate and the expected MCAP CLI principal matched the workspace, generic and typed Lakehouse item, and configured same-item landing identity. It did not independently verify the fact, folder contents, deployment ownership, landing-to-fact linkage, measured-runtime access, retained-key inventory or writer quiescence."
+    },
+    {
+      "track": "demo-2",
+      "source": "Shared integration CLI-principal selected-target metadata readback",
+      "recorded_utc": "2026-11-24T02:48:25Z",
+      "candidate_fact_binding": {"workspace_id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f", "item_id": "9b3fd360-a689-4163-91d6-3981882cd6c8", "fact": "FactSales"},
+      "note": "A read-only selected-target helper call using a provisional candidate and the expected MCAP CLI principal matched the workspace, generic and typed KQL Database, Eventhouse parent, and configured database and endpoints. The fact and CSV mapping names were checked against configuration, not against live table or mapping metadata. Deployment ownership, measured-runtime access, retained-key inventory and writer quiescence remain unverified."
+    },
+    {
       "track": "demo-3",
       "source": "Demo 3 owner isolated audit response-loss probe",
       "note": "A client wrapper discarded responses after real OneLake lock creation and Copy-intent writes. Both persisted locks blocked a competing cooperative writer, and an in-flight intent could not be released. No Copy or target query was sent; the known test objects were conditionally removed. This simulated lost client responses, not a network interruption, process crash, pipeline identity or fencing of external writers."

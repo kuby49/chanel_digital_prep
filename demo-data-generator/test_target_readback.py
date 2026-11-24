@@ -423,6 +423,12 @@ class MeasuredRuntimeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 client.request("GET", f"/v1/operations/{NOTEBOOK}")
             self.assertEqual(calls[-1][0].get_header("X-ms-fabric-skill"), skill)
+        with self.assertRaises(RuntimeError):
+            client.request("GET", f"/v1/connections/{NOTEBOOK}")
+        count = len(calls)
+        with self.assertRaises(ValueError):
+            client.request("PATCH", f"/v1/connections/{NOTEBOOK}", {})
+        self.assertEqual(len(calls), count)
 
 
 class OneLakeTableClientTests(unittest.TestCase):

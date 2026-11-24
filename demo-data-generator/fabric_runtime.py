@@ -47,8 +47,11 @@ class RuntimeFabricClient:
         self._clock = clock
 
     def request(self, method, path, payload=None, timeout=30):
+        allowed_path = isinstance(path, str) and (
+            path.startswith(("/v1/workspaces/", "/v1/operations/"))
+            or method == "GET" and re.fullmatch(r"/v1/connections/[0-9a-fA-F-]{36}", path))
         if (method not in ("GET", "POST", "PATCH", "DELETE")
-                or not isinstance(path, str) or not path.startswith(("/v1/workspaces/", "/v1/operations/"))
+                or not allowed_path
                 or "\\" in path or "#" in path or any(ord(char) < 32 for char in path)):
             raise ValueError("Invalid runtime Fabric request")
         if type(timeout) not in (int, float) or not 0 < timeout <= 600:

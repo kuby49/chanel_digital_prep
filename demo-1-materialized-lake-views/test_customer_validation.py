@@ -287,6 +287,72 @@ class CustomerValidationTest(unittest.TestCase):
             managed_refresh.manage(self.config, "chanel", self.root, "start", yes=True)
         self.assertEqual(client.request.call_count, 1)
 
+    def test_stop_persists_response_before_independent_readback(self):
+        self.recurring()
+        client, root = self.schedule_transport()
+        managed_refresh.manage(self.config, "chanel", self.root, "start", yes=True)
+        path = managed_refresh.schedule_file(self.root, self.config)
+        original = json.loads(path.read_text())
+        mutate = client.request.side_effect
+
+        def patch_schedule(method, endpoint, payload):
+            status, _, reply, readable = mutate(method, endpoint, payload)
+            return status, {"x-ms-request-id": "request-id", "set-cookie": "not-journaled"}, reply, readable
+
+        def readback(transport, endpoint):
+            headers, reply = self.response(transport, endpoint)
+            if endpoint == root + "/schedules/" + INTENT and reply["enabled"] is False:
+                pending = json.loads(path.read_text())
+                self.assertEqual(pending["status"], "stop-pending")
+                self.assertEqual(pending["stop_intent"]["path"], endpoint)
+                self.assertEqual(pending["stop_response"], {
+                    "status": 200, "headers": {"x-ms-request-id": "request-id"},
+                    "body": reply, "body_read": True,
+                })
+            return headers, reply
+
+        client.request.side_effect = patch_schedule
+        with patch("managed_refresh._object_response", side_effect=readback):
+            self.assertEqual(managed_refresh.manage(self.config, "chanel", self.root, "stop", yes=True)["status"], "pass")
+        stopped = json.loads(path.read_text())
+        self.assertEqual(stopped["create_response"], original["create_response"])
+        self.assertEqual(stopped["stop_readback"], self.overrides[root + "/schedules/" + INTENT])
+
+    def test_unexpected_or_unreadable_stop_response_is_retained_and_never_retried(self):
+        self.recurring()
+        client, root = self.schedule_transport()
+        managed_refresh.manage(self.config, "chanel", self.root, "start", yes=True)
+        path = managed_refresh.schedule_file(self.root, self.config)
+        original = path.read_bytes()
+        endpoint = root + "/schedules/" + INTENT
+        live = copy.deepcopy(self.overrides[endpoint])
+        for status, headers, body, readable in (
+            (202, {"location": "https://api.fabric.microsoft.com/v1/operations/" + OWNER,
+                   "x-ms-operation-id": OWNER}, None, True),
+            (200, {"x-ms-request-id": OWNER}, None, False),
+        ):
+            with self.subTest(status=status):
+                path.write_bytes(original)
+                self.overrides[endpoint] = copy.deepcopy(live)
+                client.request.reset_mock(side_effect=True)
+                client.request.return_value = (status, headers, body, readable)
+                with self.assertRaises(CandidateBlocked):
+                    managed_refresh.manage(self.config, "chanel", self.root, "stop", yes=True)
+                pending = json.loads(path.read_text())
+                self.assertEqual(pending["status"], "stop-pending")
+                self.assertEqual(pending["stop_response"], {
+                    "status": status, "headers": headers, "body": body, "body_read": readable,
+                })
+                with self.assertRaises(CandidateBlocked):
+                    managed_refresh.manage(self.config, "chanel", self.root, "stop", yes=True)
+                self.overrides[endpoint]["enabled"] = False
+                with self.assertRaises(CandidateBlocked):
+                    managed_refresh.manage(self.config, "chanel", self.root, "stop", yes=True)
+                observed = managed_refresh.manage(self.config, "chanel", self.root, "status")
+                self.assertFalse(observed["enabled"])
+                self.assertEqual(json.loads(path.read_text()), pending)
+                client.request.assert_called_once_with("PATCH", endpoint, pending["stop_intent"]["request"])
+
     def test_plan_is_local_and_enforces_exact_counts_and_window(self):
         self.recurring()
         payload = managed_refresh.plan(self.config, duration_minutes=19)

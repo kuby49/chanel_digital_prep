@@ -279,7 +279,12 @@ finally/cleanup; the shared schedule remains under its explicit bound.
 At the end of the operating window, use `managed_refresh.py status/stop --yes`
 with the **original setup config and journal**, not a fresh native run ID.
 Confirm disabled readback and wait for any active lineage refresh to become
-terminal. There is no automatic job cancellation or schedule extension.
+terminal. MLV schedule and job pagination stays on the public Fabric API and
+blocks on inconsistent continuations. The setup journal retains the stop
+intent, response and disabled readback. Only a documented synchronous HTTP 200
+can confirm the PATCH; use read-only status to investigate an uncertain result,
+and never resubmit it blindly. There is no automatic job cancellation or
+schedule extension.
 
 ## Entry point
 

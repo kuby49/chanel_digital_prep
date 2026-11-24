@@ -20,6 +20,10 @@ from provision_synthetic import FabricClient, _object_response, _verify_confirme
 TERMINAL = ("Completed", "Failed", "Cancelled", "Deduped")
 MARGIN_MINUTES = 5
 MAX_WINDOW_MINUTES = 180
+STOP_RECEIPT_HEADERS = {
+    "activityid", "content-type", "date", "location", "requestid", "retry-after",
+    "x-ms-activity-id", "x-ms-correlation-request-id", "x-ms-operation-id", "x-ms-request-id",
+}
 
 
 def recurring_run(data):
@@ -142,6 +146,20 @@ def _record(config, prefix, state_dir, journal):
     _check_payload(config, record.get("request"))
     _check_live(record.get("create_response"), record, True)
     return record
+
+
+def _check_stop_response(record, intent):
+    receipt = record.get("stop_response")
+    if record.get("stop_intent") != intent or not isinstance(receipt, dict):
+        raise CandidateBlocked("No confirmed stop receipt; reconcile by readback, never repeat the PATCH.")
+    if receipt.get("status") != 200:
+        raise CandidateBlocked(
+            f"Schedule stop returned HTTP {receipt.get('status')}; only synchronous HTTP 200 is documented. "
+            "Preserve the receipt; no polling or automatic retry."
+        )
+    if receipt.get("body_read") is not True:
+        raise CandidateBlocked("Schedule stop response was unreadable; reconcile by readback, no retry.")
+    _check_live(receipt.get("body"), record, False)
 
 
 def _page(client, path, *, read=None):
@@ -293,24 +311,33 @@ def manage(config, prefix, state_dir, action, *, yes=False, start_delay_minutes=
             _persist(path, record)
         else:
             record = _record(config, prefix, state_dir, journal)
-            _, live = _object_response(client, root + "/schedules/" + record["schedule_id"])
+            schedule_path = root + "/schedules/" + record["schedule_id"]
+            _, live = _object_response(client, schedule_path)
             if type(live.get("enabled")) is not bool:
                 raise CandidateBlocked("Native schedule enabled state is unknown.")
             _check_live(live, record, live["enabled"])
             if action == "stop":
+                intent = {"path": schedule_path, "request": {**record["request"], "enabled": False}}
                 if live["enabled"]:
-                    if record["status"] != "confirmed":
+                    if record["status"] != "confirmed" or "stop_intent" in record or "stop_response" in record:
                         raise CandidateBlocked("Unresolved stop; reconcile the retained schedule before any retry.")
-                    record["status"] = "stop-pending"
+                    record.update(status="stop-pending", stop_intent=intent)
                     _persist(path, record)
-                    request = {**record["request"], "enabled": False}
-                    status, _, _, _ = client.request("PATCH", root + "/schedules/" + record["schedule_id"], request)
-                    if status != 200:
-                        raise CandidateBlocked(f"Schedule stop returned HTTP {status}; no automatic retry.")
-                    _, live = _object_response(client, root + "/schedules/" + record["schedule_id"])
+                    status, headers, body, readable = client.request("PATCH", schedule_path, intent["request"])
+                    record["stop_response"] = {
+                        "status": status, "headers": {key: value for key, value in headers.items()
+                                                       if key in STOP_RECEIPT_HEADERS},
+                        "body": body if readable else None, "body_read": readable,
+                    }
+                    _persist(path, record)
+                    _check_stop_response(record, intent)
+                    _, live = _object_response(client, schedule_path)
+                elif record["status"] == "stop-pending":
+                    _check_stop_response(record, intent)
                 _check_live(live, record, False)
-                record["status"] = "stopped"
-                _persist(path, record)
+                if record["status"] != "stopped":
+                    record.update(status="stopped", stop_readback=live)
+                    _persist(path, record)
         jobs = _page(client, root + "/instances")
         active = [row.get("id") for row in jobs if row.get("status") not in TERMINAL]
         return {

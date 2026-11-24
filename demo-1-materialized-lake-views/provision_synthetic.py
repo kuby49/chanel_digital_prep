@@ -27,6 +27,22 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _read_response(response, status, *, retain_ambiguous_headers=False):
+    headers = {key.lower(): value for key, value in response.headers.items()}
+    duplicates = {key: values for key in ("location", "x-ms-operation-id", "retry-after")
+                  if len(values := response.headers.get_all(key, [])) > 1}
+    if duplicates:
+        return status, {**headers, **duplicates} if retain_ambiguous_headers else {}, None, False
+    try:
+        raw = response.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return status, headers, None, False
+        parsed = json.loads(raw, object_pairs_hook=_unique_pairs) if raw else None
+        return status, headers, parsed, True
+    except (ValueError, HTTPException, OSError):
+        return status, headers, None, False
+
+
 class FabricClient:
     def __init__(self, tenant, principal, timeout, azure_config):
         self.end = time.monotonic() + timeout
@@ -87,21 +103,11 @@ class FabricClient:
         request = Request(FABRIC_ORIGIN + path + query, data=payload, headers=headers, method=method)
         try:
             with self.requester.open(request, timeout=min(45, self.remaining())) as response:
-                status = response.status
-                headers = {key.lower(): value for key, value in response.headers.items()}
-                if any(len(response.headers.get_all(key, [])) > 1
-                       for key in ("Location", "x-ms-operation-id", "Retry-After")):
-                    return status, {}, None, False
-                try:
-                    raw = response.read(1024 * 1024 + 1)
-                    if len(raw) > 1024 * 1024:
-                        return status, headers, None, False
-                    parsed = json.loads(raw, object_pairs_hook=_unique_pairs) if raw else None
-                    return status, headers, parsed, True
-                except (ValueError, HTTPException, OSError):
-                    return status, headers, None, False
+                return _read_response(response, response.status, retain_ambiguous_headers=method == "PATCH")
         except HTTPError as error:
             with error:
+                if method == "PATCH":
+                    return _read_response(error, error.code, retain_ambiguous_headers=True)
                 return error.code, {}, None, False
         except (URLError, HTTPException, OSError):
             raise CandidateBlocked("Fabric response was not obtained; a pending create cannot be retried.") from None

@@ -1,5 +1,6 @@
 import base64
 from email.message import Message
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 from ownership import (
     AZURE_CLI_TIMEOUT_SECONDS, FABRIC_ORIGIN, LOCK_FILE, STATE_FILE, CandidateBlocked, _az_json, _state_lock,
@@ -292,6 +294,15 @@ class TransportTest(unittest.TestCase):
             for method, unsafe_path in (("GET", WS), ("POST", path)):
                 with self.subTest(method=method, path=unsafe_path), self.assertRaises(ValueError):
                     client.request(method, unsafe_path, continuation_token="token")
+            headers = Message()
+            headers["Retry-After"] = "20"
+            headers["X-MS-Request-ID"] = "request-id"
+            send.side_effect = HTTPError(FABRIC_ORIGIN + path, 429, "Throttled", headers,
+                                         BytesIO(b'{"errorCode":"TooManyRequests"}'))
+            self.assertEqual(client.request("PATCH", path), (
+                429, {"retry-after": "20", "x-ms-request-id": "request-id"},
+                {"errorCode": "TooManyRequests"}, True,
+            ))
 
     @patch("ownership.shutil.which", return_value="az")
     @patch("ownership.subprocess.run")

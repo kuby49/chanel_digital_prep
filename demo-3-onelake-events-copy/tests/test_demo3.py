@@ -919,6 +919,16 @@ class NativeGuardTests(unittest.TestCase):
         self.assertIn("from native_guard import execute", source)
         self.assertNotIn(self.config.run_id, source)
 
+    def test_native_notebook_policy_order_does_not_change_packaged_source(self):
+        policy = copy.deepcopy(self.policy)
+        reordered = dict(reversed(list(policy.items())))
+        reordered["run_template"] = dict(reversed(list(policy["run_template"].items())))
+        args = (self.settings["workspace_id"], self.settings["item_id"], "NativeDemo",
+                str(uuid.uuid4()), str(uuid.uuid4()))
+        first = guarded_notebook.build_native_notebook(self.producer_path.parent, policy, *args)
+        second = guarded_notebook.build_native_notebook(self.producer_path.parent, reordered, *args)
+        self.assertEqual(first, second)
+
     def test_contended_event_waits_past_sixty_seconds_without_stealing_writer(self):
         first = audit.BatchAudit(self.target, self.settings["workspace_id"], self.settings["item_id"])
         held = first.acquire(str(uuid.uuid4()), "older_run_0001")

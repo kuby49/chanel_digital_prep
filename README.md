@@ -44,7 +44,8 @@ and monitor jobs were terminal, and its writer lock was absent. Demo 3's owned
 jobs were terminal and its writer lock was absent; event-queue drainage remains
 unverified. No sales delivery is claimed.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
-bounded schedule and updated profile were subsequently confirmed. The
+bounded schedule and updated profile were subsequently confirmed. The new
+schedule was also disabled and read back after the failed run. The
 first-cycle Demo 3 rule was disabled and read back; its second cycle was
 enabled after rebinding the guard to the replacement staging Lakehouse and
 disabled again after the failed run. A requested

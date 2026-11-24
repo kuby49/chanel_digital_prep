@@ -219,6 +219,22 @@ retaining the producer's lifecycle lock. The barrier does not establish that
 Fabric's event queue or jobs are drained, and it is not a complete native
 readiness or delivery-verification hook.
 
+`native_demo3.py` contains local-only producer hooks. Before generating the
+reusable producer profile, a future authorized setup must pin
+`demo-3.native_proof`: version, owned workspace/Lakehouse/guard/pipeline/Reflex/
+connection IDs, owner marker, native policy and generator SHA-256, plus
+`guard_sha256`, `pipeline_sha256`, and `graph_disabled_sha256`. The hashes
+cover canonical JSON (sorted keys, compact UTF-8, no newline) of respectively
+`_guard(notebook)`, `pipeline["properties"]`, and `_graph(graph, enabled=False)`
+from **confirmed live readbacks** matching the owned deployment and its
+journal. Do not treat the offline candidate as a confirmed readback.
+Each native launch checks the pinned live definitions, enabled rule, connection,
+ownership, writer quiescence and deterministic dimensions before publishing.
+Verification requires matching producer bytes, completed event-origin audits,
+completed pipeline jobs, and fresh exact Delta/dimension readback for every
+batch. Failed or unavailable evidence blocks the run. The hooks and their
+profile integration have not been verified in Fabric.
+
 After coordinated stopped-state verification, exclusively create
 `demo3-native-binding-state.json` with the existing resource IDs, generator
 fingerprint, `native_policy`, `native_policy_sha256`, the disabled graph and

@@ -1,3 +1,4 @@
+import base64
 import copy
 import importlib.util
 import json
@@ -1025,6 +1026,159 @@ class NativeGuardTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, modules), self.assertRaisesRegex(TimeoutError, "deadline"):
             native_stop.stop(context, None)
         self.assertEqual(self.target.read(audit.LOCK_PATH), existing)
+
+    def test_native_lifecycle_requires_enabled_graph_and_verifies_each_event_batch(self):
+        from dataclasses import asdict, replace
+
+        config = replace(self.config, file_count=1, rows_per_file=2)
+        self.config = config
+        self.manifest = self.generator.new_manifest(config, ["demo-3"])
+        self.manifest["demo3_admission"] = {
+            "version": 1, "state": "open", "workspace_id": self.target.workspace_id,
+            "lakehouse_id": self.target.lakehouse_id, "stop_config_sha256": "c" * 64,
+            "config_sha256": self.native.config_sha256(asdict(config)),
+            "expires_at_utc": (self.now + timedelta(seconds=1800)).isoformat(),
+        }
+        source, entry = self.generator.batch_bytes(config, 1)
+        self.manifest["batches"]["1"] = {**entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+        self.subject = "/Files/incoming/sales/" + entry["filename"]
+        self.target.create(self.subject[1:], source)
+        self.publish()
+        batch_audit = self.native.AdmissionAudit(
+            self.target, self.target.workspace_id, self.target.lakehouse_id, self.resolve)
+        guarded = delivery_runtime.GuardedDelivery(self.generator, config, self.authority, batch_audit)
+        job = str(uuid.uuid4())
+        attempt = guarded.prepare(job, self.subject, "actual-event", "event")
+        guarded.finish(job, attempt, {
+            "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+            "files_read": 1, "rows_read": 2, "rows_copied": 2,
+        }, lambda _: self.proof(entry))
+
+        ids = [str(uuid.uuid4()) for _ in range(5)]
+        tenant, notebook_id, pipeline_id, reflex_id, connection_id = ids
+        sample = {"type": activator.EVENT_TYPE, "id": "sample",
+                  "subject": self.subject,
+                  "source": f"/tenants/{tenant}/workspaces/{self.target.workspace_id}/items/{self.target.lakehouse_id}"}
+        graph = activator.build_native_definition(
+            tenant, self.target.workspace_id, self.target.lakehouse_id, pipeline_id, sample)
+        notebook = {"cells": [{"source": ["verified"]}],
+                    "metadata": {"trident": {"lakehouse": {"default_lakehouse": self.target.lakehouse_id}}}}
+        pipeline = {"properties": {"guarded": True}}
+        marker = "owned-marker-123"
+        data = {"notebook-content.ipynb": notebook, "pipeline-content.json": pipeline,
+                "ReflexEntities.json": graph}
+
+        class Client:
+            def list_all(client, path):
+                if "lakehouses" in path:
+                    identity = self.target.lakehouse_id
+                elif "type=Notebook" in path:
+                    identity = notebook_id
+                elif "type=DataPipeline" in path:
+                    identity = pipeline_id
+                elif "reflexes" in path:
+                    identity = reflex_id
+                else:
+                    return []
+                return [{"id": identity, "description": marker}]
+
+            def get(client, path, deadline=None):
+                return {}, {"id": connection_id, "connectionDetails": {"type": "Lakehouse"}}
+
+            def request(client, method, path, payload=None, timeout=30):
+                if method == "GET":
+                    return 200, {}, {"status": "Completed"}
+                part = ("ReflexEntities.json" if "reflexes" in path else
+                        "notebook-content.ipynb" if "format=ipynb" in path else "pipeline-content.json")
+                encoded = base64.b64encode(json.dumps(data[part]).encode()).decode()
+                return 200, {}, {"definition": {"parts": [
+                    {"path": part, "payloadType": "InlineBase64", "payload": encoded}]}}
+
+        modules = {"generator": self.generator, "fabric_runtime": types.SimpleNamespace(
+            run_config=lambda document: (config, 1800)),
+            "guard_spark": types.SimpleNamespace(query_target=lambda *args: self.proof(entry))}
+        with mock.patch.dict(sys.modules, modules):
+            import native_demo3
+
+            proof = {"version": 1, "workspace_id": self.target.workspace_id,
+                     "lakehouse_id": self.target.lakehouse_id, "guard_notebook_id": notebook_id,
+                     "pipeline_id": pipeline_id, "reflex_id": reflex_id, "connection_id": connection_id,
+                     "marker": marker, "native_policy": self.policy,
+                     "generator_sha256": self.generator.generator_source_sha256(),
+                     "guard_sha256": native_demo3._digest(native_demo3._guard(notebook)),
+                     "pipeline_sha256": native_demo3._digest(pipeline["properties"]),
+                     "graph_disabled_sha256": native_demo3._digest(native_demo3._graph(graph, enabled=False))}
+            document = {"data": {"run_id": config.run_id}, "demo-3": {"native_proof": proof},
+                        "shared": {"workspace_id": self.authority.workspace_id,
+                                   "staging_lakehouse_id": self.authority.lakehouse_id, "target_bindings": {
+                "demo-3": {"workspace_id": self.target.workspace_id, "item_id": self.target.lakehouse_id,
+                           "fact": "dbo.factsales"}}}}
+            digest = native_demo3._digest(document)
+            binding = {"run_id": config.run_id, "config_sha256": digest, "nonce": "native-" + digest[:32],
+                       "producer": {"workspace_id": self.authority.workspace_id,
+                                    "staging_lakehouse_id": self.authority.lakehouse_id}}
+            client = Client()
+            context = {"document": document, "binding": binding, "store": self.authority,
+                       "fabric_factory": lambda skill: client,
+                       "store_factory": lambda ws, lh: self.target, "read_manifest": lambda: self.manifest,
+                       "clock": lambda: self.now, "sleep": lambda seconds: None, "stop_requested": lambda: False,
+                       "preparation_deadline_utc": (self.now + timedelta(minutes=5)).isoformat(),
+                       "verification_deadline_utc": (self.now + timedelta(minutes=10)).isoformat(),
+                       "spark": object(), "notebookutils": object()}
+            with mock.patch.object(native_demo3, "_dimensions"), self.assertRaisesRegex(ValueError, "rule state"):
+                native_demo3.prepare(context)
+            graph[3]["payload"]["definition"]["settings"]["shouldRun"] = True
+            with mock.patch.object(native_demo3, "_dimensions"):
+                prepared = native_demo3.prepare(context)
+            self.assertEqual(native_demo3.verify(context, prepared)["batch_count"], 1)
+            path = audit.RECORD_PREFIX + entry["batch_id"] + ".json"
+            original = self.target.read(path)
+            changed = json.loads(original[0])
+            changed["observations"][0].update(origin="recovery", event_id=None)
+            self.target.objects[path] = (json.dumps(changed).encode(), original[1])
+            with self.assertRaisesRegex(RuntimeError, "no matching event"):
+                native_demo3.verify(context, prepared)
+            self.target.objects[path] = original
+            with mock.patch.object(native_demo3.guard_spark, "query_target",
+                                   return_value={**self.proof(entry), "row_difference_count": 1}):
+                with self.assertRaisesRegex(RuntimeError, "fact or dimension"):
+                    native_demo3.verify(context, prepared)
+            self.manifest["demo3_admission"]["workspace_id"] = str(uuid.uuid4())
+            with self.assertRaisesRegex(ValueError, "destination-bound"):
+                native_demo3.verify(context, prepared)
+            self.manifest["demo3_admission"]["workspace_id"] = self.target.workspace_id
+            graph[3]["payload"]["definition"]["instance"] = "{}"
+            with mock.patch.object(native_demo3, "_dimensions"), self.assertRaisesRegex(RuntimeError, "differs"):
+                native_demo3.prepare(context)
+
+    def test_native_definition_read_polls_only_the_recorded_operation(self):
+        operation = str(uuid.uuid4())
+        payload = base64.b64encode(b'{"properties":{"ok":true}}').decode()
+        client = types.SimpleNamespace(request=mock.Mock(side_effect=[
+            (202, {"x-ms-operation-id": operation}, None),
+            (200, {}, {"status": "Running"}),
+            (200, {}, {"status": "Succeeded"}),
+            (200, {}, {"definition": {"parts": [{
+                "path": "pipeline-content.json", "payloadType": "InlineBase64", "payload": payload}]}}),
+        ]))
+        clock = [self.now]
+        context = {"clock": lambda: clock[0],
+                   "sleep": lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds)),
+                   "stop_requested": lambda: False}
+        modules = {"generator": self.generator, "fabric_runtime": types.SimpleNamespace(run_config=None),
+                   "guard_spark": types.SimpleNamespace()}
+        with mock.patch.dict(sys.modules, modules):
+            import native_demo3
+
+            result = native_demo3._definition(
+                context, client, "/v1/workspaces/a/items/b/getDefinition", "pipeline-content.json",
+                self.now + timedelta(seconds=20))
+        self.assertEqual(result, {"properties": {"ok": True}})
+        self.assertEqual([call.args[:2] for call in client.request.call_args_list], [
+            ("POST", "/v1/workspaces/a/items/b/getDefinition"),
+            ("GET", "/v1/operations/" + operation),
+            ("GET", "/v1/operations/" + operation),
+            ("GET", "/v1/operations/" + operation + "/result")])
 
     def test_native_lock_readback_conflict_never_retries_successful_create(self):
         guarded = self.native.AdmissionAudit(

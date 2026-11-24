@@ -31,6 +31,101 @@ def load_script(name, path):
 
 
 class SharedManifestIntegrationTest(unittest.TestCase):
+    def test_native_demo3_publisher_proof_is_consumed_by_bundled_hooks(self):
+        import fabric_assets
+
+        workspace = "11111111-1111-4111-8111-111111111111"
+        lakehouse = "22222222-2222-4222-8222-222222222222"
+        definition = fabric_assets.notebook_definition(workspace, lakehouse, "producer_staging")
+        notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+        bundle = "".join(notebook["cells"][1]["source"])
+        script = bundle + """
+import copy
+import importlib.util
+import json
+import sys
+import types
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+from fabric_runtime import native_parameters
+from native_lifecycle import load_hooks
+
+root = Path(sys.argv[1])
+hook = load_hooks(["demo-3"])["demo-3"]
+sys.path[0:0] = [str(root / "demo-3-onelake-events-copy" / "tests"),
+                 str(root / "demo-3-onelake-events-copy"), str(root / "demo-data-generator")]
+import test_native_binding as fixture
+import native_binding
+
+case = fixture.NativeBindingTests("test_proof_requires_confirmed_actions_and_fresh_matching_readbacks")
+case.setUpClass()
+case.setUp()
+try:
+    state = copy.deepcopy(case.template)
+    state["publisher"] = copy.deepcopy(case.binding.pinned)
+    state["actions"] = {name: {"status": "confirmed-readback", "http": 200,
+                               "time_utc": "2030-01-01T00:00:00+00:00",
+                               "confirmed_at_utc": "2030-01-01T00:01:00+00:00"}
+                        for name in native_binding._ACTIONS}
+    case.write(fixture.check.NATIVE_JOURNAL, state)
+    pipeline = {"properties": {"activities": [{"name": "GuardedCopy"}]}}
+    with mock.patch.object(native_binding, "_quiescent", return_value=pipeline), \\
+         mock.patch.object(native_binding, "_guard", return_value=case.binding.notebook), \\
+         mock.patch.object(native_binding, "_graph", return_value=case.binding.graph):
+        proof = case.binding.proof(case.root / "proof.json")
+
+    enabled = copy.deepcopy(case.binding.graph)
+    rule = next(item for item in enabled if item.get("type") == "timeSeriesView-v1"
+                and item["payload"]["definition"]["type"] == "Rule")
+    rule["payload"]["definition"]["settings"]["shouldRun"] = True
+    assert hook._digest(hook._graph(enabled, enabled=True)) == proof["graph_disabled_sha256"]
+    assert hook._digest(hook._guard(case.binding.notebook)) == proof["guard_sha256"]
+    assert hook._digest(pipeline["properties"]) == proof["pipeline_sha256"]
+
+    spec = importlib.util.spec_from_file_location("shared_deploy", root / "demo-data-generator" / "deploy.py")
+    shared_deploy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shared_deploy)
+    config = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
+    target = {"workspace_id": proof["workspace_id"], "item_id": proof["lakehouse_id"], "fact": "dbo.factsales"}
+    producer = {"workspace_id": fixture.check.STAGING_WORKSPACE,
+                "staging_lakehouse_id": fixture.check.STAGING_LAKEHOUSE,
+                "producer_notebook_id": "33333333-3333-4333-8333-333333333333"}
+    config["demo-3"].update({"native_proof": proof,
+        "landing_uri": f"abfss://{proof['workspace_id']}@onelake.dfs.fabric.microsoft.com/"
+                       f"{proof['lakehouse_id']}/Files/incoming/sales/"})
+    config["shared"].update({**producer, "identity_id": "44444444-4444-4444-8444-444444444444",
+        "target_bindings": {"demo-3": target}, "native_launch": True, "native_reusable": True,
+        "native_selected_demos": "demo-3"})
+    resources = {"workspace": {"id": producer["workspace_id"]},
+                 "staging_lakehouse": {"id": producer["staging_lakehouse_id"]},
+                 "notebook": {"id": producer["producer_notebook_id"]}}
+    profile = shared_deploy._native_profile(config, resources)
+    results = []
+    for minute in (0, 1):
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=minute)
+        document, _, binding, _, _ = native_parameters(profile, now=now)
+        observed, run = hook._proof(document)
+        store = types.SimpleNamespace(workspace_id=producer["workspace_id"],
+                                      lakehouse_id=producer["staging_lakehouse_id"])
+        hook._binding({"document": document, "binding": binding, "store": store}, run)
+        assert observed == proof
+        results.append(run.run_id)
+    assert results[0] != results[1]
+    print(json.dumps(results))
+finally:
+    case.doCleanups()
+    case.doClassCleanups()
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ, TEMP=directory, TMP=directory,
+                               DEMO3_PRODUCER_PATH=str(ROOT / "demo-data-generator" / "generator.py"))
+            completed = subprocess.run([sys.executable, "-I", "-B", "-", str(ROOT)], input=script, text=True,
+                                       capture_output=True, env=environment, timeout=60, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        first, second = json.loads(completed.stdout.splitlines()[-1])
+        self.assertNotEqual(first, second)
+
     def test_native_demo1_bundle_reconciles_real_producer_manifests_across_clicks(self):
         import fabric_assets
 

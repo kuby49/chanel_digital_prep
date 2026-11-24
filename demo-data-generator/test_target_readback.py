@@ -418,6 +418,11 @@ class MeasuredRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.request("POST", "https://untrusted.invalid/run")
         self.assertEqual(len(calls), 1)
+        for skill in ("activator-cli", "eventhouse-cli"):
+            client = RuntimeFabricClient(lambda: "checked-token", opener=Unknown(), skill=skill)
+            with self.assertRaises(RuntimeError):
+                client.request("GET", f"/v1/operations/{NOTEBOOK}")
+            self.assertEqual(calls[-1][0].get_header("X-ms-fabric-skill"), skill)
 
 
 class OneLakeTableClientTests(unittest.TestCase):

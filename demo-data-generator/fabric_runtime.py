@@ -39,7 +39,7 @@ class RuntimeFabricClient:
     """Bounded Fabric requests using checked notebook credentials; no mutation retries."""
 
     def __init__(self, token_provider, *, skill="spark-cli", opener=None, clock=time.monotonic):
-        if not callable(token_provider) or skill not in ("spark-cli", "eventhouse-cli"):
+        if not callable(token_provider) or skill not in ("spark-cli", "eventhouse-cli", "activator-cli"):
             raise ValueError("Invalid runtime Fabric client")
         self.token_provider = token_provider
         self.skill = skill

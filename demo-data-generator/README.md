@@ -122,7 +122,8 @@ and cleanup; delivery success alone is not end-to-end success.
 
 Context is a dict with immutable-by-contract `document` and `binding`,
 conditional producer-staging `store`, checked-token `store_factory(ws, lh)`,
-`fabric`, active `spark`, `token_provider(audience)`, `manifest_path`,
+`fabric`, `fabric_factory(skill)`, active `spark`, `notebookutils`,
+`token_provider(audience)`, `manifest_path`,
 `read_manifest()`, `stop_requested()`, UTC `clock()`, and `sleep(seconds)`.
 It includes fixed UTC strings `preparation_deadline_utc`,
 `verification_deadline_utc`, `cleanup_deadline_utc` and `expires_at_utc`.
@@ -133,6 +134,14 @@ exact operation/job receipts and bounded reconciliation; a prepare exception
 does not mean its mutation failed. Cleanup is called with `prepared=None`
 after a partial prepare, and all previously attempted tracks are cleaned
 up even if another cleanup fails.
+
+The Fabric factory allows `spark-cli`, `eventhouse-cli` and `activator-cli`
+telemetry clients using the same identity-checked token. Async definition
+reads and mutations must be followed by the track's exact-ID operation
+polls, not reissued. A Demo 3 native hook may receive a sanitized deployment
+proof object as `demo-3.native_proof`; it is included in the immutable
+per-click document hash and does not replace live graph/definition,
+connection, access and output checks.
 
 The fixed producer staging object `Files/producer/native/writer.lock`
 serializes the complete native lifecycle across different run IDs and

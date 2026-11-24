@@ -1112,7 +1112,7 @@ def _native_profile(config, resources):
                        "monitor_definition_sha256", "verifier_definition_sha256", "shortcut_name",
                        "shortcut_target_path", "verification_batch", "verification_timeout_seconds",
                        "poll_interval_seconds", "max_concurrent_batches"),
-            "demo-3": (),
+            "demo-3": ("native_proof",),
         }
         for name in selected:
             runtime[name].update({key: config[name][key] for key in native_fields[name] if key in config[name]})

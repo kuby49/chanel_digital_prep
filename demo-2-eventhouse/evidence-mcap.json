@@ -1,7 +1,7 @@
 {
   "contract_version": 1,
   "environment": "MCAP",
-  "recorded_at_utc": "2026-11-23T23:10:52Z",
+  "recorded_at_utc": "2026-11-24T00:18:19Z",
   "status": "partial",
   "capacity": {
     "name": "fabricadbmirror",
@@ -60,6 +60,8 @@
     "batch_class": "bootstrap",
     "sha256": "384ffeeb886fab376ce9b76368230d33146553d5ec1f146db487ebe5115aa470",
     "row_count": 5,
+    "sales_line_ids": [1, 2, 3, 4, 5],
+    "other_fact_batches_present_at_key_readback": false,
     "sales_amount_minor_units": 526232,
     "amount_by_date": {
       "2026-01-01": 7020,
@@ -127,12 +129,23 @@
     "reported_high_concurrency": false,
     "measured_batches_started": false
   },
+  "nested_bootstrap_verifier": {
+    "monitor_probe_job_id": "8dd4e578-3001-4e16-b757-493d5f1bef4a",
+    "verification_job_id": "6ba4a611-722d-4332-966a-d24a65aece34",
+    "notebook_token_submission_and_readback_verified": true,
+    "bootstrap_reconciliation_verified": true,
+    "owned_probe_notebook_and_objects_removed": true,
+    "measured_batches_started": false
+  },
   "measured_run": {
     "started": false,
     "bootstrap_exclusion": "Manifest batch-class filter; not yet exercised by a measured run"
   },
   "limitations": [
     "Producer OneLake-to-local staging and packaged queued submission have not been verified in a measured run.",
+    "Fresh producer-runtime identity and effective ingestion permissions are not established by historical probes.",
+    "The manually provisioned workspace has no matching Demo 2 CLI ownership ledger or markers.",
+    "The global sales-line reservation contract is not finalized; the retained-key inventory does not prove writer quiescence.",
     "The independent per-batch monitor has not been verified against a measured run.",
     "Two concurrent verifier jobs succeeded, but Fabric reported high-concurrency mode disabled.",
     "Serialized replay was verified; concurrent duplicate submission safety was not established.",

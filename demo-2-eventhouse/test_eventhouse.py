@@ -292,6 +292,8 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(batches=batches):
                 with self.assertRaises(VerificationError):
                     measured_batches({"contract_version": 1, "batches": batches})
+        with self.assertRaises(VerificationError):
+            measured_batches({"contract_version": True, "batches": {"1": self.batch()}})
 
     def test_run_key_verification_rejects_non_measured_batches(self):
         with self.assertRaises(VerificationError):

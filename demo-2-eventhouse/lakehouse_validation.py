@@ -97,7 +97,11 @@ def verify_dimensions(spark, data, generator, lakehouse, schema=None):
 
 
 def measured_batches(manifest):
-    if not isinstance(manifest, dict) or manifest.get("contract_version") != 1:
+    if (
+        not isinstance(manifest, dict)
+        or type(manifest.get("contract_version")) is not int
+        or manifest["contract_version"] != 1
+    ):
         raise VerificationError("Manifest contract version must be 1")
     batches = manifest.get("batches")
     if not isinstance(batches, dict):
@@ -270,9 +274,19 @@ def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None):
         raise VerificationError("Run key verification accepts measured batches only")
     from pyspark.sql import functions as F
 
-    facts = spark.table(_table_name(lakehouse, shortcut, schema)).where(
-        F.col("BatchID").isin([batch["batch_id"] for batch in batches])
-    )
+    all_facts = spark.table(_table_name(lakehouse, shortcut, schema))
+    batch_ids = [batch["batch_id"] for batch in batches]
+    facts = all_facts.where(F.col("BatchID").isin(batch_ids))
     expected = sum(batch["row_count"] for batch in batches)
-    if facts.count() != expected or facts.select("SalesLineID").distinct().count() != expected:
+    keys = facts.select("SalesLineID")
+    if (
+        facts.count() != expected
+        or facts.where(F.col("SalesLineID").isNull()).limit(1).count()
+        or keys.distinct().count() != expected
+    ):
         raise VerificationError("Measured run has missing or duplicate sales-line keys")
+    other_keys = all_facts.where(
+        F.col("BatchID").isNull() | ~F.col("BatchID").isin(batch_ids)
+    ).select("SalesLineID")
+    if keys.join(other_keys, "SalesLineID", "left_semi").limit(1).count():
+        raise VerificationError("Measured run has sales-line keys already used by another batch or run")

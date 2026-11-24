@@ -55,6 +55,7 @@ def build_notebook(
         identifier(schema, "lakehouse schema")
     if not isinstance(data, dict):
         raise ValueError("data must be an object")
+    data = {**data, "run_id": None}
     verification_timeout_seconds = _positive_integer(
         verification_timeout_seconds, "verification_timeout_seconds"
     )

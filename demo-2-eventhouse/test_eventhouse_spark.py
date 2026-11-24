@@ -118,15 +118,28 @@ class SparkVerificationTests(unittest.TestCase):
         with self.assertRaises(VerificationError):
             verify_lakehouse_batch(self.spark, self.batch, "global_temp", "EventhouseFactSales")
 
-    def test_run_keys_ignore_bootstrap_but_reject_cross_batch_duplicates(self):
+    def test_run_keys_exclude_other_batches_but_reject_global_duplicates(self):
         from pyspark.sql import functions as F
 
-        bootstrap = self.facts.withColumn("BatchID", F.lit("bootstrap_0001"))
-        self.facts.union(bootstrap).createOrReplaceGlobalTempView("EventhouseFactSales")
+        bootstrap = self.facts.withColumn("BatchID", F.lit("bootstrap_0001")).withColumn(
+            "SalesLineID", F.col("SalesLineID") + 1000000
+        )
+        other_run = self.facts.withColumn("BatchID", F.lit("other_run_0001")).withColumn(
+            "SalesLineID", F.col("SalesLineID") + 2000000
+        )
+        self.facts.union(bootstrap).union(other_run).createOrReplaceGlobalTempView("EventhouseFactSales")
         verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
+
+        collision = self.facts.withColumn("BatchID", F.lit("other_run_0002"))
+        self.facts.union(bootstrap).union(collision).createOrReplaceGlobalTempView("EventhouseFactSales")
+        with self.assertRaisesRegex(VerificationError, "another batch or run"):
+            verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
+
         second = dict(self.batch, batch_id="spark_contract_0002")
         duplicate = self.facts.withColumn("BatchID", F.lit(second["batch_id"]))
-        self.facts.union(bootstrap).union(duplicate).createOrReplaceGlobalTempView("EventhouseFactSales")
+        self.facts.union(bootstrap).union(other_run).union(duplicate).createOrReplaceGlobalTempView(
+            "EventhouseFactSales"
+        )
         with self.assertRaises(VerificationError):
             verify_run_keys(self.spark, [self.batch, second], "global_temp", "EventhouseFactSales")
 

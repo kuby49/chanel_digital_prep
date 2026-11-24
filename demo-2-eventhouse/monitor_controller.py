@@ -126,7 +126,7 @@ def settings(parameters, *, lakehouse_id):
     }
 
 
-def _batch_fingerprint(batch):
+def batch_fingerprint(batch):
     fields = (
         "batch_id", "batch_number", "batch_class", "sha256", "row_count",
         "sales_amount_minor_units", "amount_by_date", "amount_by_product_category",
@@ -138,6 +138,49 @@ def _batch_fingerprint(batch):
         raise MonitorError("A measured batch is missing immutable evidence") from exc
     data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_delivery_evidence(batch, record):
+    """Require the producer's exact KQL reconciliation and terminal ingestion evidence."""
+    deliveries = batch.get("deliveries")
+    delivery = deliveries.get("demo-2") if isinstance(deliveries, dict) else None
+    if not isinstance(delivery, dict) or not isinstance(record, dict):
+        raise MonitorError("The measured batch lacks Demo 2 delivery evidence")
+    outcome = delivery.get("ingestion_outcome")
+    expected_fields = {
+        "status", "timestamp_utc", "source_id", "service_operation_id", "error_code", "diagnostic"
+    }
+    if (
+        delivery.get("status") != "verified"
+        or delivery.get("submission_status") != "submitted"
+        or not isinstance(outcome, dict)
+        or set(outcome) != expected_fields
+        or outcome.get("status") != "succeeded"
+        or outcome.get("error_code") is not None
+    ):
+        raise MonitorError("Kusto terminal success evidence is missing or invalid")
+    operation = _uuid(delivery.get("operation_id"), "delivery operation_id")
+    if (
+        record.get("operation_id") != operation
+        or _uuid(outcome.get("source_id"), "ingestion outcome source_id") != operation
+    ):
+        raise MonitorError("Kusto terminal success evidence does not match the submitted source")
+    if (
+        outcome.get("service_operation_id") is not None
+        and not isinstance(outcome["service_operation_id"], str)
+    ) or (
+        outcome.get("diagnostic") is not None and not isinstance(outcome["diagnostic"], str)
+    ):
+        raise MonitorError("Kusto terminal success evidence has invalid details")
+    _utc(outcome.get("timestamp_utc"), "ingestion outcome timestamp")
+    _utc(delivery.get("verified_at_utc"), "delivery verification timestamp")
+    expected = {
+        "verified_row_count": batch["row_count"],
+        "verified_total_minor_units": batch["sales_amount_minor_units"],
+        "verified_distinct_sales_line_ids": batch["row_count"],
+    }
+    if any(type(delivery.get(key)) is not int or delivery[key] != value for key, value in expected.items()):
+        raise MonitorError("Kusto reconciliation evidence does not match the measured batch")
 
 
 def _measured(manifest, cfg):
@@ -283,7 +326,7 @@ class Controller:
 
     def _record(self, batch, delivery, now):
         batch_id = batch["batch_id"]
-        fingerprint = _batch_fingerprint(batch)
+        fingerprint = batch_fingerprint(batch)
         record = self.state["batches"].get(batch_id)
         if record and record["fingerprint"] != fingerprint:
             raise MonitorError(f"Measured batch {batch_id} changed after observation")
@@ -386,6 +429,18 @@ class Controller:
             raise MonitorError("Producer scheduler state is invalid")
         if scheduler and scheduler.get("status") == "failed":
             raise MonitorError("Producer scheduler reported failure")
+        if scheduler and scheduler.get("status") == "completed":
+            result = scheduler.get("result")
+            if (
+                not scheduler.get("finished_at_utc")
+                or not isinstance(result, dict)
+                or result.get("verified") is not True
+                or result.get("errors") != []
+                or len(batches) != self.cfg["count"]
+            ):
+                raise MonitorError("Producer completion evidence is incomplete")
+            _utc(scheduler["finished_at_utc"], "producer completion timestamp")
+            _utc(result.get("deadline_utc"), "producer deadline")
 
         known = {batch["batch_id"]: batch for batch in batches}
         if any(batch_id not in known for batch_id in self.state["batches"]):
@@ -408,13 +463,7 @@ class Controller:
             if record.get("status") == "verified" and delivery.get("status") != "verified":
                 raise MonitorError(f"Measured batch {batch['batch_id']} lost its transport verification")
             if record.get("status") in ("spark_verified", "verified") and delivery.get("status") == "verified":
-                outcome = delivery.get("ingestion_outcome")
-                if (
-                    not isinstance(outcome, dict)
-                    or outcome.get("status") != "succeeded"
-                    or _uuid(outcome.get("source_id"), "ingestion outcome source_id") != record["operation_id"]
-                ):
-                    raise MonitorError("Kusto terminal success evidence is missing")
+                verify_delivery_evidence(batch, record)
                 record["status"] = "verified"
 
         active = sum(
@@ -429,14 +478,6 @@ class Controller:
                 active += 1
 
         if scheduler and scheduler.get("status") == "completed":
-            result = scheduler.get("result")
-            if (
-                not scheduler.get("finished_at_utc")
-                or not isinstance(result, dict)
-                or result.get("verified") is not True
-                or len(batches) != self.cfg["count"]
-            ):
-                raise MonitorError("Producer completion evidence is incomplete")
             if all(self.state["batches"].get(batch["batch_id"], {}).get("status") == "verified"
                    for batch in batches):
                 expected = {

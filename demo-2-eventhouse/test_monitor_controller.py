@@ -4,7 +4,9 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from monitor_controller import Controller, FabricClient, MonitorError, RetryLater, settings
+from monitor_controller import (
+    Controller, FabricClient, MonitorError, RetryLater, settings, verify_delivery_evidence,
+)
 from monitor_notebook_builder import build_monitor_notebook
 
 
@@ -76,6 +78,26 @@ def manifest(*batches, count=None):
         "batches": {str(item["batch_number"]): item for item in batches},
         "scheduler": {"status": "running"},
     }
+
+
+def verified_delivery(entry, timestamp=NOW):
+    delivery = entry["deliveries"]["demo-2"]
+    delivery.update(
+        status="verified",
+        verified_at_utc=stamp(timestamp),
+        verified_row_count=entry["row_count"],
+        verified_total_minor_units=entry["sales_amount_minor_units"],
+        verified_distinct_sales_line_ids=entry["row_count"],
+        ingestion_outcome={
+            "status": "succeeded",
+            "timestamp_utc": stamp(timestamp),
+            "source_id": delivery["operation_id"],
+            "service_operation_id": None,
+            "error_code": None,
+            "diagnostic": None,
+        },
+    )
+    return delivery
 
 
 class Clock:
@@ -212,11 +234,10 @@ class MonitorControllerTests(unittest.TestCase):
                           "sales_amount_minor_units": 300},
             })},
         }
-        delivery = doc["batches"]["1"]["deliveries"]["demo-2"]
-        delivery["status"] = "verified"
-        delivery["ingestion_outcome"] = {"status": "succeeded", "source_id": delivery["operation_id"]}
+        verified_delivery(doc["batches"]["1"], self.clock())
         doc["scheduler"] = {"status": "completed", "finished_at_utc": stamp(self.clock()),
-                            "result": {"verified": True, "errors": []}}
+                            "result": {"verified": True, "errors": [],
+                                       "deadline_utc": stamp(NOW + timedelta(minutes=5))}}
         self.controller._tick()
         self.assertEqual(self.client.started[1][0], "verify_run_keys")
         run_job = self.client.started[1][3]
@@ -296,6 +317,23 @@ class MonitorControllerTests(unittest.TestCase):
         self.controller._tick()
         self.assertEqual(self.controller.state["batches"][f"{RUN}_0001"]["status"], "spark_verified")
         self.assertEqual(self.controller.state["state"], "running")
+
+    def test_completed_scheduler_requires_error_free_result_and_valid_deadline(self):
+        for result in (
+            {"verified": True, "errors": ["delivery failed"], "deadline_utc": stamp(NOW)},
+            {"verified": True, "errors": [], "deadline_utc": "invalid"},
+        ):
+            with self.subTest(result=result):
+                client = FakeClient(self.cfg)
+                client.manifest = manifest(batch(1))
+                client.manifest["scheduler"] = {
+                    "status": "completed", "finished_at_utc": stamp(NOW), "result": result,
+                }
+                controller = Controller(self.cfg, client, clock=self.clock, sleep=self.clock.advance)
+                controller._begin()
+                with self.assertRaises(MonitorError):
+                    controller._tick()
+                self.assertEqual(client.started, [])
 
     def test_uncertain_job_submission_is_not_replayed_on_restart(self):
         self.client.manifest = manifest(batch(1))
@@ -452,13 +490,36 @@ class MonitorControllerTests(unittest.TestCase):
                           "sales_amount_minor_units": 300},
             })},
         }
-        delivery = entry["deliveries"]["demo-2"]
-        delivery.update(status="verified", ingestion_outcome={
-            "status": "succeeded", "source_id": str(uuid.UUID(int=99)),
-        })
+        delivery = verified_delivery(entry, self.clock())
+        delivery["ingestion_outcome"]["source_id"] = str(uuid.UUID(int=99))
         self.clock.advance(1)
         with self.assertRaisesRegex(MonitorError, "terminal success evidence"):
             self.controller._tick()
+
+    def test_terminal_success_requires_exact_kql_reconciliation_evidence(self):
+        entry = batch(1)
+        delivery = verified_delivery(entry)
+        record = {"operation_id": delivery["operation_id"]}
+        verify_delivery_evidence(entry, record)
+        changes = (
+            ("verified_row_count", 1),
+            ("verified_total_minor_units", 299),
+            ("verified_distinct_sales_line_ids", 1),
+            ("verified_row_count", True),
+            ("verified_at_utc", "invalid"),
+        )
+        for field, value in changes:
+            with self.subTest(field=field, value=value):
+                modified = copy.deepcopy(entry)
+                modified["deliveries"]["demo-2"][field] = value
+                with self.assertRaises(MonitorError):
+                    verify_delivery_evidence(modified, record)
+        for field, value in (("error_code", "Forbidden"), ("timestamp_utc", "invalid")):
+            with self.subTest(field=field, value=value):
+                modified = copy.deepcopy(entry)
+                modified["deliveries"]["demo-2"]["ingestion_outcome"][field] = value
+                with self.assertRaises(MonitorError):
+                    verify_delivery_evidence(modified, record)
 
     def test_duplicate_tag_skip_without_serialized_replay_proof_is_not_verified(self):
         entry = batch(1)
@@ -474,11 +535,10 @@ class MonitorControllerTests(unittest.TestCase):
                           "sales_amount_minor_units": 300},
             })},
         }
-        delivery = entry["deliveries"]["demo-2"]
-        delivery.update(status="verified", ingestion_outcome={
-            "status": "failed", "source_id": delivery["operation_id"],
-            "error_code": "Skipped_IngestByTagAlreadyExists",
-        })
+        delivery = verified_delivery(entry, self.clock())
+        delivery["ingestion_outcome"].update(
+            status="failed", error_code="Skipped_IngestByTagAlreadyExists",
+        )
         self.clock.advance(1)
         with self.assertRaisesRegex(MonitorError, "terminal success evidence"):
             self.controller._tick()
@@ -497,10 +557,7 @@ class MonitorControllerTests(unittest.TestCase):
                           "sales_amount_minor_units": 300},
             })},
         }
-        delivery = entry["deliveries"]["demo-2"]
-        delivery.update(status="verified", ingestion_outcome={
-            "status": "succeeded", "source_id": delivery["operation_id"],
-        })
+        verified_delivery(entry, self.clock())
         original_job = self.client.job
 
         def delayed_job(value):

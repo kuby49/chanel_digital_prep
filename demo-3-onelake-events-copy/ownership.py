@@ -33,14 +33,14 @@ class FabricControl:
         self.opener = build_opener(_NoRedirect())
 
     @classmethod
-    def from_cli(cls, tenant_id):
+    def from_cli(cls, tenant_id, *, timeout=30):
         try:
             executable = shutil.which("az")
             if executable is None:
                 raise OSError("Azure CLI is unavailable")
             response = subprocess.run(
                 [executable, "account", "get-access-token", "--resource", _API, "--output", "json"],
-                check=True, capture_output=True, timeout=30, text=True,
+                check=True, capture_output=True, timeout=timeout, text=True,
             )
             credential = json.loads(response.stdout)
             token = credential["accessToken"]

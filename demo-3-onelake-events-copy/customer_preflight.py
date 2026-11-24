@@ -126,7 +126,7 @@ def _storage_token():
     result = subprocess.run(
         [shutil.which("az"), "account", "get-access-token", "--resource",
          "https://storage.azure.com/", "-o", "json"],
-        capture_output=True, check=True, text=True, timeout=30,
+        capture_output=True, check=True, text=True, timeout=90,
     )
     credential = json.loads(result.stdout)
     _require(credential["tenant"] == TENANT, "Storage credential tenant differs.")
@@ -175,7 +175,7 @@ def _validate(config, prefix, state_dir, *, api=None):
     producer, generator, storage = _producer(state_dir)
     _require(guarded_notebook.run_config_from_shared(generator, config) == RUN,
              "Only the bound one-file ten-row customer run is supported.")
-    api = api or FabricControl.from_cli(TENANT)
+    api = api or FabricControl.from_cli(TENANT, timeout=90)
     base = "/v1/workspaces/" + WORKSPACE
     workspace = _owned(api, "/v1/workspaces", "chanel-demo3-copy-events", WORKSPACE)
     _require(workspace.get("capacityId") == "de12195c-40d2-4bee-af60-f0d6dedfbb0f",
@@ -214,7 +214,8 @@ def _validate(config, prefix, state_dir, *, api=None):
         _require(all(job.get("status") in TERMINAL for job in _inventory(
             api, base + "/items/" + item["id"] + "/jobs/instances?jobType=" + job_type)),
             "An owned notebook or pipeline job is not terminal.")
-    store = storage.OneLakeStore(WORKSPACE, LAKEHOUSE, _storage_token)
+    token = _storage_token()
+    store = storage.OneLakeStore(WORKSPACE, LAKEHOUSE, lambda: token)
     for path in (LOCK_PATH, RECORD_PREFIX + RUN["run_id"] + "_0001.json",
                  "Files/incoming/sales/sales_" + RUN["run_id"] + "_0001.csv"):
         _absent(store, path)

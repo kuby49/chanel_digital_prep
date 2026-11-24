@@ -31,12 +31,18 @@ start_path = pathlib.Path(a.state_dir) / 'demo-2-monitor-start.json'
 stop_job = json.loads(start_path.read_text())['job_id'] if a.mode == 'stop-monitor' and start_path.exists() else None
 event_path = pathlib.Path(a.result).parent / ('event-' + str(time.time_ns()) + '-' + track + '-' + a.mode + '.json')
 event_path.write_text(json.dumps({'track': track, 'mode': a.mode, 'yes': a.yes, 'selected': a.selected_demos,
-                                  'stop_job': stop_job, 'state_dir': a.state_dir}))
+                                  'stop_job': stop_job, 'state_dir': a.state_dir, 'config_path': a.config,
+                                  'shared': config.get('shared')}))
 if behavior.get('delay'):
     time.sleep(behavior['delay'])
 if behavior.get('omit_result'):
     sys.exit(0)
 status = behavior.get('status', 'pass')
+if track == 'shared' and a.mode == 'resolve-candidate-ids' and status == 'pass' and not behavior.get('omit_candidate'):
+    candidate = behavior.get('candidate', {'version': 1,
+        'workspace_id': '11111111-1111-4111-8111-111111111111',
+        'staging_lakehouse_id': '22222222-2222-4222-8222-222222222222'})
+    (pathlib.Path(a.result).parent / 'shared-producer-candidate-ids.json').write_text(json.dumps(candidate))
 monitor_path = pathlib.Path(a.state_dir) / 'demo-2-monitor.json'
 if track == 'demo-2' and a.mode in ('start-monitor', 'monitor-status', 'wait-monitor') and status == 'pass':
     if a.mode == 'start-monitor':
@@ -227,6 +233,74 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(summary["phases"]["monitor-status"]["demo-2"]["ready"])
         self.assertTrue(summary["phases"]["wait-monitor"]["demo-2"]["ready"])
 
+    def test_missing_ids_resolved_once_before_fresh_validation_and_monitor(self):
+        self.config["shared"]["workspace_id"] = None
+        self.config["shared"]["staging_lakehouse_id"] = None
+        code, summary, events = self.run_cli("demo-2,demo-3", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["phases"]["resolve-candidate-ids"]["shared"]["status"], "pass")
+        modes = [event["mode"] for event in events]
+        self.assertLess(modes.index("resolve-candidate-ids"), modes.index("validate-only"))
+        after = [event for event in events if event["mode"] in
+                 ("validate-only", "start-monitor", "monitor-status", "run-data", "wait-monitor")]
+        self.assertEqual(len({event["config_path"] for event in after}), 1)
+        self.assertTrue(all(event["shared"]["workspace_id"] == "11111111-1111-4111-8111-111111111111"
+                            and event["shared"]["staging_lakehouse_id"] == "22222222-2222-4222-8222-222222222222"
+                            for event in after))
+        self.assertIsNone(self.config["shared"]["workspace_id"])
+        self.assertIsNone(json.loads((self.root / "config.json").read_text())["shared"]["workspace_id"])
+
+    def test_explicit_ids_do_not_require_producer_journal(self):
+        code, _, events = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.assertNotIn("resolve-candidate-ids", [event["mode"] for event in events])
+        self.assertEqual(len({event["config_path"] for event in events if event["mode"] != "deploy"}), 1)
+
+    def test_candidate_conflict_and_missing_sidecar_block_before_validation(self):
+        for behavior in (
+            {"candidate": {"version": 1, "workspace_id": "44444444-4444-4444-8444-444444444444",
+                           "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222"}},
+            {"omit_candidate": True},
+            {"candidate": {"version": True, "workspace_id": "11111111-1111-4111-8111-111111111111",
+                           "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222"}},
+            {"status": "blocked"},
+        ):
+            with self.subTest(behavior=behavior):
+                self.config["shared"]["staging_lakehouse_id"] = None
+                self.config["behavior"] = {"shared:resolve-candidate-ids": behavior}
+                code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+                self.assertEqual(code, 1)
+                self.assertNotIn("validate-only", summary["phases"])
+                self.assertNotIn("run-data", summary["phases"])
+                self.assertNotIn("start-monitor", [event["mode"] for event in events])
+
+    def test_resolved_manifest_root_mismatch_blocks_before_validation(self):
+        self.config["shared"]["workspace_id"] = None
+        self.config["shared"]["run_state_location"] = "https://example.invalid/other-root"
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["resolve-shared-config"]["shared"]["status"], "blocked")
+        self.assertNotIn("validate-only", [event["mode"] for event in events])
+
+    def test_prior_invocation_candidate_cannot_be_reused(self):
+        self.config["shared"]["workspace_id"] = None
+        code, _, _ = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.config["behavior"] = {"shared:resolve-candidate-ids": {"omit_candidate": True}}
+        code, summary, events = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["resolve-shared-config"]["shared"]["status"], "blocked")
+        self.assertNotIn("validate-only", [event["mode"] for event in events])
+
+    def test_resolved_config_still_requires_fresh_readiness(self):
+        self.config["shared"]["workspace_id"] = None
+        self.config["behavior"] = {"shared:validate-only": {"status": "blocked", "ready": False}}
+        code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["validate-only"]["shared"]["status"], "blocked")
+        self.assertNotIn("start-monitor", [event["mode"] for event in events])
+        self.assertNotIn("run-data", summary["phases"])
+
     def test_failed_monitor_start_attempts_stop_and_blocks_producer(self):
         self.config["behavior"] = {"demo-2:start-monitor": {"status": "blocked", "ready": False}}
         code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
@@ -293,8 +367,8 @@ class OrchestrationTests(unittest.TestCase):
         self.assertNotIn("run-data", summary["phases"])
 
     def test_monitor_start_timeout_attempts_stop_before_producer(self):
-        self.config["execution"]["track_timeout_seconds"] = 1
-        self.config["behavior"] = {"demo-2:start-monitor": {"delay": 3}}
+        self.config["execution"]["track_timeout_seconds"] = 5
+        self.config["behavior"] = {"demo-2:start-monitor": {"delay": 8}}
         code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
         self.assertEqual(code, 1)
         self.assertEqual(summary["phases"]["start-monitor"]["demo-2"]["status"], "fail")

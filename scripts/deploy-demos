@@ -4,6 +4,7 @@
 import argparse
 import concurrent.futures
 import contextlib
+import copy
 import datetime
 import json
 import math
@@ -213,6 +214,47 @@ def monitor_config(config):
     return f"{root}/{config['data']['run_id']}/manifest.json", duration
 
 
+def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, selected):
+    phases = {}
+    resolved = copy.deepcopy(config)
+    shared = resolved.get("shared")
+    try:
+        if not isinstance(shared, dict):
+            raise ValueError("shared must be an object")
+        keys = ("workspace_id", "staging_lakehouse_id")
+        if any(shared.get(key) is None for key in keys):
+            candidate_result = invoke("shared", "resolve-candidate-ids", invocation_dir / "input-config.json",
+                                      prefix, state_dir, invocation_dir, timeout, selected)
+            phases["resolve-candidate-ids"] = {"shared": candidate_result}
+            if candidate_result["status"] != "pass":
+                return phases, None, None
+            with (invocation_dir / "shared-producer-candidate-ids.json").open(encoding="utf-8") as file:
+                candidate = json.load(file)
+            if (not isinstance(candidate, dict) or set(candidate) != {"version", *keys}
+                    or type(candidate["version"]) is not int or candidate["version"] != 1):
+                raise ValueError("invalid candidate ID sidecar")
+            for key in keys:
+                candidate_id = str(uuid.UUID(candidate[key]))
+                if shared.get(key) is not None and str(uuid.UUID(shared[key])) != candidate_id:
+                    raise ValueError(f"explicit shared.{key} conflicts with the producer journal candidate")
+                shared[key] = candidate_id
+        else:
+            for key in keys:
+                shared[key] = str(uuid.UUID(shared[key]))
+        if "demo-2" in selected:
+            monitor_config(resolved)
+        effective_path = invocation_dir / "effective-config.json"
+        effective_path.write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
+        phases["resolve-shared-config"] = {"shared": result(
+            "shared", "resolve-shared-config", "pass",
+            "Resolved configuration is provisional; fresh live readiness validation is required")}
+        return phases, resolved, effective_path
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+        phases["resolve-shared-config"] = {"shared": result(
+            "shared", "resolve-shared-config", "blocked", f"Could not resolve shared configuration: {error}")}
+        return phases, None, None
+
+
 def monitor_evidence(path, run_id, manifest_uri, max_duration, state, require_future=True):
     with path.open(encoding="utf-8") as file:
         evidence = json.load(file)
@@ -360,7 +402,12 @@ def main(argv=None):
         if args.run_data:
             validate_run_data(config)
             run_timeout = producer_timeout(config, args.selector, timeout)
-            monitor_settings = monitor_config(config) if "demo-2" in args.selector else None
+            shared = config.get("shared")
+            if not isinstance(shared, dict):
+                raise ValueError("shared must be an object")
+            if "demo-2" in args.selector and all(shared.get(key) is not None for key in
+                                                  ("workspace_id", "staging_lakehouse_id")):
+                monitor_config(config)
         state_root = args.state_dir.resolve()
         state_root.mkdir(parents=True, exist_ok=True)
         if args.mode != "dry-run":
@@ -379,10 +426,19 @@ def main(argv=None):
             phases = {args.mode: run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
                                            timeout, args.selector, concurrency, args.yes)}
             if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
-                phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix,
+                (invocation_dir / "input-config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+                resolution_phases, effective_config, effective_path = effective_run_config(
+                    config, prefix, state_dir, invocation_dir, timeout, args.selector)
+                phases.update(resolution_phases)
+                if effective_config is not None:
+                    config = effective_config
+                    config_path = effective_path
+                    monitor_settings = monitor_config(config) if "demo-2" in args.selector else None
+                    phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix,
                                                      state_dir, invocation_dir, timeout,
                                                      args.selector, concurrency, False)
-                if all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values()):
+                if ("validate-only" in phases and
+                        all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values())):
                     monitor_ready = True
                     if "demo-2" in args.selector:
                         monitor_phases, monitor_ready, monitor_initial = start_monitor(

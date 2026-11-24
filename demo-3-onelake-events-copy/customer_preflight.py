@@ -5,7 +5,6 @@ import copy
 import hashlib
 import importlib.util
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +13,7 @@ import guarded_notebook
 import guarded_pipeline
 from audit import LOCK_PATH, RECORD_PREFIX
 from deploy import CandidateBlocked, _load_json
-from ownership import FabricControl
+from ownership import FabricControl, cli_credential
 
 
 TENANT = "4526cee1-4399-4e4b-9134-46fabd583527"
@@ -145,12 +144,7 @@ def _producer(state_dir):
 
 
 def _storage_token():
-    result = subprocess.run(
-        [shutil.which("az"), "account", "get-access-token", "--resource",
-         "https://storage.azure.com/", "-o", "json"],
-        capture_output=True, check=True, text=True, timeout=90,
-    )
-    credential = json.loads(result.stdout)
+    credential = cli_credential("https://storage.azure.com/", timeout=120)
     _require(credential["tenant"] == TENANT, "Storage credential tenant differs.")
     return credential["accessToken"]
 
@@ -208,7 +202,7 @@ def _validate(config, prefix, state_dir, *, api=None):
     producer, generator, storage = _producer(state_dir)
     _require(guarded_notebook.run_config_from_shared(generator, config) == run,
              "Only the bound one-file ten-row customer run is supported.")
-    api = api or FabricControl.from_cli(TENANT, timeout=90)
+    api = api or FabricControl.from_cli(TENANT, timeout=120)
     base = "/v1/workspaces/" + WORKSPACE
     workspace = _owned(api, "/v1/workspaces", "chanel-demo3-copy-events", WORKSPACE)
     _require(workspace.get("capacityId") == "de12195c-40d2-4bee-af60-f0d6dedfbb0f",

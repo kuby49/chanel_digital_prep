@@ -122,6 +122,17 @@ class CustomerPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "access denied"):
             preflight._absent(store, preflight.LOCK_PATH)
 
+    def test_storage_uses_bounded_shared_cli_and_preserves_tenant_check(self):
+        credential = {"tenant": preflight.TENANT, "accessToken": "synthetic-storage"}
+        with mock.patch.object(preflight, "cli_credential", return_value=credential) as token:
+            self.assertEqual(preflight._storage_token(), "synthetic-storage")
+            token.assert_called_once_with("https://storage.azure.com/", timeout=120)
+            token.reset_mock()
+            credential["tenant"] = "other"
+            with self.assertRaisesRegex(deploy.CandidateBlocked, "Storage credential tenant differs"):
+                preflight._storage_token()
+            token.assert_called_once_with("https://storage.azure.com/", timeout=120)
+
     def test_entrypoint_reports_ready_only_after_successful_customer_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

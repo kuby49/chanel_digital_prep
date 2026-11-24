@@ -154,6 +154,15 @@ enable anything or require a future manifest/file, SQL synchronization or live
 delivery. `ready:true` means admission to this bounded customer demonstration
 only, not general deployment or completion of the acceptance run.
 
+Customer preflight and its session controller bound each CLI credential request
+to 120 seconds without automatic retry. On Windows they invoke the Azure CLI
+MSI's sibling `python.exe -IBm azure.cli` directly, preserving `AZ_INSTALLER=MSI`
+and the inherited `AZURE_CONFIG_DIR`; missing MSI Python blocks rather than
+falling back to `az.cmd`. Other platforms keep the native `az` entry point.
+Temporary output handles, rather than captured pipes, prevent inherited child
+handles from delaying timeout cleanup. Fabric credential and JWT tenant/principal
+checks and the storage credential tenant check remain required.
+
 The first attempt was enabled and safely stopped after the common producer
 blocked before submission; its journal must not be reset or reused. The only
 additional approved attempt is `customer_demo_20261124_dc2792654b5b`, with the

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -21,6 +22,36 @@ _API = "https://api.fabric.microsoft.com"
 _TERMINAL = {"Completed", "Failed", "Cancelled", "Canceled", "Deduped"}
 
 
+def _cli_command():
+    executable = shutil.which("az")
+    if executable is None:
+        raise OSError("Azure CLI is unavailable")
+    if sys.platform == "win32":
+        python = Path(executable).parent.parent / "python.exe"
+        if not python.is_file():
+            raise OSError("Windows MSI Azure CLI Python is unavailable; batch fallback is prohibited")
+        return [str(python), "-IBm", "azure.cli"]
+    return [executable]
+
+
+def cli_credential(resource, *, timeout=30):
+    command = _cli_command() + [
+        "account", "get-access-token", "--resource", resource, "--output", "json",
+    ]
+    environment = None
+    if sys.platform == "win32":
+        environment = os.environ.copy()
+        environment["AZ_INSTALLER"] = "MSI"
+    # Inherited pipes can outlive a timed-out CLI, even after its parent exits.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        subprocess.run(
+            command, check=True, stdout=output, stderr=errors,
+            timeout=timeout, env=environment,
+        )
+        output.seek(0)
+        return json.load(output)
+
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -35,14 +66,7 @@ class FabricControl:
     @classmethod
     def from_cli(cls, tenant_id, *, timeout=30):
         try:
-            executable = shutil.which("az")
-            if executable is None:
-                raise OSError("Azure CLI is unavailable")
-            response = subprocess.run(
-                [executable, "account", "get-access-token", "--resource", _API, "--output", "json"],
-                check=True, capture_output=True, timeout=timeout, text=True,
-            )
-            credential = json.loads(response.stdout)
+            credential = cli_credential(_API, timeout=timeout)
             token = credential["accessToken"]
             payload = token.split(".")[1]
             claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))

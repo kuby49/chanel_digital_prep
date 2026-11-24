@@ -48,6 +48,27 @@ def strict_json(path):
         return json.load(file, object_pairs_hook=object_pairs, parse_constant=invalid_constant)
 
 
+def require_config_snapshot(path, expected):
+    options = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": False, "allow_nan": False}
+    try:
+        actual = json.dumps(strict_json(path), **options)
+        original = json.dumps(expected, **options)
+    except RecursionError as error:
+        raise ValueError(f"{path.name} exceeds the supported JSON nesting depth") from error
+    if actual != original:
+        raise ValueError(f"{path.name} no longer matches the invocation configuration")
+
+
+def config_snapshot_intact(phases, path, expected):
+    try:
+        require_config_snapshot(path, expected)
+        return True
+    except (OSError, ValueError, TypeError) as error:
+        phases["config-integrity"] = {"shared": result(
+            "shared", "config-integrity", "fail", f"Configuration snapshot cannot be trusted: {error}")}
+        return False
+
+
 def canonical_uuid(value, label, require_canonical=False):
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a nonzero UUID")
@@ -316,9 +337,11 @@ def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, sel
             raise ValueError("shared must be an object")
         keys = ("workspace_id", "staging_lakehouse_id")
         if any(shared.get(key) is None for key in keys):
+            require_config_snapshot(invocation_dir / "input-config.json", config)
             candidate_result = invoke("shared", "resolve-candidate-ids", invocation_dir / "input-config.json",
                                       prefix, state_dir, invocation_dir, timeout, selected)
             phases["resolve-candidate-ids"] = {"shared": candidate_result}
+            require_config_snapshot(invocation_dir / "input-config.json", config)
             if candidate_result["status"] != "pass":
                 return phases, None, None
             candidate = strict_json(invocation_dir / "shared-producer-candidate-ids.json")
@@ -343,6 +366,7 @@ def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, sel
         candidates = run_phase(selected, "resolve-target-candidate", candidate_config, prefix, state_dir,
                                invocation_dir, timeout, selected, concurrency, False)
         phases["resolve-target-candidate"] = candidates
+        require_config_snapshot(candidate_config, resolved)
         targets = {}
         tenant_id = canonical_uuid(resolved["tenant_id"], "tenant_id")
         for track in selected:
@@ -424,7 +448,7 @@ def matching_monitor_identity(first, second):
             raise ValueError(f"monitor {key} does not match the start record")
 
 
-def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeout, selected):
+def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeout, selected, expected_config=None):
     try:
         if initial is not None:
             record = strict_json(state_dir / "demo-2-monitor-start.json")
@@ -432,6 +456,19 @@ def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeou
     except (OSError, ValueError, TypeError, KeyError) as error:
         return result("demo-2", "stop-monitor", "fail",
                       f"Start record changed or is unreadable; termination unconfirmed: {error}")
+    if expected_config is not None:
+        try:
+            require_config_snapshot(config_path, expected_config)
+        except (OSError, ValueError, TypeError):
+            try:
+                config_path = invocation_dir / "monitor-stop-config.json"
+                with config_path.open("x", encoding="utf-8") as file:
+                    json.dump(expected_config, file, indent=2, allow_nan=False)
+                    file.write("\n")
+                require_config_snapshot(config_path, expected_config)
+            except (OSError, ValueError, TypeError) as error:
+                return result("demo-2", "stop-monitor", "fail",
+                              f"Cannot persist the original stop configuration; termination unconfirmed: {error}")
     return invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, invocation_dir, timeout, selected)
 
 
@@ -443,6 +480,7 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
     try:
         try:
             binding = monitor_binding(config)
+            require_config_snapshot(config_path, config)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
             phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "blocked",
                                                         f"Cannot bind monitor configuration: {error}")}
@@ -458,7 +496,8 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
             sidecar = monitor_evidence(state_dir / "demo-2-monitor.json",
                                        config["data"]["run_id"], *monitor_settings, "start", binding)
             matching_monitor_identity(initial, sidecar)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+            require_config_snapshot(config_path, config)
+        except (OSError, ValueError, TypeError, KeyError) as error:
             phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "fail",
                                                         f"Invalid monitor evidence: {error}")}
             return phases, False, None
@@ -474,6 +513,7 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
                                        config["data"]["run_id"], *monitor_settings, "running", binding)
             matching_monitor_identity(initial, record)
             matching_monitor_identity(initial, current)
+            require_config_snapshot(config_path, config)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
             phases["monitor-status"] = {"demo-2": result("demo-2", "monitor-status", "fail",
                                                          f"Invalid monitor evidence: {error}")}
@@ -483,10 +523,19 @@ def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeou
     finally:
         if attempted and not started:
             phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
-                                                               state_dir, invocation_dir, timeout, selected)}
+                                                               state_dir, invocation_dir, timeout, selected, config)}
 
 
 def wait_monitor(initial, config, config_path, prefix, state_dir, invocation_dir, timeout, selected, monitor_settings):
+    try:
+        require_config_snapshot(config_path, config)
+    except (OSError, ValueError, TypeError) as error:
+        return {
+            "wait-monitor": {"demo-2": result("demo-2", "wait-monitor", "fail",
+                                              f"Configuration snapshot cannot be trusted: {error}")},
+            "stop-monitor": {"demo-2": stop_monitor(initial, config_path, prefix, state_dir,
+                                                       invocation_dir, timeout, selected, config)},
+        }
     deadline = datetime.datetime.fromisoformat(initial["deadline_utc"].replace("Z", "+00:00"))
     remaining = max(0, math.ceil((deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
     outcome = invoke("demo-2", "wait-monitor", config_path, prefix, state_dir, invocation_dir,
@@ -501,12 +550,13 @@ def wait_monitor(initial, config, config_path, prefix, state_dir, invocation_dir
                                        config["data"]["run_id"], *monitor_settings, "completed", binding, False)
             matching_monitor_identity(initial, record)
             matching_monitor_identity(initial, current)
+            require_config_snapshot(config_path, config)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
             phases["wait-monitor"] = {"demo-2": result("demo-2", "wait-monitor", "fail",
                                                        f"Invalid terminal monitor evidence: {error}")}
     if phases["wait-monitor"]["demo-2"]["status"] != "pass":
         phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
-                                                          state_dir, invocation_dir, timeout, selected)}
+                                                          state_dir, invocation_dir, timeout, selected, config)}
     return phases
 
 
@@ -583,9 +633,13 @@ def main(argv=None):
                 if effective_config is not None:
                     config = effective_config
                     config_path = effective_path
-            phases[args.mode] = run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
-                                          timeout, args.selector, concurrency, args.yes)
-            if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
+            snapshot_ok = config_snapshot_intact(phases, config_path, config)
+            if snapshot_ok:
+                phases[args.mode] = run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
+                                              timeout, args.selector, concurrency, args.yes)
+                snapshot_ok = config_snapshot_intact(phases, config_path, config)
+            if (args.run_data and snapshot_ok
+                    and all(item["status"] == "pass" for item in phases["deploy"].values())):
                 resolution_phases, effective_config, effective_path = effective_run_config(
                     config, prefix, state_dir, invocation_dir, timeout, args.selector, concurrency, check_monitor=True)
                 phases.update(resolution_phases)
@@ -593,10 +647,13 @@ def main(argv=None):
                     config = effective_config
                     config_path = effective_path
                     monitor_settings = monitor_config(config) if "demo-2" in args.selector else None
-                    phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix,
-                                                     state_dir, invocation_dir, timeout,
-                                                     args.selector, concurrency, False)
-                if ("validate-only" in phases and
+                    snapshot_ok = config_snapshot_intact(phases, config_path, config)
+                    if snapshot_ok:
+                        phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix,
+                                                            state_dir, invocation_dir, timeout,
+                                                            args.selector, concurrency, False)
+                        snapshot_ok = config_snapshot_intact(phases, config_path, config)
+                if (snapshot_ok and "validate-only" in phases and
                         all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values())):
                     monitor_ready = True
                     if "demo-2" in args.selector:
@@ -604,9 +661,19 @@ def main(argv=None):
                             config, config_path, prefix, state_dir, invocation_dir,
                             timeout, args.selector, monitor_settings)
                         phases.update(monitor_phases)
+                    if monitor_ready and not config_snapshot_intact(phases, config_path, config):
+                        if "demo-2" in args.selector:
+                            phases["stop-monitor"] = {"demo-2": stop_monitor(
+                                monitor_initial, config_path, prefix, state_dir, invocation_dir,
+                                timeout, args.selector, config)}
+                        monitor_ready = False
                     if monitor_ready:
                         phases["run-data"] = {"shared": invoke("shared", "run-data", config_path, prefix,
                                                                 state_dir, invocation_dir, run_timeout, args.selector)}
+                        if not config_snapshot_intact(phases, config_path, config):
+                            phases["run-data"]["shared"] = result(
+                                "shared", "run-data", "fail",
+                                "Configuration changed during producer execution; remote outcome is unconfirmed.")
                         if phases["run-data"]["shared"]["status"] != "pass":
                             print("Producer outcome is not confirmed; inspect remote job state. "
                                   "A local failure or timeout does not prove termination.", file=sys.stderr)

@@ -205,6 +205,83 @@ class OrchestrationTests(unittest.TestCase):
         run_event = next(event for event in events if event["mode"] == "run-data")
         self.assertEqual(json.loads(Path(run_event["config_path"]).read_text())["data"]["run_id"], "run-1")
 
+    def test_changed_effective_config_after_validation_blocks_producer(self):
+        run_phase = deploy.run_phase
+
+        def mutate_snapshot(*args, **kwargs):
+            outcomes = run_phase(*args, **kwargs)
+            if args[1] == "validate-only":
+                path = args[2]
+                changed = json.loads(path.read_text(encoding="utf-8"))
+                changed["data"]["run_id"] = "different-run"
+                path.write_text(json.dumps(changed), encoding="utf-8")
+            return outcomes
+
+        with mock.patch.object(deploy, "run_phase", side_effect=mutate_snapshot):
+            code, summary, events = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertNotIn("run-data", summary["phases"])
+        self.assertNotIn("run-data", [event["mode"] for event in events])
+
+    def test_changed_effective_config_after_monitor_status_stops_exact_monitor(self):
+        invoke = deploy.invoke
+
+        def mutate_snapshot(*args, **kwargs):
+            outcome = invoke(*args, **kwargs)
+            if args[:2] == ("demo-2", "monitor-status"):
+                path = args[2]
+                changed = json.loads(path.read_text(encoding="utf-8"))
+                changed["data"]["run_id"] = "different-run"
+                path.write_text(json.dumps(changed), encoding="utf-8")
+            return outcome
+
+        with mock.patch.object(deploy, "invoke", side_effect=mutate_snapshot):
+            code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertNotIn("run-data", summary["phases"])
+        self.assertEqual(events[-1]["mode"], "stop-monitor")
+        self.assertEqual(events[-1]["stop_job"], "job-1")
+        stop_config = json.loads(Path(events[-1]["config_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(stop_config["data"]["run_id"], "run-1")
+
+    def test_changed_candidate_config_blocks_resolution(self):
+        run_phase = deploy.run_phase
+
+        def mutate_snapshot(*args, **kwargs):
+            outcomes = run_phase(*args, **kwargs)
+            if args[1] == "resolve-target-candidate":
+                path = args[2]
+                changed = json.loads(path.read_text(encoding="utf-8"))
+                changed["data"]["run_id"] = "different-run"
+                path.write_text(json.dumps(changed), encoding="utf-8")
+            return outcomes
+
+        with mock.patch.object(deploy, "run_phase", side_effect=mutate_snapshot):
+            code, summary, events = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["resolve-shared-config"]["shared"]["status"], "blocked")
+        self.assertNotIn("validate-only", summary["phases"])
+        self.assertNotIn("run-data", [event["mode"] for event in events])
+
+    def test_changed_config_during_producer_marks_outcome_unconfirmed(self):
+        invoke = deploy.invoke
+
+        def mutate_snapshot(*args, **kwargs):
+            outcome = invoke(*args, **kwargs)
+            if args[:2] == ("shared", "run-data"):
+                path = args[2]
+                changed = json.loads(path.read_text(encoding="utf-8"))
+                changed["data"]["run_id"] = "different-run"
+                path.write_text(json.dumps(changed), encoding="utf-8")
+            return outcome
+
+        with mock.patch.object(deploy, "invoke", side_effect=mutate_snapshot):
+            code, summary, _ = self.run_cli("demo-1", "--deploy", "--run-data")
+        self.assertEqual(code, 1)
+        outcome = summary["phases"]["run-data"]["shared"]
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("unconfirmed", outcome["diagnostics"][0])
+
     def test_existing_orchestrator_lock_blocks_without_clearing_it(self):
         state = self.root / "state" / ("chanel-" + self.config["tenant_id"])
         state.mkdir(parents=True)

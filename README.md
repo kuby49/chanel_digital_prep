@@ -19,11 +19,12 @@ that child can acquire the shared
 producer lock and start Demo 2 verification and monitoring before Demo 1
 admission. Reusing the same producer or target resources therefore requires
 additional fencing or isolation. A permanent recovery fence was exclusively
-created and read back at the old producer lock path; a new producer requires
-a distinct staging Lakehouse. The fence does not exclude uncoordinated writers,
-and post-fence reconciliation of already admitted Copy and queued ingestion
-work remains in progress. Subsequent local runtime pagination and
-bodyless-request fixes have not yet been published to the Fabric notebook.
+created and read back at the old producer lock path, and a distinct staging
+Lakehouse was created for the new producer. Post-fence checks found no new
+owned Copy work or known unresolved ingestion; these point-in-time checks and
+the fence do not exclude uncoordinated writers. Subsequent local runtime
+pagination and bodyless-request fixes have not yet been published to the Fabric
+notebook.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
 run requires a separately confirmed schedule and updated profile.
 The first-cycle Demo 3 rule was also disabled and read back. A requested

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -1060,6 +1061,112 @@ class NativeGuardTests(unittest.TestCase):
         first = guarded_notebook.build_native_notebook(self.producer_path.parent, policy, *args)
         second = guarded_notebook.build_native_notebook(self.producer_path.parent, reordered, *args)
         self.assertEqual(first, second)
+
+    def test_stop_barrier_waits_for_existing_writer_and_checks_immutable_marker(self):
+        import hashlib
+        import native_stop
+
+        document = {"data": {"run_id": self.config.run_id}, "shared": {"target_bindings": {
+            "demo-3": {"workspace_id": self.target.workspace_id, "item_id": self.target.lakehouse_id,
+                       "fact": "dbo.factsales"}}}}
+        digest = hashlib.sha256(self.generator.canonical_bytes(document)).hexdigest()
+        binding = {"run_id": self.config.run_id, "config_sha256": digest, "nonce": "native-" + digest[:32],
+                   "producer": {"workspace_id": self.authority.workspace_id,
+                                "staging_lakehouse_id": self.authority.lakehouse_id}}
+        marker = {"version": 1, "run_id": self.config.run_id, "config_sha256": digest,
+                  "nonce": binding["nonce"]}
+        path = f"Files/producer/runs/{self.config.run_id}/stop.json"
+        self.authority.create(path, json.dumps(marker).encode())
+        audit_writer = audit.BatchAudit(self.target, self.target.workspace_id, self.target.lakehouse_id)
+        held = audit_writer.acquire(str(uuid.uuid4()), "older_run_0001")
+        original_lock = self.target.read(audit.LOCK_PATH)
+        times = [self.now]
+
+        def sleep(seconds):
+            self.assertEqual(self.target.read(audit.LOCK_PATH), original_lock)
+            times[0] += timedelta(seconds=seconds)
+            self.target.delete(audit.LOCK_PATH, held.lock_etag)
+
+        context = {"document": document, "binding": binding, "store": self.authority,
+                   "store_factory": lambda ws, lh: self.target,
+                   "cleanup_deadline_utc": (self.now + timedelta(seconds=20)).isoformat(),
+                   "clock": lambda: times[0], "sleep": sleep}
+        modules = {"generator": self.generator,
+                   "fabric_storage": types.SimpleNamespace(StorageConflict=ConditionalStore.Conflict)}
+        with mock.patch.dict(sys.modules, modules):
+            self.assertEqual(native_stop.stop(context, None), {
+                "status": "stopped", "scope": "cooperating guarded Copy intents"})
+        self.assertNotIn(audit.LOCK_PATH, self.target.objects)
+        self.assertEqual(times[0], self.now + timedelta(seconds=5))
+
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            self.authority, "read", side_effect=[self.authority.read(path), (b"{}", "changed")]
+        ), self.assertRaisesRegex(RuntimeError, "marker or deadline changed"):
+            native_stop.stop(context, None)
+        self.assertIn(audit.LOCK_PATH, self.target.objects)
+
+    def test_stop_barrier_rejects_bad_marker_and_never_retries_uncertain_create(self):
+        import hashlib
+        import native_stop
+
+        document = {"data": {"run_id": self.config.run_id}, "shared": {"target_bindings": {
+            "demo-3": {"workspace_id": self.target.workspace_id, "item_id": self.target.lakehouse_id,
+                       "fact": "dbo.factsales"}}}}
+        digest = hashlib.sha256(self.generator.canonical_bytes(document)).hexdigest()
+        binding = {"run_id": self.config.run_id, "config_sha256": digest, "nonce": "native-" + digest[:32],
+                   "producer": {"workspace_id": self.authority.workspace_id,
+                                "staging_lakehouse_id": self.authority.lakehouse_id}}
+        path = f"Files/producer/runs/{self.config.run_id}/stop.json"
+        self.authority.create(path, b'{"version":true}')
+        context = {"document": document, "binding": binding, "store": self.authority,
+                   "store_factory": lambda ws, lh: self.target,
+                   "cleanup_deadline_utc": (self.now + timedelta(seconds=20)).isoformat(),
+                   "clock": lambda: self.now, "sleep": mock.Mock()}
+        modules = {"generator": self.generator,
+                   "fabric_storage": types.SimpleNamespace(StorageConflict=ConditionalStore.Conflict)}
+        with mock.patch.dict(sys.modules, modules), self.assertRaisesRegex(ValueError, "stop marker"):
+            native_stop.stop(context, None)
+        self.assertNotIn(audit.LOCK_PATH, self.target.objects)
+        marker = {"version": 1, "run_id": self.config.run_id, "config_sha256": digest,
+                  "nonce": binding["nonce"]}
+        self.authority.objects[path] = (json.dumps(marker).encode(), "marker")
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            self.target, "create", side_effect=RuntimeError("outcome unknown")
+        ) as create, self.assertRaisesRegex(RuntimeError, "outcome unknown"):
+            native_stop.stop(context, None)
+        self.assertEqual(create.call_count, 1)
+        context["sleep"].assert_not_called()
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            self.target, "read", side_effect=ConditionalStore.Conflict("read conflict")
+        ) as read, self.assertRaisesRegex(ConditionalStore.Conflict, "read conflict"):
+            native_stop.stop(context, None)
+        self.assertEqual(read.call_count, 1)
+        self.assertIn(audit.LOCK_PATH, self.target.objects)
+        self.target.objects.pop(audit.LOCK_PATH)
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+            self.target, "delete", side_effect=RuntimeError("delete outcome unknown")
+        ) as delete, self.assertRaisesRegex(RuntimeError, "delete outcome unknown"):
+            native_stop.stop(context, None)
+        self.assertEqual(delete.call_count, 1)
+        self.assertIn(audit.LOCK_PATH, self.target.objects)
+
+        times = [self.now]
+        context["clock"] = lambda: times[0]
+        context["sleep"] = lambda seconds: times.__setitem__(0, times[0] + timedelta(seconds=seconds))
+        existing = self.target.read(audit.LOCK_PATH)
+        with mock.patch.dict(sys.modules, modules), self.assertRaisesRegex(TimeoutError, "deadline"):
+            native_stop.stop(context, None)
+        self.assertEqual(self.target.read(audit.LOCK_PATH), existing)
+
+    def test_native_lock_readback_conflict_never_retries_successful_create(self):
+        guarded = self.native.AdmissionAudit(
+            self.target, self.settings["workspace_id"], self.settings["item_id"], lambda: None,
+            lock_conflict=ConditionalStore.Conflict, sleep=mock.Mock())
+        with mock.patch.object(self.target, "read", side_effect=ConditionalStore.Conflict("read conflict")):
+            with self.assertRaisesRegex(ConditionalStore.Conflict, "read conflict"):
+                guarded.acquire(str(uuid.uuid4()), self.config.run_id + "_0001")
+        self.assertIn(audit.LOCK_PATH, self.target.objects)
+        guarded.sleep.assert_not_called()
 
     def test_contended_event_waits_past_sixty_seconds_without_stealing_writer(self):
         first = audit.BatchAudit(self.target, self.settings["workspace_id"], self.settings["item_id"])

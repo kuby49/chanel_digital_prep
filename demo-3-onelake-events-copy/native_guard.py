@@ -4,10 +4,11 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
-from audit import AuditError, BatchAudit, LOCK_PATH, _decode, _event_id, _uuid
+from audit import AuditError, BatchAudit, LOCK_PATH, WriterToken, _decode, _encode, _event_id, _time, _uuid
 
 
 _SUBJECT = re.compile(
@@ -136,10 +137,15 @@ class AdmissionAudit(BatchAudit):
         self.clock, self.sleep = clock, sleep
 
     def acquire(self, pipeline_run_id, batch_id):
+        pipeline_run_id = _uuid(pipeline_run_id)
+        self._path(batch_id)
         deadline = self.clock() + self.wait_seconds
         ticket = None
         etag = None
         path = "Files/demo3-audit/waits/" + _uuid(pipeline_run_id) + ".json"
+        lock_body = _encode({"contract_version": 1, "target": self.target,
+                             "pipeline_run_id": pipeline_run_id, "batch_id": batch_id,
+                             "nonce": str(uuid.uuid4()), "acquired_at_utc": _time()})
 
         def persist(status, **extra):
             nonlocal etag
@@ -157,7 +163,7 @@ class AdmissionAudit(BatchAudit):
                     persist("blocked", reason="admission-revoked-or-unavailable")
                 raise
             try:
-                token = super().acquire(pipeline_run_id, batch_id)
+                lock_etag = self.store.create(LOCK_PATH, lock_body)
             except self.lock_conflict:
                 if ticket is None:
                     if not isinstance(self.observation, dict):
@@ -187,6 +193,8 @@ class AdmissionAudit(BatchAudit):
                 if remaining > 0:
                     self.sleep(min(5, remaining))
                 continue
+            token = WriterToken(pipeline_run_id, batch_id, lock_body, lock_etag)
+            self._lock(token, batch_id)
             if ticket is not None:
                 persist("acquired")
             return token

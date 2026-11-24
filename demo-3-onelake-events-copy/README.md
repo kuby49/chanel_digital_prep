@@ -6,7 +6,8 @@ original customer binding and the existing run-specific resources. It does not
 claim the new file was delivered or that the ten-file acceptance run passed.
 The reusable native binding and corrected guard were published and read back
 with the rule stopped during publication; an integrated recurring run remains
-unverified. The distinct-staging guard rebind has not yet been completed.
+unverified. The distinct-staging guard rebind was published and read back; its
+new rule proof and the live run remain in progress.
 An isolated MCAP preflight
 workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
 stopped probe Activator exist. They do not constitute a deployable production

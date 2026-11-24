@@ -223,6 +223,66 @@ class SharedManifestIntegrationTest(unittest.TestCase):
             self.assertFalse((rejected / demo.CANDIDATE_FILE).exists())
             self.assertEqual(journal_path.read_bytes(), before)
 
+    def test_selected_eventhouse_and_demo3_candidates_resolve_concurrently(self):
+        sys.path.insert(0, str(ROOT / "demo-2-eventhouse"))
+        try:
+            eventhouse = load_script("eventhouse_parallel_integration", ROOT / "demo-2-eventhouse" / "deploy.py")
+        finally:
+            sys.path.pop(0)
+        demo3 = load_script("demo3_parallel_integration", ROOT / "demo-3-onelake-events-copy" / "deploy.py")
+        orchestration = load_script("orchestration_parallel_integration", ROOT / "scripts" / "deploy-demos")
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["shared"].update({"workspace_id": "11111111-1111-4111-8111-111111111111",
+                                 "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222"})
+        settings = eventhouse.validate_config(config, "chanel")
+        event_workspace = "33333333-3333-4333-8333-333333333333"
+        eventhouse_id = "44444444-4444-4444-8444-444444444444"
+        database = "55555555-5555-4555-8555-555555555555"
+        lake_workspace = "66666666-6666-4666-8666-666666666666"
+        lakehouse = "77777777-7777-4777-8777-777777777777"
+        owner = "88888888-8888-4888-8888-888888888888"
+        marker = f"chanel-demo3-{owner}"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            with eventhouse.Ledger(state, settings, create=True) as ledger:
+                ledger.data["resources"].update({
+                    "workspace": {"id": event_workspace, "name": settings["workspace_name"],
+                                  "type": "Workspace", "confirmed": True},
+                    "eventhouse": {"id": eventhouse_id, "name": settings["eventhouse_name"],
+                                   "type": "Eventhouse", "confirmed": True},
+                    "database": {"id": database, "name": settings["database_name"], "type": "KQLDatabase",
+                                 "parent_eventhouse_id": eventhouse_id, "confirmed": True},
+                    "table": {"name": settings["table"], "database_id": database, "confirmed": True},
+                })
+                ledger.save()
+            journal = {
+                "contract_version": 1, "track": "demo-3", "tenant_id": config["tenant_id"], "prefix": "chanel",
+                "owner": {"id": owner, "marker": marker}, "pending_operations": [], "uncertain_operations": [],
+                "workspace": {"id": lake_workspace, "type": "Workspace", "status": "confirmed",
+                              "created_by_owner": owner, "create_intent_id": "99999999-9999-4999-8999-999999999999",
+                              "readback": {"id": lake_workspace, "type": "Workspace", "owner_marker": marker}},
+                "lakehouse": {"id": lakehouse, "type": "Lakehouse", "status": "confirmed",
+                              "workspace_id": lake_workspace, "created_by_owner": owner,
+                              "create_intent_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                              "readback": {"id": lakehouse, "type": "Lakehouse",
+                                           "workspace_id": lake_workspace, "owner_marker": marker}},
+                "fact": {"status": "confirmed", "workspace_id": lake_workspace,
+                         "item_id": lakehouse, "name": "dbo.factsales"},
+            }
+            (state / demo3.STATE_FILE).write_text(json.dumps(journal), encoding="utf-8")
+            invocation = root / "invocation"
+            invocation.mkdir()
+            phases, resolved, _ = orchestration.effective_run_config(
+                config, "chanel", state, invocation, 30, ["demo-2", "demo-3"], 2)
+            self.assertEqual({track: (outcome["status"], outcome["ready"])
+                              for track, outcome in phases["resolve-target-candidate"].items()},
+                             {"demo-2": ("pass", False), "demo-3": ("pass", False)})
+            self.assertEqual(resolved["shared"]["target_bindings"], {
+                "demo-2": {"workspace_id": event_workspace, "item_id": database, "fact": "FactSales"},
+                "demo-3": {"workspace_id": lake_workspace, "item_id": lakehouse, "fact": "dbo.factsales"},
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ import activator
 import customer_preflight as check
 import guarded_notebook
 import native_binding
+import native_guard_hc
 import native_rule
 from deploy import CandidateBlocked
 
@@ -79,7 +80,7 @@ class NativeBindingTests(unittest.TestCase):
                                                    check.PIPELINE, sample)
         notebook = guarded_notebook.build_native_notebook(
             self.producer, policy, check.WORKSPACE, check.LAKEHOUSE, check.HOUSE_NAME,
-            check.STAGING_WORKSPACE, check.STAGING_LAKEHOUSE)
+            check.STAGING_WORKSPACE, check.STAGING_LAKEHOUSE, high_concurrency=False)
         self.template = {"workspace_id": check.WORKSPACE, "lakehouse_id": check.LAKEHOUSE,
                          "guard_notebook_id": check.NOTEBOOK, "pipeline_id": check.PIPELINE,
                          "reflex_id": check.REFLEX, "producer_workspace_id": check.STAGING_WORKSPACE,
@@ -273,11 +274,19 @@ class NativeBindingTests(unittest.TestCase):
         native_binding._create(self.binding.journal, state)
         pipeline = {"properties": {"verified": True}}
         output = self.root / "proof.json"
+        corrected = copy.deepcopy(self.binding.notebook)
+        corrected["cells"][1]["source"].insert(0, native_binding.HC_FLAG)
+        correction = {"binding_sha256": check.config_sha256(state), "before": self.binding.notebook,
+                      "old_sha256": check.config_sha256(self.binding.notebook), "target": corrected,
+                      "target_sha256": check.config_sha256(corrected),
+                      "update": {"status": "confirmed-readback", "http": 200,
+                                 "time_utc": "start", "confirmed_at_utc": "end"}}
+        native_binding._create(self.root / native_binding.HC_JOURNAL, correction)
         with mock.patch.object(native_binding, "_quiescent", return_value=pipeline), \
-             mock.patch.object(native_binding, "_guard", return_value=self.binding.notebook), \
+             mock.patch.object(native_binding, "_guard", return_value=corrected), \
              mock.patch.object(native_binding, "_graph", return_value=self.binding.graph):
             proof = self.binding.proof(output)
-            self.assertEqual(proof["guard_sha256"], check.config_sha256(native_binding._notebook(self.binding.notebook)))
+            self.assertEqual(proof["guard_sha256"], check.config_sha256(native_binding._notebook(corrected)))
             self.assertEqual(proof["pipeline_sha256"], check.config_sha256(pipeline["properties"]))
             self.assertEqual(proof["graph_disabled_sha256"], check.config_sha256(
                 check._canonical(self.binding.graph)))
@@ -412,6 +421,97 @@ class NativeBindingTests(unittest.TestCase):
                 controller.change("enable", self.root / "proof.json")
         self.assertFalse(controller.journal.exists())
         self.api.request.assert_not_called()
+
+    def test_hc_correction_preserves_metadata_and_rule_admits_new_proof(self):
+        controller = self.rule_controller()
+        correction = native_guard_hc.GuardCorrection(self.binding)
+        old = copy.deepcopy(self.binding.notebook)
+        old["metadata"]["unrelated"] = {"preserve": "yes"}
+        old["cells"][1]["metadata"]["unrelated"] = True
+        current = copy.deepcopy(old)
+        pipeline = {"properties": {"verified": True}}
+        published = self.binding._published()
+        self.write("old-proof.json", {
+            "version": 1, "workspace_id": check.WORKSPACE, "lakehouse_id": check.LAKEHOUSE,
+            "guard_notebook_id": check.NOTEBOOK, "pipeline_id": check.PIPELINE, "reflex_id": check.REFLEX,
+            "connection_id": check.CONNECTION, "marker": check.MARKER,
+            "native_policy": published["native_policy"], "generator_sha256": check.GENERATOR_SHA,
+            "guard_sha256": check.config_sha256(native_binding._notebook(old)),
+            "pipeline_sha256": check.config_sha256(pipeline["properties"]),
+            "graph_disabled_sha256": check.config_sha256(check._canonical(self.binding.graph))})
+        operation = "468567aa-fc56-4b9f-b61a-0e39ae31fe51"
+        location = "https://api.fabric.microsoft.com/v1/operations/" + operation
+
+        def request(method, url, body, **kwargs):
+            state = json.loads(correction.journal.read_text(encoding="utf-8"))
+            self.assertEqual(state["update"]["status"], "in-flight")
+            current.clear()
+            current.update(native_binding._decode_part(body, "notebook-content.ipynb"))
+            return 202, {"x-ms-operation-id": operation, "Location": location}, None
+
+        self.api.request.side_effect = request
+        with mock.patch.object(native_binding, "_quiescent", return_value=pipeline), \
+             mock.patch.object(native_binding, "_guard", return_value=current), \
+             mock.patch.object(native_binding, "_graph", return_value=self.binding.graph):
+            correction.update(self.root / "old-proof.json")
+            self.poll.assert_called_once_with(self.api, location, operation, "spark-cli")
+            self.assertEqual(current["metadata"], old["metadata"])
+            self.assertEqual(current["cells"][1]["metadata"], old["cells"][1]["metadata"])
+            self.assertEqual(current["cells"][1]["source"][0], native_binding.HC_FLAG)
+            new_proof = self.binding.proof(self.root / "new-proof.json")
+            self.assertEqual(controller._verify_proof(self.root / "new-proof.json"),
+                             check.config_sha256(new_proof))
+            with self.assertRaisesRegex(CandidateBlocked, "proof differs"):
+                controller._verify_proof(self.root / "old-proof.json")
+            with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
+                correction.update(self.root / "old-proof.json")
+        self.assertEqual(self.api.request.call_count, 1)
+        with mock.patch.object(native_binding, "_quiescent", return_value=pipeline), \
+             mock.patch.object(native_binding, "_guard", return_value=current), \
+             mock.patch.object(native_binding, "_graph", return_value=self.binding.graph), \
+             mock.patch.object(controller, "_readback"), \
+             mock.patch.object(self.api, "request", return_value=(200, {}, None)):
+            state = controller.change("enable", self.root / "new-proof.json")
+            self.assertEqual(state["actions"]["enable"]["status"], "confirmed-readback")
+            self.assertEqual(state["proof_sha256"], check.config_sha256(new_proof))
+
+    def test_hc_uncertain_submission_never_retries(self):
+        self.rule_controller()
+        correction = native_guard_hc.GuardCorrection(self.binding)
+        old = self.binding.notebook
+        target = copy.deepcopy(old)
+        target["cells"][1]["source"].insert(0, native_binding.HC_FLAG)
+        self.write("old-proof.json", {"proof": "test"})
+        self.api.request.side_effect = RuntimeError("response lost")
+        with mock.patch.object(correction, "_baseline", return_value=(old, target)):
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                correction.update(self.root / "old-proof.json")
+            with self.assertRaisesRegex(CandidateBlocked, "acceptance unknown"):
+                correction.reconcile()
+            with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
+                correction.update(self.root / "old-proof.json")
+        self.assertEqual(self.api.request.call_count, 1)
+
+    def test_hc_lro_reconcile_polls_recorded_operation_only(self):
+        self.rule_controller()
+        correction = native_guard_hc.GuardCorrection(self.binding)
+        old = copy.deepcopy(self.binding.notebook)
+        target = copy.deepcopy(old)
+        target["cells"][1]["source"].insert(0, native_binding.HC_FLAG)
+        self.write("old-proof.json", {"proof": "test"})
+        operation = "468567aa-fc56-4b9f-b61a-0e39ae31fe51"
+        location = "https://api.fabric.microsoft.com/v1/operations/" + operation
+        self.api.request.return_value = (202, {"x-ms-operation-id": operation, "Location": location}, None)
+        self.poll.side_effect = [TimeoutError("pending"), None]
+        with mock.patch.object(correction, "_baseline", return_value=(old, target)), \
+             mock.patch.object(native_binding, "_guard", return_value=target), \
+             mock.patch.object(native_binding, "_graph", return_value=self.binding.graph):
+            with self.assertRaises(TimeoutError):
+                correction.update(self.root / "old-proof.json")
+            state = correction.reconcile()
+            self.assertEqual(state["update"]["status"], "confirmed-readback")
+        self.assertEqual(self.api.request.call_count, 1)
+        self.assertEqual(self.poll.call_args_list, [mock.call(self.api, location, operation, "spark-cli")] * 2)
 
 
 if __name__ == "__main__":

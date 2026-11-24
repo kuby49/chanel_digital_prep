@@ -57,6 +57,7 @@ sys.path[0:0] = [str(root / "demo-3-onelake-events-copy" / "tests"),
                  str(root / "demo-3-onelake-events-copy"), str(root / "demo-data-generator")]
 import test_native_binding as fixture
 import native_binding
+import native_guard_hc
 
 case = fixture.NativeBindingTests("test_proof_requires_confirmed_actions_and_fresh_matching_readbacks")
 case.setUpClass()
@@ -70,9 +71,28 @@ try:
                         for name in native_binding._ACTIONS}
     case.write(fixture.check.NATIVE_JOURNAL, state)
     pipeline = {"properties": {"activities": [{"name": "GuardedCopy"}]}}
+    old = copy.deepcopy(case.binding.notebook)
+    current = copy.deepcopy(old)
+    case.write("old-proof.json", {
+        "version": 1, "workspace_id": fixture.check.WORKSPACE, "lakehouse_id": fixture.check.LAKEHOUSE,
+        "guard_notebook_id": fixture.check.NOTEBOOK, "pipeline_id": fixture.check.PIPELINE,
+        "reflex_id": fixture.check.REFLEX, "connection_id": fixture.check.CONNECTION,
+        "marker": fixture.check.MARKER, "native_policy": state["native_policy"],
+        "generator_sha256": fixture.check.GENERATOR_SHA,
+        "guard_sha256": fixture.check.config_sha256(native_binding._notebook(old)),
+        "pipeline_sha256": fixture.check.config_sha256(pipeline["properties"]),
+        "graph_disabled_sha256": fixture.check.config_sha256(fixture.check._canonical(case.binding.graph)),
+    })
+    def update(method, url, body, **kwargs):
+        assert method == "POST"
+        current.clear()
+        current.update(native_binding._decode_part(body, "notebook-content.ipynb"))
+        return 200, {}, None
+    case.api.request.side_effect = update
     with mock.patch.object(native_binding, "_quiescent", return_value=pipeline), \\
-         mock.patch.object(native_binding, "_guard", return_value=case.binding.notebook), \\
+         mock.patch.object(native_binding, "_guard", return_value=current), \\
          mock.patch.object(native_binding, "_graph", return_value=case.binding.graph):
+        native_guard_hc.GuardCorrection(case.binding).update(case.root / "old-proof.json")
         proof = case.binding.proof(case.root / "proof.json")
 
     enabled = copy.deepcopy(case.binding.graph)
@@ -80,7 +100,8 @@ try:
                 and item["payload"]["definition"]["type"] == "Rule")
     rule["payload"]["definition"]["settings"]["shouldRun"] = True
     assert hook._digest(hook._graph(enabled, enabled=True)) == proof["graph_disabled_sha256"]
-    assert hook._digest(hook._guard(case.binding.notebook)) == proof["guard_sha256"]
+    assert hook._digest(hook._guard(current)) == proof["guard_sha256"]
+    assert hook._digest(hook._guard(old)) != proof["guard_sha256"]
     assert hook._digest(pipeline["properties"]) == proof["pipeline_sha256"]
 
     spec = importlib.util.spec_from_file_location("shared_deploy", root / "demo-data-generator" / "deploy.py")

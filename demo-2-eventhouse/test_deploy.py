@@ -3063,11 +3063,14 @@ else:
             os.environ["AZURE_CONFIG_DIR"] = "two"
             client._token(deploy.FABRIC)
             self.assertEqual(run.call_count, 3)
-            clock.return_value = 1060
+            clock.return_value = 1599
+            client._token(deploy.FABRIC)
+            self.assertEqual(run.call_count, 3)
+            clock.return_value = 1600
             client._token(deploy.FABRIC)
             self.assertEqual(run.call_count, 4)
             response.stdout = json.dumps({"tenant": TENANT, "accessToken": "new-token"})
-            clock.return_value = 1120
+            clock.return_value = 1940
             client._token(deploy.FABRIC)
             client._token(deploy.FABRIC)
             self.assertEqual(run.call_count, 6)

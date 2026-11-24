@@ -583,7 +583,7 @@ class FabricClient:
                 raise ValueError
             expires = token.get("expires_on")
             if (type(expires) is int or isinstance(expires, str) and expires.isascii() and expires.isdecimal()):
-                refresh_at = min(time.time() + 60, int(expires) - 60)
+                refresh_at = min(time.time() + 600, int(expires) - 60)
                 if refresh_at > time.time():
                     self._tokens[key] = (token["accessToken"], refresh_at)
             return token["accessToken"]

@@ -466,6 +466,14 @@ class NativeBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
                 correction.update(self.root / "old-proof.json")
         self.assertEqual(self.api.request.call_count, 1)
+        with mock.patch.object(native_binding, "_quiescent", return_value=pipeline), \
+             mock.patch.object(native_binding, "_guard", return_value=current), \
+             mock.patch.object(native_binding, "_graph", return_value=self.binding.graph), \
+             mock.patch.object(controller, "_readback"), \
+             mock.patch.object(self.api, "request", return_value=(200, {}, None)):
+            state = controller.change("enable", self.root / "new-proof.json")
+            self.assertEqual(state["actions"]["enable"]["status"], "confirmed-readback")
+            self.assertEqual(state["proof_sha256"], check.config_sha256(new_proof))
 
     def test_hc_uncertain_submission_never_retries(self):
         self.rule_controller()

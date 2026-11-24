@@ -1219,7 +1219,9 @@ def _definition_update_record(store):
         value = strict_json_loads(raw)
         binding = value["binding"]
         if (not isinstance(binding, dict)
-                or set(value) != {"version", "binding", "phase", "operation_id", "retry_after"}
+                or set(value) not in (
+                    {"version", "binding", "phase", "operation_id", "retry_after"},
+                    {"version", "binding", "phase", "operation_id", "retry_after", "response_status"})
                 or type(value["version"]) is not int or value["version"] != 1
                 or value["phase"] not in ("pending", "completed")
                 or set(binding) != {"kind", "item_id", "workspace_id", "tenant_id", "before_sha256",
@@ -1232,7 +1234,10 @@ def _definition_update_record(store):
                 or (value["operation_id"] is None and value["retry_after"] is not None)
                 or (value["operation_id"] is not None
                     and (not _same_uuid(value["operation_id"], value["operation_id"])
-                         or type(value["retry_after"]) is not int or value["retry_after"] < 0))):
+                         or type(value["retry_after"]) is not int or value["retry_after"] < 0))
+                or ("response_status" in value
+                    and (type(value["response_status"]) is not int or value["response_status"] != 200
+                         or value["operation_id"] is not None))):
             raise ValueError
     except (KeyError, TypeError, ValueError, RecursionError):
         raise Blocked("Definition-update journal is invalid; reconcile before continuing.") from None
@@ -1292,6 +1297,10 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
         matches = record is not None and record["binding"] == binding
         if record and record["phase"] == "pending" and not matches:
             raise Blocked("Another definition update is unresolved or its binding changed; no POST was attempted.")
+        if (matches and record["phase"] == "pending" and record["operation_id"] is None
+                and record.get("response_status") != 200):
+            raise Blocked("Definition update POST outcome unknown; manual reconciliation is required. "
+                          "No POST was retried.")
         _require_idle_producer(client, store, state, plan["tenant_id"])
         path = store.directory / DEFINITION_UPDATE_NAME
 
@@ -1321,8 +1330,12 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
                                                   {"definition": target}, on_accepted=accepted, require_result=False)
             except (FabricHttpError, FabricTransportError, Blocked, OSError):
                 raise Blocked("Definition update is unconfirmed; reconcile the same intent. No POST was retried.") from None
-            if status not in (200, 202) or status == 202 and record["operation_id"] is None:
+            if (status not in (200, 202) or status == 202 and record["operation_id"] is None
+                    or status == 200 and record["operation_id"] is not None):
                 raise Blocked("Definition update returned an unconfirmed response; no POST will be retried.")
+            if status == 200:
+                record["response_status"] = 200
+                persist()
             matches = True
         if matches:
             live, actual = _read_definition(client, state, kind)

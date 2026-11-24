@@ -163,7 +163,7 @@ class DefinitionUpdateTests(unittest.TestCase):
         self.assertEqual(self.calls, ["notebook"])
         self.client.poll.assert_called_once_with(OPERATION, 6, require_result=False)
 
-    def test_unknown_post_never_retries_even_when_old_definition_remains(self):
+    def test_unknown_post_never_retries_or_completes_from_matching_readback(self):
         digest = self.digest("notebook")
 
         def uncertain(kind, target, accepted):
@@ -173,16 +173,84 @@ class DefinitionUpdateTests(unittest.TestCase):
         self.behavior = uncertain
         with self.assertRaisesRegex(deploy.Blocked, "unconfirmed"):
             self.update("notebook", digest)
-        with self.assertRaisesRegex(deploy.Blocked, "readback is unconfirmed"):
+        with self.assertRaisesRegex(deploy.Blocked, "outcome unknown"):
             self.update("notebook", digest)
         self.live["notebook"] = copy.deepcopy(self.target)
         self.live["notebook"]["parts"][-1] = definition({"different": "platform"}, ".platform")["parts"][0]
         with self.assertRaisesRegex(deploy.Blocked, "binding changed"):
             self.update("notebook", digest)
         self.live["notebook"] = self.target
-        self.update("notebook", digest)
+        with self.assertRaisesRegex(deploy.Blocked, "outcome unknown"):
+            self.update("notebook", digest)
+        self.assertEqual(deploy._definition_update_record(self.store)["phase"], "pending")
         self.assertEqual(self.calls, ["notebook"])
         self.client.poll.assert_not_called()
+
+    def test_confirmed_200_is_persisted_before_readback_and_can_be_recovered(self):
+        digest = self.digest("notebook")
+        original_read = deploy._read_definition
+        read_count = 0
+
+        def disconnected(client, state, kind):
+            nonlocal read_count
+            read_count += 1
+            if read_count == 3:
+                journal = deploy._definition_update_record(self.store)
+                self.assertEqual((journal["phase"], journal["response_status"]), ("pending", 200))
+                raise deploy.FabricTransportError("readback unavailable")
+            return original_read(client, state, kind)
+
+        with mock.patch.object(deploy, "_read_definition", side_effect=disconnected):
+            with self.assertRaisesRegex(deploy.FabricTransportError, "readback unavailable"):
+                self.update("notebook", digest)
+        self.assertEqual(deploy._definition_update_record(self.store)["phase"], "pending")
+        self.update("notebook", digest)
+        self.assertEqual(deploy._definition_update_record(self.store)["phase"], "completed")
+        self.assertEqual(self.calls, ["notebook"])
+        self.client.poll.assert_not_called()
+
+    def test_crash_before_200_receipt_is_persisted_stays_unknown(self):
+        digest = self.digest("notebook")
+        original_write = deploy._atomic_json
+
+        def crash(path, value):
+            if value.get("response_status") == 200:
+                raise OSError("receipt write interrupted")
+            return original_write(path, value)
+
+        with mock.patch.object(deploy, "_atomic_json", side_effect=crash):
+            with self.assertRaises(OSError):
+                self.update("notebook", digest)
+        journal = deploy._definition_update_record(self.store)
+        self.assertEqual(journal["phase"], "pending")
+        self.assertNotIn("response_status", journal)
+        with self.assertRaisesRegex(deploy.Blocked, "outcome unknown"):
+            self.update("notebook", digest)
+        self.assertEqual(self.calls, ["notebook"])
+        self.assertEqual(deploy._definition_update_record(self.store), journal)
+
+    def test_malformed_sync_receipt_fails_closed(self):
+        digest = self.digest("notebook")
+        self.update("notebook", digest)
+        journal = deploy._definition_update_record(self.store)
+        path = self.store.directory / deploy.DEFINITION_UPDATE_NAME
+        for value in (True, "200", 202, None):
+            with self.subTest(value=value):
+                deploy._atomic_json(path, {**journal, "response_status": value})
+                with self.assertRaisesRegex(deploy.Blocked, "journal is invalid"):
+                    deploy._definition_update_record(self.store)
+        deploy._atomic_json(path, {**journal, "operation_id": OPERATION, "retry_after": 1})
+        with self.assertRaisesRegex(deploy.Blocked, "journal is invalid"):
+            deploy._definition_update_record(self.store)
+
+    def test_legacy_completed_record_remains_compatible(self):
+        digest = self.digest("notebook")
+        self.update("notebook", digest)
+        journal = deploy._definition_update_record(self.store)
+        journal.pop("response_status")
+        deploy._atomic_json(self.store.directory / deploy.DEFINITION_UPDATE_NAME, journal)
+        self.update("notebook", digest)
+        self.assertEqual(self.calls, ["notebook"])
 
     def test_active_and_unknown_scheduler_jobs_block_before_intent(self):
         for status in ("NotStarted", "InProgress", "NewStatus"):

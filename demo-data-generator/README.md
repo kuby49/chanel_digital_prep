@@ -259,10 +259,13 @@ metadata. If publication is interrupted, rerun the **same command** with
 the same config and approved baseline. The durable
 `shared-producer-definition-update-v1.json` intent records the target and any
 accepted Fabric operation ID. The controller polls only that ID or checks
-exact readback when acceptance is unknown; it does not retry an uncertain
-update POST. If exact readback cannot establish the outcome, keep the
-journal and reconcile manually. Successful publication does not declare demo
-readiness or start a producer.
+exact readback after a durably recorded synchronous HTTP 200. If the POST
+outcome is unknown, even matching readback cannot prove an operation has
+terminated: keep the journal and reconcile manually; the controller never
+retries the POST. Legacy completed records remain compatible, but a completed
+record without an operation ID or synchronous receipt does not independently
+prove that a previously ambiguous operation terminated. Successful publication
+does not declare demo readiness or start a producer.
 
 ## Isolated Demo 2 synthetic staging
 

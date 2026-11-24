@@ -113,6 +113,76 @@ class SharedManifestIntegrationTest(unittest.TestCase):
         for key in ("target_bindings", "generator_sha256", "producer_config", "monitor_binding_sha256"):
             self.assertEqual(root_binding[key], eventhouse_binding[key])
 
+    def test_orchestrator_resolves_real_demo1_candidate_only_from_confirmed_journal(self):
+        ownership = load_script("demo1_ownership_integration", ROOT / "demo-1-materialized-lake-views" / "ownership.py")
+        orchestration = load_script("orchestration_demo1_integration", ROOT / "scripts" / "deploy-demos")
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["capacity"]["id"] = "11111111-1111-4111-8111-111111111111"
+        config["shared"].update({"workspace_id": "22222222-2222-4222-8222-222222222222",
+                                 "staging_lakehouse_id": "33333333-3333-4333-8333-333333333333"})
+        config["demo-1"].update({"lakehouse_name": "Demo1Lakehouse", "silver_view": "sales_joined"})
+        workspace = "44444444-4444-4444-8444-444444444444"
+        lakehouse = "55555555-5555-4555-8555-555555555555"
+        owner = "66666666-6666-4666-8666-666666666666"
+        intent = "77777777-7777-4777-8777-777777777777"
+        marker = f"chanel-demo1-{owner}"
+        target = {"workspace_id": workspace, "item_id": lakehouse, "fact": "silver.sales_joined"}
+        workspace_record = {
+            "status": "confirmed", "type": "Workspace", "id": workspace, "created_by_owner": owner,
+            "create_intent_id": intent, "create_response": {"id": workspace},
+            "readback": {"id": workspace, "type": "Workspace", "name": "chanel-demo1-mlv",
+                         "owner_marker": marker},
+        }
+        lakehouse_record = {
+            "status": "confirmed", "type": "Lakehouse", "id": lakehouse, "created_by_owner": owner,
+            "create_intent_id": intent, "create_response": {"id": lakehouse}, "workspace_id": workspace,
+            "readback": {"id": lakehouse, "type": "Lakehouse", "name": "Demo1Lakehouse",
+                         "workspace_id": workspace, "owner_marker": marker},
+        }
+        journal = {
+            "contract_version": 1, "track": "demo-1", "tenant_id": config["tenant_id"], "prefix": "chanel",
+            "config_sha256": ownership._config_fingerprint(config, "chanel"),
+            "pending_operations": [], "uncertain_operations": [], "owner": {"id": owner, "marker": marker},
+            "workspace": workspace_record, "lakehouse": lakehouse_record,
+            "fact": {"status": "confirmed", "workspace_id": workspace, "item_id": lakehouse,
+                     "name": target["fact"], "type": "MATERIALIZED_LAKE_VIEW"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            missing = root / "missing"
+            missing.mkdir()
+            phases, resolved, _ = orchestration.effective_run_config(
+                config, "chanel", state, missing, 30, ["demo-1"], 1)
+            self.assertEqual(phases["resolve-target-candidate"]["demo-1"]["status"], "blocked")
+            self.assertIsNone(resolved)
+            self.assertFalse((missing / ownership.CANDIDATE_FILE).exists())
+            journal_path = state / ownership.STATE_FILE
+            journal_path.write_text(json.dumps(journal), encoding="utf-8")
+            before = journal_path.read_bytes()
+            invocation = root / "invocation"
+            invocation.mkdir()
+            phases, resolved, path = orchestration.effective_run_config(
+                config, "chanel", state, invocation, 30, ["demo-1"], 1)
+            candidate_result = phases["resolve-target-candidate"]["demo-1"]
+            self.assertEqual((candidate_result["status"], candidate_result["ready"]), ("pass", False))
+            self.assertEqual(resolved["shared"]["target_bindings"], {"demo-1": target})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), resolved)
+            self.assertEqual(journal_path.read_bytes(), before)
+            self.assertFalse((state / ownership.LOCK_FILE).exists())
+
+            conflict = json.loads(json.dumps(config))
+            conflict["shared"]["target_bindings"]["demo-1"] = dict(target, item_id=workspace)
+            rejected = root / "rejected"
+            rejected.mkdir()
+            phases, resolved, _ = orchestration.effective_run_config(
+                conflict, "chanel", state, rejected, 30, ["demo-1"], 1)
+            self.assertEqual(phases["resolve-target-candidate"]["demo-1"]["status"], "blocked")
+            self.assertIsNone(resolved)
+            self.assertFalse((rejected / ownership.CANDIDATE_FILE).exists())
+            self.assertEqual(journal_path.read_bytes(), before)
+
     def test_orchestrator_resolves_real_eventhouse_candidate_without_cloud_calls(self):
         sys.path.insert(0, str(ROOT / "demo-2-eventhouse"))
         try:

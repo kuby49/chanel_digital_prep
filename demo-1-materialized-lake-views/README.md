@@ -1,16 +1,19 @@
 # Demo 1: file-backed materialized lake views
 
-**Status: bounded customer-run admission verified; full measured readiness blocked.**
-The read-only `validate-only` path accepts the configured one-file, ten-row
-customer run after checking the original owned journal, target, access,
-dimensions, existing outputs and native refresh state. It does not establish
-new delivery or the separate ten-file acceptance run. Live validation created the isolated
+**Status: one-file admission verified; recurring admission is locally tested.**
+The read-only `validate-only` path checks the original owned journal, target,
+access, dimensions, existing outputs and native refresh state. The recurring
+10-file path additionally requires an owned bounded schedule and has not been
+verified on the fresh cloud target. Neither admission establishes new delivery
+or measured ten-file acceptance. Live validation created the isolated
 `chanel-demo1-mlv` workspace on the MCAP F8 capacity, a schema-enabled
 `ChanelDemo1Lakehouse`, Bronze/Silver schemas, and static dimensions. Spark
 readback confirmed 365 unique non-null date keys, 20 product keys, and 100
 customer keys. A separate header-only bootstrap CSV enabled creation of the
-Bronze and Silver MLVs; both initially read back zero rows. The executable
-deployment and full measured-run verification remain unimplemented.
+Bronze and Silver MLVs; both initially read back zero rows. A later synthetic
+refresh produced three Bronze rows and two Silver facts totaling 3,000 minor
+units from two batches and a renamed identical replay. Full measured-run
+verification remains unimplemented.
 
 ## Architecture and prerequisites
 
@@ -78,10 +81,9 @@ Leave the bootstrap in place: deleting it and refreshing from a truly empty
 folder has not been tested.
 
 `silver-candidate.sql` proposes a fully qualified SQL MLV using casts,
-exact monetary values, left joins and failure constraints. The earlier
-non-deduplicating definition and empty schema were validated in the isolated
-Fabric Lakehouse; the current replay-aware definition has **not** been deployed
-or tested as an MLV. It groups by `(BatchID, SalesLineID)`, collapses
+exact monetary values, left joins and failure constraints. The replay-aware
+definition passed a synthetic refresh on the fresh Lakehouse; it has not
+passed the measured producer run. It groups by `(BatchID, SalesLineID)`, collapses
 identical copies from different files and exposes quality flags so the
 constraint fails on conflicting raw payloads, duplicate keys within a file,
 or missing source paths. Bronze retains the original files and rows. Silver
@@ -171,14 +173,41 @@ directly, so timeout cleanup does not wait on a CMD wrapper's inherited
 pipes. Failures are reported without tokens or command output; acquisition is
 not automatically retried.
 
+For the specified 10-file, 1,000-row recurring run, `managed_refresh.py`
+provides `plan`, `start`, `status`, and `stop` controls for a receipt-bound
+native five-minute full-lineage schedule. `start` and `stop` require `--yes`
+and the original ownership state; reconcile ambiguous operations before retry.
+Admission requires the exact enabled schedule, a future first refresh, and no
+conflicting schedules or active lineage jobs. Source files are targeted at
+60-second intervals; scheduled refresh and query visibility are slower.
+The controller is locally tested but has not yet been verified on this target.
+With a frozen recurring config and coordinated approval, run:
+
+```powershell
+python .\demo-1-materialized-lake-views\managed_refresh.py plan --config <absolute-common-config>
+python .\demo-1-materialized-lake-views\managed_refresh.py start --config <absolute-common-config> --start-delay-minutes 10 --duration-minutes 30 --yes
+python .\demo-1-materialized-lake-views\managed_refresh.py status --config <absolute-common-config>
+python .\demo-1-materialized-lake-views\managed_refresh.py stop --config <absolute-common-config> --yes
+```
+
+`start` performs preparation checks before creating one future-start schedule,
+retains the create receipt, and verifies its owner, scope and bounds. Complete
+coordinated admission and start the producer before the first scheduled refresh.
+If the first-fire deadline is missed, admission blocks; do not bypass it.
+Observe the actual delivery times, refresh jobs and Silver BatchIDs, then
+disable only the owned schedule after the final batch is reconciled. `stop`
+reports blocked while any lineage job is nonterminal; it does not cancel jobs.
+The minimum active window is 19 minutes and the default is 30 minutes; these
+are bounded allowances, not latency guarantees.
+
 Invoke `python deploy.py --mode MODE --config ABSOLUTE_JSON --prefix PREFIX
 --state-dir ABSOLUTE_DIR --result ABSOLUTE_JSON`, where `MODE` is `dry-run`,
 `validate-only`, `deploy`, `cleanup`, or `resolve-target-candidate`; cleanup
 also requires `--yes`. The
 result uses shared contract version 1. Dry-run only checks the local contract
-and never reports readiness. Deployment, validation and cleanup remain
-blocked and perform no cloud operations. Cleanup is unavailable because
-resource-scoped cleanup is not implemented.
+and never reports readiness. Customer-run validation is read-only and can
+report readiness after its checks pass. General deployment and cleanup remain
+blocked; resource-scoped cleanup is not implemented.
 The config must contain `contract_version: 1`. The `--prefix` argument is the
 effective prefix; the SQL planning helpers expand `{prefix}` in the workspace
 template and render a file-backed Bronze MLV definition and fully qualified

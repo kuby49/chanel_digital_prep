@@ -4,6 +4,7 @@ import hashlib
 import re
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from urllib import error, parse, request
 
 from fabric_delivery import OneLakeFileAdapter, _landing
@@ -164,6 +165,29 @@ def require_write_roles(client, document, selected, targets, producer_workspace,
                    and role["principal"].get("id") == identity_id
                    and role["principal"].get("type") in ("User", "ServicePrincipal") for role in roles):
             raise RuntimeError(f"Runtime identity lacks a directly assigned write role in workspace {workspace}")
+
+
+def native_parameters(profile, *, now):
+    """Resolve the operator-pinned, single-run profile, not caller-supplied overrides."""
+    if (not isinstance(profile, dict)
+            or set(profile) != {"document", "selected", "binding", "expires_at_utc", "activity_timeout"}):
+        raise ValueError("No prepared native producer profile")
+    document, selected, binding = (profile[key] for key in ("document", "selected", "binding"))
+    run, duration = run_config(document)
+    try:
+        expiry = datetime.fromisoformat(profile["expires_at_utc"])
+    except (ValueError, TypeError):
+        raise ValueError("Native profile requires a fixed UTC expiry") from None
+    if expiry.tzinfo is None or expiry.utcoffset() != timedelta(0):
+        raise ValueError("Native profile expiry must be UTC")
+    if now is not None and expiry - now <= timedelta(seconds=duration):
+        raise ValueError("Native profile is expired or has insufficient time; ask the operator to prepare a new run")
+    digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
+    nonce = "native-" + digest[:32]
+    if (not isinstance(binding, dict) or binding.get("nonce") != nonce or binding.get("run_id") != run.run_id
+            or binding.get("config_sha256") != digest):
+        raise ValueError("Native profile does not match the prepared run binding")
+    return document, selected, binding, nonce, expiry.astimezone(timezone.utc).isoformat()
 
 
 def prepare_measured(document, selected, probe_id, binding, context, identities, clients, table_client=None):

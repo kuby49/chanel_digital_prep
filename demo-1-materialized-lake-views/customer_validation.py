@@ -1,4 +1,4 @@
-"""Read-only admission for a bounded, on-demand customer demonstration."""
+"""Read-only admission for bounded on-demand and native recurring demonstrations."""
 
 import base64
 from datetime import date, timedelta
@@ -13,6 +13,7 @@ from urllib.request import Request, build_opener
 
 from definition_plan import bootstrap_csv_bytes, render_bronze_sql, render_silver_sql
 from fresh_deploy import verify_readback
+from managed_refresh import check_idle, check_schedule, recurring_run
 from ownership import (
     STATE_FILE, CandidateBlocked, _az_json, _resource, _state_lock, _unique_pairs, _uuid,
 )
@@ -117,7 +118,7 @@ def _page(client, path):
     return body["value"]
 
 
-def validate_customer(config, prefix, state_dir):
+def validate_customer(config, prefix, state_dir, *, _preparing_schedule=False):
     demo, shared, data = (config.get(key) for key in ("demo-1", "shared", "data"))
     if not isinstance(demo, dict) or demo.get("readiness_scope") != "customer-run":
         raise CandidateBlocked("The header-only bootstrap exists; validate-only requires explicit customer-run scope.")
@@ -127,8 +128,7 @@ def validate_customer(config, prefix, state_dir):
             or not isinstance(shared.get("target_bindings"), dict)):
         raise ValueError("Customer-run prefix, capacity and selected target bindings must be explicit and consistent.")
     tenant, principal = _uuid(config.get("tenant_id")), _uuid(shared.get("identity_id"))
-    if (data.get("file_count"), data.get("rows_per_file"), data.get("currency")) != (1, 10, "USD"):
-        raise CandidateBlocked("This readiness scope supports only the agreed one-file/ten-row USD customer run.")
+    recurring = recurring_run(data)
     for key in ("date_count", "product_count", "customer_count"):
         if type(data.get(key)) is not int or data[key] < 1:
             raise ValueError(f"data.{key} must be a positive integer")
@@ -211,18 +211,29 @@ def validate_customer(config, prefix, state_dir):
             raise CandidateBlocked("Producer lacks a direct write/refresh role on the Demo 1 workspace.")
         refresh_path = f"/v1/workspaces/{workspace}/lakehouses/{item}/jobs/refreshMaterializedLakeViews"
         history = _page(client, refresh_path + "/instances")
-        if not history or any(row.get("status") not in ("Completed", "Failed", "Cancelled", "Deduped")
-                              for row in history):
-            raise CandidateBlocked("Native MLV history is missing or a lineage refresh is already active.")
-        latest = max(history, key=lambda row: row.get("startTimeUtc") or "")
-        if latest.get("status") != "Completed" or latest.get("itemId") != item:
-            raise CandidateBlocked("The latest native MLV lineage refresh did not complete successfully.")
+        check_idle(history, item)
         schedules = _page(client, refresh_path + "/schedules")
-        if any(row.get("enabled") is not False for row in schedules):
+        if recurring:
+            check_schedule(config, prefix, state_dir, journal, schedules, preparing=_preparing_schedule)
+        elif any(row.get("enabled") is not False for row in schedules):
             raise CandidateBlocked("The bounded customer run requires no enabled competing refresh schedule.")
         _bootstrap(workspace, item, tenant, principal)
         _sql_readback(live_lakehouse["properties"].get("sqlEndpointProperties", {}),
                       expected["lakehouse_name"], tenant, principal, data)
+        if recurring:
+            check_idle(_page(client, refresh_path + "/instances"), item)
+            schedules = _page(client, refresh_path + "/schedules")
+            check_schedule(config, prefix, state_dir, journal, schedules, preparing=_preparing_schedule)
+    if recurring:
+        return [
+            "Owned target, landing/bootstrap, producer role, dimensions and SQL outputs verified read-only.",
+            "Preparation only; no recurring readiness claimed." if _preparing_schedule else
+            "Owned bounded five-minute full-lineage schedule verified; future start and no active job required.",
+            "Ten files x 1000 rows are configured for 60-second source intervals; downstream refresh is five minutes "
+            "plus processing, not a 60-second freshness SLA. Reconcile only the ten customer BatchIDs "
+            "against the delivered manifest, excluding synthetic/bootstrap baseline; delivery, latency, "
+            "per-view mode and measured acceptance remain unproven.",
+        ]
     return [
         "Owned target, landing/bootstrap, producer role, dimensions and SQL outputs verified read-only.",
         "Native lineage has a completed refresh and no active job or enabled schedule.",

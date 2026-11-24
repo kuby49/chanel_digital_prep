@@ -728,7 +728,7 @@ class OwnershipTests(unittest.TestCase):
         store = MemoryStore()
         with mock.patch.object(deploy, "_definition", return_value=expected) as build:
             deploy._create_resource(client, store, state, plan, "notebook")
-        build.assert_called_once_with(state, "notebook")
+        build.assert_called_once_with(state, "notebook", None)
         self.assertEqual(client.post_operation.call_args.args[1]["definition"], expected)
         self.assertEqual(store.state["resources"]["notebook"]["id"], NOTEBOOK)
 
@@ -1285,7 +1285,7 @@ class MockFabricService:
         return 201, {"id": item_id}
 
 
-def bound_definition(state, kind):
+def bound_definition(state, kind, config=None):
     resources = state["resources"]
     if kind == "notebook":
         notebook = definition({"workspace": resources["workspace"]["id"],

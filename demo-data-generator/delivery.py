@@ -60,7 +60,7 @@ def begin_submission(root, run_id, batch_number, destination, max_attempts):
             "sales_amount_minor_units": batch["sales_amount_minor_units"]}
 
 
-def finish_delivery_submission(delivery, status, operation_id=None, diagnostic=None):
+def finish_delivery_submission(delivery, status, operation_id=None, diagnostic=None, *, observed_at=None):
     if status not in ("submitted", "retryable_failure", "unknown", "permanent_failure"):
         raise ValueError("invalid submission outcome")
     if operation_id is not None and not isinstance(operation_id, str):
@@ -69,7 +69,7 @@ def finish_delivery_submission(delivery, status, operation_id=None, diagnostic=N
         raise ValueError("diagnostic must be a sanitized string")
     if delivery["status"] != "submitting":
         raise RuntimeError("no submission is in progress")
-    timestamp = _now()
+    timestamp = observed_at.isoformat() if observed_at is not None else _now()
     delivery.update(status=status, timestamp_utc=timestamp, submission_status=status,
                     submission_result_at_utc=timestamp, operation_id=operation_id, diagnostic=diagnostic)
 

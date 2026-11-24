@@ -2,6 +2,8 @@
 
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,7 +12,8 @@ from fabric_ledger import FabricLedger
 
 def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attempts, *,
                        selected_targets, clock=None, sleep=None, poll_seconds=5,
-                       allow_staged_pending=False, stop_requested=None):
+                       allow_staged_pending=False, stop_requested=None,
+                       independent_source=False, fresh_only=False, demo3_admission=None):
     config.validate()
     if not adapters or any(not callable(getattr(adapter, "submit", None))
                            or not callable(getattr(adapter, "verify", None)) for adapter in adapters.values()):
@@ -41,7 +44,9 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
             errors.append("stop requested; unresolved deliveries require reconciliation")
         return stopped
 
-    with FabricLedger(store, config, list(adapters), selected_targets=selected_targets) as ledger:
+    executor = ThreadPoolExecutor(max_workers=1) if independent_source else nullcontext()
+    with (FabricLedger(store, config, list(adapters), selected_targets=selected_targets,
+                       fresh_only=fresh_only) as ledger, executor as worker):
         scheduler = ledger.manifest.get("scheduler")
         if scheduler is None:
             if ledger.manifest["batches"]:
@@ -76,6 +81,67 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
             return result
         if scheduler.get("status", "running") != "running":
             raise RuntimeError("run lifecycle state is invalid")
+        if demo3_admission is not None and not should_stop():
+            ledger.open_demo3_admission(*demo3_admission)
+
+        starts = scheduler["batch_started_at_utc"]
+
+        def due_at(number):
+            due = start + timedelta(seconds=(number - 1) * config.interval_seconds)
+            if number > 1:
+                previous = (ledger.manifest["batches"][str(number - 1)]["generated_at_utc"]
+                            if independent_source else starts[str(number - 1)])
+                previous = datetime.fromisoformat(previous)
+                due = max(due, previous + timedelta(seconds=config.interval_seconds))
+            return due
+
+        def stage(number):
+            key = str(number)
+            if key not in starts:
+                starts[key] = clock().isoformat()
+                ledger.set_scheduler(scheduler)
+            ledger.stage_batch(number, clock=clock)
+
+        next_source = 1
+
+        def stage_due():
+            nonlocal next_source
+            while next_source <= config.file_count and clock() < deadline and not should_stop():
+                if str(next_source) not in ledger.manifest["batches"]:
+                    if str(next_source) not in starts and clock() < due_at(next_source):
+                        break
+                    stage(next_source)
+                next_source += 1
+
+        def adapter_call(method, *args):
+            if worker is None:
+                return method(*args)
+            # Only this thread changes the manifest; the worker owns only adapter I/O.
+            future = worker.submit(method, *args)
+            try:
+                while not future.done():
+                    stage_due()
+                    expired = clock() >= deadline
+                    if (should_stop() or expired) and demo3_admission is not None:
+                        ledger.stop_demo3_admission()
+                    if stopped or expired:
+                        break
+                    remaining = ((due_at(next_source) if next_source <= config.file_count else deadline)
+                                 - clock()).total_seconds()
+                    wait((future,), timeout=min(poll_seconds, max(0, remaining)))
+            finally:
+                wait((future,))
+            return future.result()
+
+        def adapter_result(method, *args):
+            try:
+                return True, method(*args)
+            except Exception:
+                return False, None
+
+        def invoke(method, *args):
+            # Catch only adapter errors, not a failed source write or stop check.
+            return adapter_call(adapter_result, method, *args)
 
         def verify(number, destination):
             batch = ledger.manifest["batches"][str(number)]
@@ -86,12 +152,15 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                     ledger.record_observation(number, destination, "unknown",
                                               "Ingestion source ID is unavailable; reconcile before retry")
                     return
+                ok, outcome = invoke(adapters[destination].ingestion_status, operation_id)
+                if not ok:
+                    ledger.record_observation(number, destination, "unknown", "Ingestion status outcome unknown")
+                    return
                 try:
-                    outcome = adapters[destination].ingestion_status(operation_id)
                     evidence = {field: getattr(outcome, field) for field in
                                 ("status", "timestamp_utc", "source_id", "service_operation_id",
                                  "error_code", "diagnostic")}
-                except Exception:
+                except AttributeError:
                     ledger.record_observation(number, destination, "unknown", "Ingestion status outcome unknown")
                     return
                 previous = delivery.get("ingestion_outcome")
@@ -113,11 +182,9 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                                   else evidence["diagnostic"] or "Eventhouse ingestion failed")
                     ledger.record_observation(number, destination, "failed", diagnostic)
                     return
-            try:
-                result = adapters[destination].verify(
-                    batch["batch_id"], batch["sha256"], batch["row_count"],
-                    batch["sales_amount_minor_units"], delivery.get("operation_id"))
-            except Exception:
+            ok, result = invoke(adapters[destination].verify, batch["batch_id"], batch["sha256"], batch["row_count"],
+                                batch["sales_amount_minor_units"], delivery.get("operation_id"))
+            if not ok:
                 # The readback is not proof of failure; keep the prior submission state.
                 ledger.record_observation(number, destination, "unknown", "Verification outcome unknown")
                 return
@@ -136,16 +203,13 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
             else:
                 ledger.record_observation(number, destination, "unknown", "Invalid verification outcome")
 
+        delivery_order = sorted(adapters, key=lambda name: name == "demo-2") if independent_source else adapters
         for number in range(1, config.file_count + 1):
             if should_stop():
                 break
             key = str(number)
-            starts = scheduler["batch_started_at_utc"]
             if key not in starts:
-                due = start + timedelta(seconds=(number - 1) * config.interval_seconds)
-                if number > 1:
-                    previous = datetime.fromisoformat(starts[str(number - 1)])
-                    due = max(due, previous + timedelta(seconds=config.interval_seconds))
+                due = due_at(number)
                 remaining = (due - clock()).total_seconds()
                 if remaining > 0:
                     if due >= deadline:
@@ -161,13 +225,13 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                 if clock() >= deadline:
                     errors.append("deadline reached before next batch")
                     break
-                starts[key] = clock().isoformat()
-                ledger.set_scheduler(scheduler)
             if clock() >= deadline:
                 errors.append("deadline reached before batch delivery")
                 break
-            ledger.stage_batch(number)
-            for destination, adapter in adapters.items():
+            if key not in ledger.manifest["batches"] or not independent_source:
+                stage(number)
+            for destination in delivery_order:
+                adapter = adapters[destination]
                 while clock() < deadline:
                     if should_stop():
                         break
@@ -186,12 +250,8 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                         local = Path(directory) / "batch.csv"
                         local.write_bytes(ledger.staged_bytes(number))
                         request = ledger.begin_submission(number, destination, max_attempts)
-                        try:
-                            result = adapter.submit(str(local), request["batch_id"], request["sha256"],
-                                                    request["row_count"], request["sales_amount_minor_units"])
-                        except Exception:
-                            # The external operation may have succeeded before raising.
-                            result = None
+                        _, result = invoke(adapter.submit, str(local), request["batch_id"], request["sha256"],
+                                           request["row_count"], request["sales_amount_minor_units"])
                         status = getattr(result, "status", None)
                         operation_id = getattr(result, "operation_id", None)
                         diagnostic = getattr(result, "diagnostic", None)
@@ -199,17 +259,20 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                                 or operation_id is not None and not isinstance(operation_id, str)
                                 or diagnostic is not None and not isinstance(diagnostic, str)):
                             status, operation_id, diagnostic = "unknown", None, "Adapter outcome unknown; reconcile before retry"
-                        ledger.record_submission(number, destination, status, operation_id, diagnostic)
+                        ledger.record_submission(number, destination, status, operation_id, diagnostic,
+                                                 observed_at=clock() if independent_source else None)
                         if status == "unknown":
                             break
                 if should_stop():
                     break
                 delivery = ledger.manifest["batches"][key]["deliveries"][destination]
-                if delivery["status"] in ("submitted", "unknown", "submitting") and clock() < deadline:
+                if (not independent_source and delivery["status"] in ("submitted", "unknown", "submitting")
+                        and clock() < deadline):
                     verify(number, destination)
             if stopped:
                 break
 
+        first_poll = independent_source
         while clock() < deadline:
             if should_stop():
                 break
@@ -219,17 +282,25 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                        if delivery["status"] in ("submitted", "unknown", "submitting")]
             if not pending:
                 break
-            sleep(min(poll_seconds, max(0, (deadline - clock()).total_seconds())))
+            if not first_poll:
+                sleep(min(poll_seconds, max(0, (deadline - clock()).total_seconds())))
+            first_poll = False
             for number, destination in pending:
                 if clock() >= deadline or should_stop():
                     break
                 verify(number, destination)
+        if independent_source:
+            should_stop()
+            if clock() >= deadline:
+                errors.append("producer execution deadline reached")
         final = ledger.manifest
         for number, batch in final["batches"].items():
             for destination, delivery in batch["deliveries"].items():
                 if delivery["status"] != "verified":
                     errors.append(f"{destination} batch {number}: {delivery['status']}")
         verified = not errors and len(final["batches"]) == config.file_count
+        if not verified and demo3_admission is not None:
+            ledger.stop_demo3_admission()
         result = {"verified": verified, "errors": errors, "deadline_utc": deadline.isoformat()}
         scheduler.update(status="completed" if verified else "failed",
                          finished_at_utc=clock().isoformat(), result=result)

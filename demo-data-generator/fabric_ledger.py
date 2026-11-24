@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from delivery import finish_delivery_submission, start_delivery, verify_delivery
 from fabric_storage import StorageConflict, StorageError
-from generator import (batch_bytes, batch_metadata_matches, new_manifest, strict_json_loads,
+from generator import (batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest, strict_json_loads,
                        validate_fabric_targets, validate_run_manifest)
 
 
@@ -46,9 +46,10 @@ def _validate_ingestion_outcome(outcome, operation_id):
 
 
 class FabricLedger:
-    def __init__(self, store, config, destinations, *, selected_targets):
+    def __init__(self, store, config, destinations, *, selected_targets, fresh_only=False):
         self.store = store
         self.config = config
+        self.fresh_only = fresh_only
         self.expected = new_manifest(config, destinations)
         validate_fabric_targets(selected_targets)
         if set(selected_targets) != set(destinations):
@@ -79,7 +80,11 @@ class FabricLedger:
         return self
 
     def __exit__(self, exc_type, exc, traceback):
-        self._release()
+        try:
+            if exc_type is not None and not self.unsafe:
+                self.stop_demo3_admission()
+        finally:
+            self._release()
 
     def _release(self):
         if not self.unsafe:
@@ -124,6 +129,8 @@ class FabricLedger:
             initialized, _ = self.store.read(self.started_path)
         except FileNotFoundError:
             initialized = None
+        if self.fresh_only and (raw is not None or initialized is not None):
+            raise RuntimeError("Native run ID has already been initialized; inspect the existing manifest")
         if raw is None:
             if initialized is not None:
                 raise RuntimeError("initialized run has no manifest; manual recovery required")
@@ -142,7 +149,28 @@ class FabricLedger:
         self.manifest_etag = self._write(self.manifest_path, _encoded(manifest), self.manifest_etag)
         self.manifest = manifest
 
-    def stage_batch(self, batch_number):
+    def open_demo3_admission(self, expires_at_utc, stop_config_sha256):
+        target = self.expected["target_bindings"]["demo-3"]
+        if (not self.fresh_only or self.manifest["batches"] or "demo3_admission" in self.manifest
+                or not re.fullmatch(r"[a-f0-9]{64}", stop_config_sha256)):
+            raise ValueError("Demo 3 admission requires a fresh native run and exact stop binding")
+        updated = copy.deepcopy(self.manifest)
+        updated["demo3_admission"] = {
+            "version": 1, "state": "open", "workspace_id": target["workspace_id"],
+            "lakehouse_id": target["item_id"], "expires_at_utc": expires_at_utc,
+            "config_sha256": hashlib.sha256(canonical_bytes(self.expected["config"])).hexdigest(),
+            "stop_config_sha256": stop_config_sha256,
+        }
+        self._save(updated)
+
+    def stop_demo3_admission(self):
+        admission = self.manifest.get("demo3_admission")
+        if self.fresh_only and admission is not None and admission["state"] == "open":
+            updated = copy.deepcopy(self.manifest)
+            updated["demo3_admission"]["state"] = "stopped"
+            self._save(updated)
+
+    def stage_batch(self, batch_number, *, clock=None):
         self._assert_lock()
         payload, expected = batch_bytes(self.config, batch_number)
         key = str(batch_number)
@@ -164,7 +192,7 @@ class FabricLedger:
             if actual != payload:
                 raise RuntimeError("untracked staged batch differs; manual recovery required") from None
         entry = dict(expected)
-        entry["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
+        entry["generated_at_utc"] = (clock() if clock else datetime.now(timezone.utc)).isoformat()
         entry["deliveries"] = {name: {"status": "pending", "timestamp_utc": None}
                                for name in self.expected["destinations"]}
         updated = copy.deepcopy(self.manifest)
@@ -195,10 +223,15 @@ class FabricLedger:
                 "row_count": batch["row_count"],
                 "sales_amount_minor_units": batch["sales_amount_minor_units"]}
 
-    def record_submission(self, batch_number, destination, status, operation_id=None, diagnostic=None):
+    def record_submission(self, batch_number, destination, status, operation_id=None, diagnostic=None, *,
+                          observed_at=None):
         updated = copy.deepcopy(self.manifest)
-        delivery = updated["batches"][str(batch_number)]["deliveries"][destination]
-        finish_delivery_submission(delivery, status, operation_id, diagnostic)
+        batch = updated["batches"][str(batch_number)]
+        delivery = batch["deliveries"][destination]
+        finish_delivery_submission(delivery, status, operation_id, diagnostic, observed_at=observed_at)
+        if observed_at is not None and status == "submitted":
+            staged = datetime.fromisoformat(batch["generated_at_utc"])
+            delivery["staged_to_submission_ack_seconds"] = round((observed_at - staged).total_seconds(), 3)
         self._save(updated)
 
     def record_verification(self, batch_number, destination, row_count, total_minor_units, distinct_sales_line_ids):

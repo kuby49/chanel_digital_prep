@@ -38,13 +38,14 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from fabric_ledger import _validate_ingestion_outcome
-from fabric_runtime import require_write_roles, run_config
+from fabric_runtime import _kusto_endpoint, _tenant, native_parameters, require_write_roles, run_config
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
                        strict_json_loads, validate_run_manifest)
 from job_lifecycle import (JOURNAL_DIR_NAME, STARTUP_HEADROOM_SECONDS, LifecycleBlocked, PipelineJob,
                            activity_timeout)
-from target_readback import OneLakeTableClient, TargetReadbackBlocked, read_selected_targets, selected_candidates
+from target_readback import (OneLakeTableClient, TargetReadbackBlocked, _configured_landing,
+                             read_selected_targets, selected_candidates)
 
 
 HERE = Path(__file__).resolve().parent
@@ -1054,7 +1055,60 @@ def _ensure_environment(client, store, state, spec):
     _finish_environment_publish(client, store, state, spec)
 
 
-def _definition(state, kind):
+def _native_profile(config, resources):
+    shared = config.get("shared", {})
+    if shared.get("native_launch", False) is False:
+        return None
+    if shared["native_launch"] is not True:
+        raise ValueError("shared.native_launch must be a boolean")
+    selection = shared.get("native_selected_demos", "demo-1,demo-2,demo-3")
+    if not isinstance(selection, str):
+        raise ValueError("Native launch selection must be a comma-delimited string")
+    selected = sorted(_validate_run(config, selection))
+    targets = selected_candidates(config, selected)
+    run, duration = run_config(config)
+    producer = {field: resources[kind]["id"] for field, kind in (
+        ("workspace_id", "workspace"), ("staging_lakehouse_id", "staging_lakehouse"), ("notebook_id", "notebook"))}
+    if any(shared.get(field) != producer[key] for field, key in (
+            ("workspace_id", "workspace_id"), ("staging_lakehouse_id", "staging_lakehouse_id"),
+            ("producer_notebook_id", "notebook_id"))):
+        raise ValueError("Native launch requires the exact owned producer IDs")
+    tenant = _tenant(config)
+    identity = _uuid(shared.get("identity_id"), "native identity")
+    runtime = {"contract_version": 1, "tenant_id": tenant,
+               "shared": {"workspace_id": producer["workspace_id"],
+                          "staging_lakehouse_id": producer["staging_lakehouse_id"],
+                          "producer_notebook_id": producer["notebook_id"], "identity_id": identity,
+                          "target_bindings": targets},
+               "data": {"run_id": run.run_id, "seed": run.seed, "start_date": run.start_date,
+                        "date_count": run.date_count, "product_count": run.products, "customer_count": run.customers,
+                        "rows_per_file": run.rows_per_file, "file_count": run.file_count,
+                        "interval_seconds": run.interval_seconds, "max_duration_seconds": duration,
+                        "currency": "USD"}}
+    for name in selected:
+        keys = ("ingestion_endpoint", "query_endpoint", "kql_database_name", "sales_table", "csv_mapping") \
+            if name == "demo-2" else ("landing_uri",)
+        runtime[name] = {key: config[name][key] for key in keys}
+        if name == "demo-2":
+            for key in ("ingestion_endpoint", "query_endpoint"):
+                _kusto_endpoint(runtime[name][key])
+            if (runtime[name]["sales_table"] != targets[name]["fact"]
+                    or runtime[name]["csv_mapping"] != "SalesCsvV1"
+                    or not isinstance(runtime[name]["kql_database_name"], str)
+                    or not runtime[name]["kql_database_name"].strip()):
+                raise ValueError("Native Eventhouse target does not match the CSV v1 binding")
+        else:
+            _configured_landing(runtime, name, targets[name])
+    digest = hashlib.sha256(canonical_bytes(runtime)).hexdigest()
+    profile = {"document": runtime, "selected": selected, "activity_timeout": activity_timeout(duration),
+               "expires_at_utc": shared["native_launch_expires_at_utc"],
+               "binding": {"nonce": "native-" + digest[:32], "run_id": run.run_id, "config_sha256": digest,
+                           "tenant_id": tenant, "identity_id": identity, "producer": producer}}
+    native_parameters(profile, now=None)
+    return profile
+
+
+def _definition(state, kind, config=None):
     try:
         import fabric_assets
 
@@ -1064,8 +1118,9 @@ def _definition(state, kind):
             return fabric_assets.notebook_definition(workspace_id, resources["staging_lakehouse"]["id"],
                                                      resources["staging_lakehouse"]["name"],
                                                      resources["environment_item"]["id"])
-        return fabric_assets.pipeline_definition(workspace_id, resources["notebook"]["id"])
-    except (ImportError, OSError, ValueError, TypeError, KeyError, IndexError):
+        profile = _native_profile(config or {}, resources)
+        return fabric_assets.pipeline_definition(workspace_id, resources["notebook"]["id"], native_profile=profile)
+    except (ImportError, OSError, ValueError, TypeError, KeyError, IndexError, ContractError):
         raise Blocked("Local notebook or pipeline definition is unavailable or invalid.") from None
 
 
@@ -1084,8 +1139,8 @@ def _parts(definition):
     return result
 
 
-def _verify_definition(client, state, kind):
-    expected_definition = _definition(state, kind)
+def _verify_definition(client, state, kind, config=None):
+    expected_definition = _definition(state, kind, config)
     expected = _parts(expected_definition)
     workspace_id = state["resources"]["workspace"]["id"]
     item_id = state["resources"][kind]["id"]
@@ -1148,7 +1203,7 @@ def _finish_pending(client, store, state, plan):
     store.write(state)
 
 
-def _create_resource(client, store, state, plan, kind, spec=None):
+def _create_resource(client, store, state, plan, kind, spec=None, config=None):
     if kind == "workspace":
         path = "/v1/workspaces"
         existing = client.list_all(path)
@@ -1166,7 +1221,7 @@ def _create_resource(client, store, state, plan, kind, spec=None):
             del payload["type"]
             payload["definition"] = _environment_definition(spec or _environment_spec())
         elif kind in ("notebook", "pipeline"):
-            payload["definition"] = _definition(state, kind)
+            payload["definition"] = _definition(state, kind, config)
     if any(isinstance(item, dict) and isinstance(item.get("displayName"), str)
            and item["displayName"].casefold() == plan["names"][kind].casefold() for item in existing):
         raise Blocked("A resource with the requested name exists without an owned state ID; it was not adopted.")
@@ -1192,7 +1247,7 @@ def _create_resource(client, store, state, plan, kind, spec=None):
     _finish_pending(client, store, state, plan)
 
 
-def _verify_all(client, state, plan, spec=None):
+def _verify_all(client, state, plan, spec=None, config=None):
     spec = spec or _environment_spec()
     if state.get("pending"):
         raise Blocked("Deployment has a pending operation; reconcile or resume it before validation.")
@@ -1203,7 +1258,7 @@ def _verify_all(client, state, plan, spec=None):
         _verify_item(client, state, plan, kind, principal_type)
     _verify_published_environment(client, state, spec)
     for kind in ("notebook", "pipeline"):
-        _verify_definition(client, state, kind)
+        _verify_definition(client, state, kind, config)
 
 
 def _check_assets(plan):
@@ -1421,6 +1476,9 @@ def _manifest_summary(store, config, selected):
                 detail += f", source={operation[:256]}"
             if destination == "demo-2" and isinstance(delivery.get("ingestion_outcome"), dict):
                 detail += f", ingestion={delivery['ingestion_outcome'].get('status')}"
+            lag = delivery.get("staged_to_submission_ack_seconds")
+            if type(lag) in (int, float):
+                detail += f", staging-to-submission acknowledgement={lag:g}s"
             diagnostics.append(detail + ".")
             if status != "verified":
                 all_verified = False
@@ -1513,6 +1571,8 @@ def _wait_for_measured(job, job_id, config, selected, plan, lakehouse_id):
 
 
 def _run_measured(config, plan, state_dir, selected_demos):
+    if config.get("shared", {}).get("native_launch") is True:
+        raise Blocked("This run ID is reserved for the prepared native pipeline; no CLI job was started.")
     selected = _validate_run(config, selected_demos)
     if any(not plan[field] for field in ("tenant_id", "capacity_id", "identity_id")):
         raise Blocked("Producer tenant, capacity and identity are required; no job was started.")
@@ -1750,7 +1810,7 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
             raise Blocked("Effective producer IDs differ from owned state.")
         token = azure_cli_token(plan["tenant_id"], plan["identity_id"])
         client = FabricClient(token)
-        _verify_all(client, state, plan)
+        _verify_all(client, state, plan, config=config)
         clients = {name: client for name in selected}
         if "demo-2" in selected:
             clients["demo-2"] = FabricClient(token, skill="eventhouse-cli")
@@ -1777,7 +1837,7 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
             state = new_state(plan)
             store.write(state)
         if state.get("legacy"):
-            _verify_all(client, state, plan, spec)
+            _verify_all(client, state, plan, spec, config)
         else:
             for kind in KINDS:
                 if state.get("pending") and state["pending"]["kind"] == kind:
@@ -1790,7 +1850,7 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
                 if kind not in state["resources"]:
                     if state.get("pending"):
                         raise Blocked("A previous operation is still pending; reconcile before proceeding.")
-                    _create_resource(client, store, state, plan, kind, spec)
+                    _create_resource(client, store, state, plan, kind, spec, config)
                 if kind == "workspace":
                     _workspace_principal(client, state, plan)
                 else:
@@ -1799,7 +1859,7 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
                     if kind == "environment_item":
                         _ensure_environment(client, store, state, spec)
                     elif kind in ("notebook", "pipeline"):
-                        _verify_definition(client, state, kind)
+                        _verify_definition(client, state, kind, config)
         return ["Owned producer resources and published Environment libraries were read back; no data job was started and runtime readiness remains unproven.", *BLOCKERS]
 
 

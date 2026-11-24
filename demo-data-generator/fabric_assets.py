@@ -77,12 +77,21 @@ def notebook_definition(workspace_id, lakehouse_id, lakehouse_name, environment_
     return _definition(notebook, "notebook-content.ipynb", "ipynb")
 
 
-def pipeline_definition(workspace_id, notebook_id):
+def pipeline_definition(workspace_id, notebook_id, *, native_profile=None):
     workspace_id, notebook_id = _guid(workspace_id), _guid(notebook_id)
     pipeline = json.loads((HERE / "pipeline-content.json").read_text(encoding="utf-8"))
     activity = pipeline["properties"]["activities"][0]
     activity["typeProperties"]["workspaceId"] = workspace_id
     activity["typeProperties"]["notebookId"] = notebook_id
+    if native_profile is not None:
+        params = pipeline["properties"]["parameters"]
+        params["operation"]["defaultValue"] = "run-native"
+        params["activity_timeout"]["defaultValue"] = native_profile["activity_timeout"]
+        params["run_config_json"]["defaultValue"] = "{}"
+        params["selected_demos_json"]["defaultValue"] = "[]"
+        activity["typeProperties"]["parameters"]["native_profile_json"] = {
+            "type": "string", "value": json.dumps(native_profile, separators=(",", ":"), sort_keys=True),
+        }
     return _definition(pipeline, "pipeline-content.json")
 
 

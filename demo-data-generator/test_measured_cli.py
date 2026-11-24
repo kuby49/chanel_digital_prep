@@ -14,7 +14,7 @@ import fabric_runtime
 from fabric_runner import run_fabric_batches
 from generator import RunConfig, canonical_bytes
 from job_lifecycle import LifecycleBlocked
-from test_deploy import (IDENTITY, LAKEHOUSE, PIPELINE, TENANT, WORKSPACE,
+from test_deploy import (IDENTITY, LAKEHOUSE, NOTEBOOK, PIPELINE, TENANT, WORKSPACE,
                          config, owned_state, run_data)
 from test_fabric_ledger import MemoryStore, TEST_TARGETS
 from test_fabric_runner import Adapter, EventhouseAdapter, FakeClock
@@ -253,6 +253,40 @@ class MeasuredSubmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pipeline timeout"):
             fabric_runtime.run_config(self.document)
 
+    def test_native_wrapper_defaults_pin_one_run_without_publishing_desktop_config(self):
+        target = TEST_TARGETS["demo-1"]
+        self.document["demo-1"] = {
+            "landing_uri": (f"abfss://{target['workspace_id']}@onelake.dfs.fabric.microsoft.com/"
+                            f"{target['item_id']}/Files/raw"), "deployment_state_dir": "do-not-publish"}
+        expiry = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.document["shared"].update(native_launch=True, native_selected_demos="demo-1",
+                                       producer_notebook_id=NOTEBOOK, native_launch_expires_at_utc=expiry.isoformat())
+        self.document["execution"] = {"desktop_only": "do-not-publish"}
+        rendered = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        properties = rendered["properties"]
+        self.assertEqual(properties["parameters"]["operation"]["defaultValue"], "run-native")
+        self.assertEqual(properties["parameters"]["run_config_json"]["defaultValue"], "{}")
+        activity = properties["activities"][0]["typeProperties"]
+        self.assertNotIn("do-not-publish", json.dumps(rendered))
+        profile = json.loads(activity["parameters"]["native_profile_json"]["value"])
+        document, selected, binding, _, _ = fabric_runtime.native_parameters(
+            profile, now=expiry - timedelta(hours=1))
+        self.assertEqual(selected, ["demo-1"])
+        self.assertEqual(binding["producer"]["notebook_id"], NOTEBOOK)
+        run, _ = fabric_runtime.run_config(document)
+        self.assertEqual((run.run_id, run.file_count, run.rows_per_file, run.interval_seconds), ("run-1", 10, 1000, 60))
+        with self.assertRaisesRegex(deploy.Blocked, "reserved"):
+            self.invoke()
+        with self.assertRaisesRegex(ValueError, "expired"):
+            fabric_runtime.native_parameters(profile, now=expiry - timedelta(minutes=1))
+        profile["document"]["data"]["run_id"] = "unbound"
+        with self.assertRaisesRegex(ValueError, "run binding"):
+            fabric_runtime.native_parameters(profile, now=expiry - timedelta(hours=1))
+        blocked = deploy._parts(deploy._definition(self.state, "pipeline"))["pipeline-content.json"]
+        self.assertEqual(blocked["properties"]["parameters"]["operation"]["defaultValue"], "blocked")
+        with self.assertRaisesRegex(ValueError, "No prepared"):
+            fabric_runtime.native_parameters({}, now=expiry)
+
 
 class ManifestReconciliationTests(unittest.TestCase):
     def completed(self, destination):
@@ -357,6 +391,19 @@ class MeasuredRecoveryTests(unittest.TestCase):
 
 
 class MeasuredNotebookTests(unittest.TestCase):
+    def test_unprepared_native_operation_does_not_acquire_token_or_stage(self):
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        source = "".join(notebook["cells"][1]["source"])
+        token = mock.Mock()
+        namespace = {"operation": "run-native", "native_profile_json": "{}", "run_config_json": "not JSON",
+                     "notebookutils": SimpleNamespace(credentials=SimpleNamespace(getToken=token)),
+                     "spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None))}
+        with mock.patch("fabric_runner.run_fabric_batches") as run:
+            with self.assertRaisesRegex(ValueError, "No prepared"):
+                exec(compile(source, "notebook.ipynb", "exec"), namespace)
+        token.assert_not_called()
+        run.assert_not_called()
+
     def test_pipeline_run_without_context_run_id_reports_verified_delivery(self):
         notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
         source = "".join(notebook["cells"][1]["source"])

@@ -67,10 +67,65 @@ messages are not success. The separate Demo 2 verifier must also check joins
 and grouped totals. Serialized duplicate replay was demonstrated for a
 separately accounted bootstrap, not for concurrent submissions.
 
-The scheduler spaces batch starts but calls adapters synchronously and cannot
-interrupt a blocking call. It does not establish a hard run deadline or
-guarantee one-minute cadence. The Demo 2 verification controller must run
-independently, persist its own outcomes and enforce its own deadlines.
+Measured runs stage the first closed CSV at source start, then schedule each
+following CSV one interval apart. The main thread is the only manifest writer
+and stages due files while one worker performs serialized destination I/O.
+`generated_at_utc` records staging after closed-file readback; submission and
+verification timestamps describe delivery separately. The runner submits
+file destinations before Eventhouse and defers its own readback until after
+submissions so that a slow KQL query cannot delay later publication. Compare
+adjacent `submission_result_at_utc` values for the observed destination
+interval; `staged_to_submission_ack_seconds` shows the per-batch backlog for
+successful submissions. A file acknowledgement means OneLake acknowledged
+the write (or matching bytes were already present); Eventhouse's
+acknowledgement means the queue accepted the request, not that KQL can see it.
+Slow submissions can delay landing, slow
+OneLake reads/writes can skew staging, and a blocking SDK call can outlast
+cooperative stop or the deadline. Demo 2's separate downstream verifier
+applies its own deadline.
+
+## Run a prepared customer demo from Fabric
+
+After the operator confirms the exact run ID and downstream readiness, open
+the producer workspace, open its **producer_wrapper** Data Pipeline, and select
+**Run**. Accept the defaults; do not edit parameters or paste JSON. This
+consumes the prepared run ID on first initialization. A repeat or expired
+profile fails closed; the operator must prepare a new ID for another demo.
+
+Before enabling the native default, the operator must verify the selected
+tracks and dimensions, start Demo 2's monitor for the exact run ID and
+manifest with enough time for startup, execution and verification, and
+confirm Demo 3's matching admission policy and enabled rule for that run.
+Demo 1's ingestion/MLV path must also be ready. The native job checks runtime
+identity, notebook context, destination bindings and write access; it cannot
+prove a desktop monitor is running or substitute for these checks.
+
+Render and verify the owned definitions using the same resolved config:
+set `shared.native_launch: true`, set `shared.native_launch_expires_at_utc`
+to a fixed UTC expiry covering Spark startup, producer duration and downstream
+drain, and supply the exact owned producer workspace, staging Lakehouse,
+notebook and identity IDs. The default target selection is all three demos;
+`shared.native_selected_demos` may override it with a comma-delimited selection
+that matches `shared.target_bindings`. A prepared profile pins `data.run_id`
+and its generation settings; the customer settings are 10 files, 1,000 rows
+each, at 60-second intervals. The definition embeds only the projected runtime
+configuration, not desktop paths, journal settings or credentials. Updating
+existing owned definitions requires a coordinated publication; ordinary deploy
+and validation still refuse to overwrite drift. Guarded CLI `run-data` is
+not the launcher for a config reserved for native use.
+
+Observe **Monitor** in Fabric for the parent and `RunProducer` notebook,
+then open `Files/producer/runs/<run_id>/manifest.json` in `producer_staging`.
+Report staging and delivery progress separately from MLV refresh, Eventhouse
+analysis and Copy results. To stop, have the operator disable the Demo 3
+rule, stop/cancel the producer as appropriate, confirm both Fabric jobs are
+terminal, and drain admitted Copy and Eventhouse work. A native run has no
+desktop CLI submission journal; a cancellation request does not confirm
+termination or undo external writes. Never remove `writer.lock` on that
+basis. The producer marks Demo 3 admission stopped under its writer lock on
+cooperative stop or failure when the ledger remains writable. On success the
+admission remains open until the fixed expiry so queued copies can finish;
+after force cancellation do not rely on an admission update having happened.
 
 ## Isolated Demo 2 synthetic staging
 

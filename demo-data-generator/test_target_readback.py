@@ -193,12 +193,13 @@ class TargetReadbackTests(unittest.TestCase):
         plan = deploy.parse_config(self.config, "sample")
         state = owned_state(plan)
         with (mock.patch.object(deploy, "load_owned_state", return_value=state),
-              mock.patch.object(deploy, "_verify_all"),
+              mock.patch.object(deploy, "_verify_all") as verify_definitions,
               mock.patch.object(deploy, "azure_cli_token", side_effect=["fabric-token", "storage-token"]) as auth,
               mock.patch.object(deploy, "FabricClient", return_value=self.client) as factory,
               mock.patch.object(deploy, "OneLakeTableClient", return_value=self.table_client) as tables):
             diagnostics = deploy.perform("validate-only", self.config, "sample", ".", ",".join(self.selected))
         self.assertEqual(factory.call_args_list[1], mock.call("fabric-token", skill="eventhouse-cli"))
+        verify_definitions.assert_called_once_with(self.client, state, plan, config=self.config)
         auth.assert_has_calls([mock.call(plan["tenant_id"], plan["identity_id"]),
                                mock.call(plan["tenant_id"], plan["identity_id"], resource=deploy.STORAGE_RESOURCE)])
         tables.assert_called_once_with("storage-token")

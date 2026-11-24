@@ -1,11 +1,13 @@
 import json
+import hashlib
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest import mock
 
 from fabric_runner import run_fabric_batches
 from fabric_storage import StorageOutcomeUnknown
-from generator import RunConfig
+from generator import RunConfig, canonical_bytes
 from runner import Submission
 from test_fabric_ledger import MemoryStore, TEST_TARGETS
 
@@ -78,6 +80,91 @@ class EventhouseAdapter(Adapter):
 
 
 class FabricRunnerTests(unittest.TestCase):
+    def test_ten_full_batches_stage_on_cadence_while_first_delivery_is_blocked(self):
+        import threading
+
+        store, clock = MemoryStore(), FakeClock()
+        config = RunConfig("native-cadence", file_count=10, rows_per_file=1000, interval_seconds=60)
+        base = f"Files/producer/runs/{config.run_id}"
+        entered, release = threading.Event(), threading.Event()
+        start = clock.now
+
+        class BlockFirst(Adapter):
+            def submit(self, path, batch_id, digest, count, total):
+                if not self.calls:
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release the adapter")
+                return super().submit(path, batch_id, digest, count, total)
+
+            def verify(self, *args):
+                if len(self.calls) != 10:
+                    return SimpleNamespace(status="failed", diagnostic="verification delayed a publication")
+                return super().verify(*args)
+
+        def wait_for_adapter(futures, timeout=None):
+            future, = futures
+            if timeout is None or clock.now == start + timedelta(seconds=540):
+                if not release.is_set():
+                    try:
+                        manifest = json.loads(store.read(f"{base}/manifest.json")[0])
+                        batches = list(manifest["batches"].values())
+                        self.assertEqual(len(batches), 10)
+                        self.assertEqual(len({b["sha256"] for b in batches}), 10)
+                        self.assertTrue(all(b["row_count"] == 1000 for b in batches))
+                        self.assertEqual(sorted(int((datetime.fromisoformat(b["generated_at_utc"]) - start)
+                                                    .total_seconds()) for b in batches), list(range(0, 600, 60)))
+                        self.assertEqual(manifest["batches"]["1"]["deliveries"]["demo-1"]["status"], "submitting")
+                        self.assertEqual(adapter.calls, [])
+                        store.read(f"{base}/writer.lock")
+                    finally:
+                        release.set()
+                return future.result(timeout=5)
+            self.assertTrue(entered.wait(5))
+            if release.is_set():
+                return future.result(timeout=5)
+            clock.sleep(timeout)
+
+        adapter = BlockFirst(clock)
+        with mock.patch("fabric_runner.wait", side_effect=wait_for_adapter):
+            result = run_with_scope(store, config, {"demo-1": adapter}, 600, 1,
+                                    independent_source=True, clock=clock.clock, sleep=clock.sleep)
+        self.assertTrue(result["verified"])
+        self.assertEqual(len(adapter.calls), 10)
+        manifest = json.loads(store.read(f"{base}/manifest.json")[0])
+        self.assertEqual(manifest["batches"]["1"]["deliveries"]["demo-1"]["staged_to_submission_ack_seconds"], 540)
+
+    def test_native_demo3_admission_is_written_before_delivery_and_run_id_cannot_be_reused(self):
+        for stop in (False, True):
+            with self.subTest(stop=stop):
+                store, clock = MemoryStore(), FakeClock()
+                config = RunConfig("native-copy", file_count=1, rows_per_file=2)
+                path = f"Files/producer/runs/{config.run_id}/manifest.json"
+                expiry = (clock.now + timedelta(minutes=15)).isoformat()
+                seen = []
+
+                class ObserveAdmission(Adapter):
+                    def submit(self, *args):
+                        seen.append(json.loads(store.read(path)[0])["demo3_admission"])
+                        return super().submit(*args)
+
+                adapter = ObserveAdmission(clock)
+                kwargs = dict(independent_source=True, fresh_only=True, clock=clock.clock,
+                              demo3_admission=(expiry, "b" * 64), stop_requested=lambda: stop and bool(seen))
+                result = run_with_scope(store, config, {"demo-3": adapter}, 600, 1, **kwargs)
+                manifest = json.loads(store.read(path)[0])
+                self.assertEqual(seen, [{
+                    "version": 1, "state": "open", "workspace_id": TEST_TARGETS["demo-3"]["workspace_id"],
+                    "lakehouse_id": TEST_TARGETS["demo-3"]["item_id"], "expires_at_utc": expiry,
+                    "config_sha256": hashlib.sha256(canonical_bytes(manifest["config"])).hexdigest(),
+                    "stop_config_sha256": "b" * 64,
+                }])
+                self.assertEqual(result["verified"], not stop)
+                self.assertEqual(manifest["demo3_admission"]["state"], "stopped" if stop else "open")
+                with self.assertRaisesRegex(RuntimeError, "already been initialized"):
+                    run_with_scope(store, config, {"demo-3": adapter}, 600, 1, **kwargs)
+                self.assertEqual(len(adapter.calls), 1)
+
     def test_deadline_cadence_and_uncertain_submission_are_persisted(self):
         store, clock = MemoryStore(), FakeClock()
         good, uncertain = Adapter(clock), Adapter(clock, uncertain=True)

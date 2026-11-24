@@ -70,4 +70,6 @@ Minor units are integer USD cents in the current producer; do not select another
 
 Demo 1's manifest validator accepts a locally staged producer manifest; this does not prove deployment or ingestion. The integrated producer includes Fabric delivery and ledger components, but its coordinated measured launcher remains blocked until its live readiness and lifecycle checks are verified.
 
+The producer owner reports that the current generator reuses `SalesLineID` values across different run IDs. This may conflict with the specification's logical fact primary key and overwrite prior facts with a `SalesLineID`-keyed Upsert; retained multi-run behavior is not ready. A generator change also requires rebinding and revalidating the frozen verifier candidate.
+
 The implementation must verify shared contract changes against all tracks before use. The specification remains the authoritative source for the data model, source manifest, isolation, verification and lifecycle requirements.

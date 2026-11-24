@@ -126,9 +126,9 @@ Invoke `python deploy.py --mode MODE --config ABSOLUTE_JSON --prefix PREFIX
 `validate-only`, `deploy`, `cleanup`, or `resolve-target-candidate`; cleanup
 also requires `--yes`. The
 result uses shared contract version 1. Dry-run only checks the local contract
-and never reports readiness. Other modes are blocked and perform no cloud
-operations. Cleanup is unavailable because resource-scoped cleanup is not
-implemented.
+and never reports readiness. Deployment, validation and cleanup remain
+blocked and perform no cloud operations. Cleanup is unavailable because
+resource-scoped cleanup is not implemented.
 The config must contain `contract_version: 1`. The `--prefix` argument is the
 effective prefix; the SQL planning helpers expand `{prefix}` in the workspace
 template and render a file-backed Bronze MLV definition and fully qualified
@@ -139,27 +139,43 @@ fail closed. The Silver definition has been created and its schema read back
 in the isolated Lakehouse but has not been tested with measured facts.
 The Bronze definition sets `FIXED` and `APPEND_ONLY`, explicit CSV v1 options,
 corrupt-row capture, and file traceability; it does not invent a
-source-schema declaration. Dry-run is local-only; other entry-point modes
-remain blocked and do not perform cloud operations. The bootstrap test was
-performed separately, not by this entry point.
+source-schema declaration. All entry-point modes are local-only; the bootstrap
+test was performed separately, not by this entry point.
 
 The orchestrator supplies a stable prefix/tenant-scoped `--state-dir`, a
 distinct per-invocation `--result` path, and an outer lock. Future deploy,
 validate, and cleanup implementations must retain ownership and recovery state
 in that stable directory across invocations and must not automatically discard
-unresolved stale state. The reserved journal filename is `demo-1-state.json`;
-future validation must reject pending or mismatched tenant, prefix, owner,
-parent and configuration fields. The current entry point does not create,
-read, or remove state files; no legacy state format has been defined.
+unresolved stale state. `resolve-target-candidate` reads the reserved
+`demo-1-state.json` under an exclusive `demo-1-state.lock`. A stale lock or
+pending/uncertain journal requires manual recovery; neither is discarded.
+It validates tenant, prefix, configuration fingerprint, owner, creation
+records, resource identity and parent, MLV fact and explicit configured IDs.
+It atomically creates a non-overwriting `demo-1-target-candidate.json` beside
+the result. Success means `pass` with `ready: false`, not cloud readiness.
 
-The proposed local `resolve-target-candidate` mode is fail-closed: it returns
-`blocked`, never emits `demo-1-target-candidate.json`, and performs no cloud
-writes. Implementing it requires a validated durable ownership journal; the
-manually provisioned workspace and matching live names alone are not proof.
-Before readiness or registry initialization, independently verify live target
-identity, definition and access, inventory all retained keys with writers
-quiesced, and prove no writer can bypass the shared allocator. A candidate
-sidecar alone is not authenticated evidence.
+The local v1 journal reader expects `contract_version`, `track`, `tenant_id`,
+`prefix`, `config_sha256`, empty `pending_operations` and
+`uncertain_operations`, an `owner` with UUID `id` and `marker`
+`{prefix}-demo1-{owner-id}`, `workspace`, `lakehouse`, and `fact`. The
+fingerprint is SHA-256 of UTF-8 compact sorted-key JSON containing `capacity`,
+`demo-1`, and the effective `prefix` as implemented in
+`ownership._config_fingerprint`. Resource records require `status: confirmed`,
+`type`, canonical `id`, `created_by_owner`, canonical `create_intent_id`,
+`create_response.id`, and `readback` containing matching `id`, `type`, `name`,
+and `owner_marker`; the Lakehouse record and readback also contain the
+workspace ID. The confirmed fact names the same workspace and Lakehouse,
+`silver.sales_joined`, and type `MATERIALIZED_LAKE_VIEW`.
+
+**No deployment journal writer or recovery implementation exists yet.**
+The journal schema defines what a future deployment must persist from
+verifiable creation and readback; it must not be manufactured to adopt the
+manual workspace. The supported source of an ownership marker still needs to
+be established by that deployment. Local journal contents and the candidate
+are not authenticated ownership evidence. Before readiness or registry
+initialization, independently verify live target identity, definition and
+access, inventory all retained keys with writers quiesced, and prove no writer
+can bypass the shared allocator.
 
 No presenter walkthrough can be executed until the blocker is resolved and
 artifacts are deployed. Once available, use Lakehouse lineage and refresh

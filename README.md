@@ -2,9 +2,16 @@
 
 The [specification](SPECIFICATION.md) defines three isolated comparisons using the same staged CSV bytes: [file-backed materialized lake views](demo-1-materialized-lake-views/), [Eventhouse and OneLake availability](demo-2-eventhouse/), and [OneLake events with Copy](demo-3-onelake-events-copy/). The [shared producer](demo-data-generator/) runs as a bounded Fabric notebook through a wrapper pipeline in its own workspace, not as a local presentation-time process.
 
-**Native recurring launch is not yet ready.** The current local prepared profile
-is single-use and still needs a separately started monitor; it is not a reusable
-presenter-facing Run button. No coordinated 10-file run has been verified.
+**Native recurring launch is not yet ready.** Reusable producer and track
+lifecycle hooks are integrated locally, but the Demo 3 publisher, live setup
+and repeated-run verification remain incomplete. The older prepared profile
+is single-use and requires a separately started monitor. No coordinated
+10-file run has been verified.
+
+The user accepted Fabric's documented five-minute MLV schedule instead of a
+shorter cadence and asked not to use the event-triggered MLV preview. A longer
+bounded operating window is permitted; see the
+[course corrections](SPECIFICATION.md#13-user-decisions-and-course-corrections).
 
 The default one-minute source cadence is not a downstream visibility guarantee. Demo 1 uses managed MLV refresh (document the actual supported interval); Demo 2's five-minute OneLake target is not an SLA and its propagation latency is not reported; Demo 3 requires a real event and Copy run. See the specification for acceptance criteria and feature-specific blockers.
 

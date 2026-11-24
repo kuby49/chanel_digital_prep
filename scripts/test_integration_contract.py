@@ -1,9 +1,12 @@
 """Exercise integration between the actual shared and track entry points."""
 
+import base64
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,6 +31,84 @@ def load_script(name, path):
 
 
 class SharedManifestIntegrationTest(unittest.TestCase):
+    def test_native_producer_bundle_loads_demo2_with_rendered_fresh_profiles(self):
+        import fabric_assets
+
+        deploy = load_script("shared_native_deploy_integration", ROOT / "demo-data-generator" / "deploy.py")
+        workspace = "11111111-1111-4111-8111-111111111111"
+        lakehouse = "22222222-2222-4222-8222-222222222222"
+        notebook_id = "33333333-3333-4333-8333-333333333333"
+        identity = "44444444-4444-4444-8444-444444444444"
+
+        target = {"workspace_id": "55555555-5555-4555-8555-555555555555",
+                  "item_id": "66666666-6666-4666-8666-666666666666", "fact": "SyntheticFactSales"}
+        demo = {"workspace_id": target["workspace_id"], "lakehouse_id": "77777777-7777-4777-8777-777777777777",
+                "monitor_notebook_id": "88888888-8888-4888-8888-888888888888",
+                "verifier_notebook_id": "99999999-9999-4999-8999-999999999999",
+                "monitor_definition_sha256": "a" * 64, "verifier_definition_sha256": "b" * 64,
+                "ingestion_endpoint": "https://ingest.example.kusto.fabric.microsoft.com",
+                "query_endpoint": "https://example.kusto.fabric.microsoft.com",
+                "kql_database_name": "demo", "sales_table": target["fact"], "csv_mapping": "SalesCsvV1",
+                "shortcut_name": "EventhouseFactSales", "shortcut_target_path": "Tables/SyntheticFactSales",
+                "verification_batch": {"batch_id": "bootstrap_0001"},
+                "verification_timeout_seconds": 900, "poll_interval_seconds": 10, "max_concurrent_batches": 2}
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["demo-2"] = demo
+        config["shared"].update({"workspace_id": workspace, "staging_lakehouse_id": lakehouse,
+                                 "producer_notebook_id": notebook_id, "identity_id": identity,
+                                 "target_bindings": {"demo-2": target}, "native_launch": True,
+                                 "native_reusable": True, "native_selected_demos": "demo-2"})
+        resources = {"workspace": {"id": workspace}, "staging_lakehouse": {"id": lakehouse},
+                     "notebook": {"id": notebook_id}}
+        profile = deploy._native_profile(config, resources)
+        self.assertIsNone(config["data"]["run_id"])
+        definition = fabric_assets.notebook_definition(workspace, lakehouse, "producer_staging")
+        notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+        bundle = "".join(notebook["cells"][1]["source"])
+        script = bundle + """
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from fabric_runtime import native_parameters
+from native_lifecycle import load_hooks
+
+profile = json.loads(sys.argv[1])
+hook = load_hooks(profile["selected"])["demo-2"]
+results = []
+for minute in (0, 1):
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=minute)
+    document, selected, binding, nonce, expiry = native_parameters(profile, now=now)
+    manifest_path = f"Files/producer/runs/{document['data']['run_id']}/manifest.json"
+    context = {
+        "document": document, "binding": binding, "store": object(),
+        "store_factory": lambda ws, lakehouse: object(), "manifest_path": manifest_path,
+        "clock": lambda: now, "stop_requested": lambda: False,
+        "preparation_deadline_utc": (now + timedelta(seconds=profile["preparation_timeout_seconds"])).isoformat(),
+        "verification_deadline_utc": (datetime.fromisoformat(expiry)
+                                      - timedelta(seconds=profile["cleanup_timeout_seconds"])).isoformat(),
+        "cleanup_deadline_utc": expiry, "expires_at_utc": expiry,
+    }
+    run = hook._Run(context, "preparation")
+    results.append({"run_id": run.cfg["run_id"], "manifest": run.cfg["manifest_url"],
+                    "target": run.target, "producer_config": run.cfg["producer_config"],
+                    "binding": run.binding["binding"]})
+print(json.dumps(results))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ, TEMP=directory, TMP=directory)
+            completed = subprocess.run([sys.executable, "-I", "-B", "-", json.dumps(profile)],
+                                       input=script, text=True, capture_output=True, env=environment,
+                                       timeout=30, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        first, second = json.loads(completed.stdout)
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertNotEqual(first["binding"], second["binding"])
+        for result in (first, second):
+            self.assertEqual(result["target"], target)
+            self.assertEqual(result["producer_config"]["run_id"], result["run_id"])
+            self.assertEqual(result["producer_config"]["file_count"], config["data"]["file_count"])
+            self.assertTrue(result["manifest"].endswith(f"/{result['run_id']}/manifest.json"))
+
     def test_native_copy_guard_accepts_producer_admission_and_stop_binding(self):
         import generator
         from fabric_ledger import FabricLedger

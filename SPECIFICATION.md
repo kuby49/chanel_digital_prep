@@ -318,6 +318,23 @@ Recheck preview status and prerequisites during deployment; documentation is not
   expiring single-use profile is interim only. Preserve the three ingestion
   mechanisms, replay correctness, bounded lifecycle and verification; report
   any unsupported or unverified native automation rather than claiming success.
+- MLV cadence and window course correction: the user requested, "I would like
+  the MLVs to run every 2.5 minutes, not 5 And if 60 bothers you, make it 115
+  or whatever you think its right, just lets finish finally". The 115-minute
+  suggestion permits a longer bounded operating window; it is separate from
+  the requested 2-minute-30-second refresh cadence. The documented native MLV
+  schedule has a [five-minute minimum effective interval](https://learn.microsoft.com/en-us/fabric/data-engineering/materialized-lake-views/materialized-lake-views-public-api),
+  and its [Cron interval is expressed in integer minutes](https://learn.microsoft.com/en-us/rest/api/fabric/lakehouse/background-jobs/create-refresh-materialized-lake-views-schedule).
+  Exact 2.5-minute native scheduling is therefore not established. Preserve
+  explicit window bounds, per-run verification deadlines and safe stopping.
+- Subsequent cadence request: "OK, if cron dose accpet only integers only,
+  make it 3 minutes". Three is an integer, but the documented five-minute
+  minimum effective interval still applies; a three-minute configuration may
+  be adjusted to five.
+- Final MLV cadence decision: "OK, dont do preview stuff , accept the 5
+  minutes". Use the documented five-minute scheduled refresh, not the
+  event-triggered MLV preview. This supersedes the earlier 2.5- and
+  three-minute requests; do not claim a shorter effective interval.
 - Simplified implementation focus: after the user asked, "can we pivot  now in our approach, or too late ?", prioritize the shortest safe path to runnable demonstrations, reusing verified work rather than adding new hardening or ownership-proof frameworks. Retain the specified correctness checks, protection against writing to the wrong target, and stopping owned jobs. Report unsupported or unverified behavior honestly; this focus does not silently waive other explicit requirements.
 - Use the signed-in MCAP identity where the relevant operation supports it.
 - The user permits starting and stopping resources needed for the demonstrations and scaling the approved capacity up to F64. Isolation, least-privilege and verification requirements remain in effect.

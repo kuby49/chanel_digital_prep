@@ -1,10 +1,10 @@
 # Demo 3: OneLake events and Copy
 
-**Status: blocked for production ingestion.** An isolated MCAP preflight
-workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
-stopped probe Activator exist. They do not constitute a deployable production
-pipeline. The entry point remains fail-closed; `dry-run` only validates the
-local contract.
+**Status: blocked for the shared run.** An isolated MCAP probe verified a
+real OneLake event through Activator, guarded Copy and target verification.
+Its rule is stopped. These run-specific assets are not yet bound to the shared
+producer, and the entry point remains fail-closed; `dry-run` only validates
+the local contract.
 
 ## Contract
 
@@ -54,17 +54,19 @@ in coordinated-run totals; `bootstrap` and `negative-test` are separate.
 | Operation | Documented API or capability | Required proof before deployment |
 |---|---|---|
 | Connection | A Lakehouse OAuth2 connection was created in the Fabric UI, read back via API, and used by a two-row Copy probe. The public [create-connection request](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/create-connection) lists OAuth2 as a credential type but does not define OAuth2 in its create-credentials union. | Automate a supported connection path or explicitly require the UI-created connection; verify identity and access in each environment. Never store credentials. |
-| Pipeline | A non-sales probe used the event subject as a dynamic exact filename and Upserted two rows; its successful event-triggered job read one file. A top-level `keyColumns` property was accepted in a definition but failed at runtime; `upsertSettings.keys` worked for the probe. | Deploy and verify the guarded candidate with explicit sales mappings and composite `(BatchID, SalesLineID)` Upsert. The prior probe did not exercise the composite key or crash recovery. |
-| Activator | A restricted non-sales `FileCreated` event invoked a parameter-only pipeline. `___subject` and `___id` matched source and activation history in that probe. A later event-triggered dynamic Copy captured the subject and ID after a six-minute warm-up. `activator.py` builds a disabled candidate. | Verify the actual production source and bindings and completed-file readiness. An event published after a 30-second warm-up appeared in source history but produced no activation or job within 300 seconds. A single six-minute success is not a readiness guarantee; definition readback or a Running label alone is insufficient. |
-| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. A synthetic audit-journal probe exercised state transitions and duplicate recognition against OneLake. The guarded pipeline and recovery launcher remain uninstalled candidates. | Verify per-file audit, missed events and uncertain writes, safe serialization/exclusive writers, bounded retries, duplicate delivery, and write-then-crash recovery end to end. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
-| Query surface | Setup verified dimensions and the fact schema. A non-destructive SQL metadata refresh using actual lowercase Delta paths exposed all four tables; the Spark amount view is not exposed as a SQL view. A separate probe had stale SQL results for over 900 seconds until a targeted, non-recreating refresh. | Verify joined queries, DECIMAL(18,2) results, exact totals and visibility with valid sales data. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
+| Pipeline | Two synthetic batches with overlapping `SalesLineID` values were copied using composite `(BatchID, SalesLineID)` Upsert; a duplicate delivery did not issue another Copy. Independent Delta readback confirmed both batches. A real event also copied one file and three rows through the guard. | Bind and verify the actual shared run, connection, mappings and target. The successful isolated jobs do not prove crash recovery or protect against outside writers. |
+| Activator | A real `FileCreated` event reached the stopped-afterward probe rule, passed `___subject` and `___id` to the guarded pipeline, and completed its audit. A subsequent event produced no new job during a 180-second post-stop observation. | Verify the shared run's source, filter, action and parameter binding; definition readback or a Running label alone is insufficient. The bounded stop observation is not a universal stop guarantee. |
+| Audit, recovery, serialization | Conditional create and ETag checks worked in the isolated Lakehouse. The real event reached a completed per-batch audit; a separately submitted duplicate did not recopy. A single pipeline with `concurrency: 1` serialized two observed wait activities. | Monitor and reconcile visible failures or uncertain writes; verify writer safety and safe stopping for the shared run. The cooperative lock and isolated observations do not fence outside writers. |
+| Query surface | Independent Delta readback verified exact sales rows, composite keys, dimension joins and totals for the isolated event. The SQL endpoint returned zero facts while Delta contained three, demonstrating that its readback can lag. | Verify measured-run totals and query visibility; exclude bootstrap facts. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
 
-In an isolated runtime 2.0 probe, the default fact table had deletion vectors
-enabled (Delta reader 3/writer 7). The Copy connector rejected its writer
-features. A new empty test table created with deletion vectors disabled used
-reader 1/writer 2. Setup requests that compatible protocol for new fact tables
-and blocks on an incompatible existing table; it never downgrades or replaces
-one. Composite Copy against that protocol still needs live verification.
+In an isolated runtime 2.0 probe, the default reader 3/writer 7 fact table
+included `appendOnly` and Copy rejected that feature. A new empty table with
+deletion vectors disabled started at reader 1/writer 2; a later Delta
+`ManualUpdate` changed it to reader 3/writer 7 with only `deletionVectors` and
+`invariants`, while the deletion-vector property remained false. Two
+composite-key Copy merges succeeded on that exact feature set. Setup accepts
+these two observed configurations, rejects `appendOnly` and unknown features,
+and never downgrades or replaces an existing table.
 
 On 2026-11-23, read-only MCAP cloud `supportedConnectionTypes` returned one
 `Lakehouse` type with creation method `Lakehouse.Contents`, optional Boolean
@@ -88,10 +90,11 @@ conditionally PUTs the complete CSV to its final Blob path; a preflight PUT
 emitted `FileCreated` with `data.api=PutBlob`, and a later GET confirmed its
 bytes. This does not prove that the bytes were readable at event delivery.
 An existing-file replay performs no new PUT and cannot rely on another event.
-Event filters use case-insensitive
-`subject` prefix and suffix comparisons; the pipeline must additionally reject
-anything except a direct immutable `sales_<run>_<batch>.csv` child and safely
-extract an exact file name. It must not read a wildcard or whole folder.
+Event filters use case-insensitive `subject` prefix and suffix comparisons.
+The disabled candidate requires a run ID and filters on
+`/Files/incoming/sales/sales_<run>_`; the guard additionally checks the exact
+case-sensitive run and canonical batch filename. It must not read a wildcard
+or whole folder.
 
 The schema-enabled Lakehouse tables REST endpoint returned
 `UnsupportedOperationForSchemasEnabledLakehouse`. A read-only OneLake Delta
@@ -108,6 +111,40 @@ and 429 retries, and read back the definitions. Do not enable the rule until
 the readiness and safe-write gates pass. Obtain approval before cross-workspace
 permissions or chargeable resources. The user approved the UI connection
 creation as a course correction; do not silently substitute another connection.
+
+## Binding a bounded shared run
+
+Choose the run ID once in the shared configuration. Use
+`guarded_notebook.run_config_from_shared(generator, config)` with the actual
+producer module, then pass that result to `guarded_notebook.build_notebook`
+with both the target Lakehouse IDs and the **separate producer staging**
+workspace and Lakehouse IDs. The packaged generator fingerprint must match the
+authoritative manifest at `Files/producer/runs/<run_id>/manifest.json`.
+`activator.build_definition(..., sample, run_id=run["run_id"])` produces a
+disabled, run-filtered rule from a representative event in the target
+Lakehouse. The pipeline must use the matching target, connection and guard.
+These builders do not deploy or enable the assets.
+
+An isolated pipeline notebook using the guard's storage-token mechanism read
+an existing manifest from the separate producer staging Lakehouse and an
+existing landing file from the target, verifying both hashes and the runtime
+principal. This establishes access to those existing objects, not the
+existence or permissions of a future run's manifest.
+
+The owned guard and disabled Activator have been bound and read back for the
+one-file, ten-row customer run `customer_demo_20261124_e0c409cc05ef`. This is a
+small demonstration, not the separate ten-file acceptance run. The existing
+guarded Copy pipeline is reused; enable the rule only after the producer and
+other destinations are ready, then monitor and stop it after the run.
+
+`setup_notebook.py --allow-dimension-expansion` is an explicit insert-only
+option for a quiescent, owned existing target. It validates existing and
+generated keys and all overlapping rows before writing, appends only missing
+rows, and checks old rows and facts remain unchanged. It does not exclude
+outside writers. If interrupted, inspect the Delta versions and partial results
+before retrying. In the isolated target, the 2026 configuration added 365
+dates, 17 products and 95 customers while retaining four earlier dates and
+three bootstrap facts; exclude those facts from measured totals.
 
 ## Local checks
 
@@ -140,8 +177,8 @@ an in-flight or unverified Copy, refuses automatic replay of an uncertain write,
 and recognizes a completed duplicate without a second Copy. Verification must
 come from an independent target query, including the symmetric multiset
 difference against all nine source columns, unique key range, orphan count, and
-grouped totals. `guard_spark.py` supplies a candidate query, but it has not been
-run end to end in the guarded pipeline. The implementation does not recover
+grouped totals. `guard_spark.py` ran end to end for the isolated event; this
+does not establish the shared-run deployment. The implementation does not recover
 stale locks or fence writers that ignore the lock. A lost response or crash requires
 reconciliation; never automatically remove a stale lock. Isolated journal
 probes used the interactive preflight principal, not the pipeline identity,
@@ -155,10 +192,11 @@ were conditionally removed only after confirming no Copy had been sent.
 and dispatches the same guarded pipeline for missing batches, with a durable
 conditional submission intent. A lost response leaves that intent in place and
 blocks automatic resubmission. Its local tests model missed events, late
-duplicates and two batches with overlapping IDs; they do not prove live recovery.
-The pipeline high-concurrency setting was enabled in the isolated preflight
-workspace, but Spark session reuse has not been verified. This setting does not
-establish event delivery.
+duplicates and two batches with overlapping IDs. Under the user's working
+assumption that notifications generally arrive, a missed-notification recovery
+demonstration is not a prerequisite; visible failures still need reporting and
+safe reconciliation. A guard notebook ran in a high-concurrency pipeline
+session, but reuse between guard phases has not been independently established.
 
 `python demo-3-onelake-events-copy/reconcile.py --manifest <manifest.json> --query-export <results.json>`
 compares measured batches only. The query export must contain `batches` keyed by

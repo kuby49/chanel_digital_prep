@@ -4,10 +4,20 @@ import re
 
 
 def validate_copy_protocol(detail):
-    if (not isinstance(detail, dict) or type(detail.get("minReaderVersion")) is not int
-            or type(detail.get("minWriterVersion")) is not int
-            or detail["minReaderVersion"] != 1 or detail["minWriterVersion"] != 2):
-        raise RuntimeError("FactSales Delta protocol is not compatible with the verified Copy connector")
+    if isinstance(detail, dict):
+        reader, writer = detail.get("minReaderVersion"), detail.get("minWriterVersion")
+        if type(reader) is int and type(writer) is int:
+            if (reader, writer) == (1, 2):
+                return
+            features = detail.get("tableFeatures")
+            properties = detail.get("properties")
+            if ((reader, writer) == (3, 7) and isinstance(features, list)
+                    and len(features) == 2 and all(isinstance(item, str) for item in features)
+                    and set(features) == {"deletionVectors", "invariants"}
+                    and isinstance(properties, dict)
+                    and properties.get("delta.enableDeletionVectors") == "false"):
+                return
+    raise RuntimeError("FactSales Delta protocol is not compatible with the verified Copy connector")
 
 
 def matches_amount_view(ddl, query, view_reference, table_reference):

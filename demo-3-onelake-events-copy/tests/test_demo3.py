@@ -54,11 +54,13 @@ class EventTests(unittest.TestCase):
     def test_definition_has_connected_disabled_rule_and_dynamic_parameters(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
         sample = {**self.event, "source": f"/tenants/{ids[0]}/workspaces/{ids[1]}/items/{ids[2]}"}
-        entities = activator.build_definition(*ids, sample)
+        entities = activator.build_definition(*ids, sample, run_id="run")
         by_type = {entity["type"]: entity for entity in entities if entity["type"] != "timeSeriesView-v1"}
         source = by_type["realTimeHubSource-v1"]
         self.assertEqual(source["payload"]["connection"]["artifactId"], ids[2])
         self.assertEqual(source["payload"]["filterSettings"]["eventTypes"], [{"name": activator.EVENT_TYPE}])
+        self.assertEqual(source["payload"]["filterSettings"]["filters"][0]["values"],
+                         ["/Files/incoming/sales/sales_run_"])
         views = [e for e in entities if e["type"] == "timeSeriesView-v1"]
         event = next(e for e in views if e["payload"]["definition"]["type"] == "Event")
         rule = next(e for e in views if e["payload"]["definition"]["type"] == "Rule")
@@ -78,11 +80,22 @@ class EventTests(unittest.TestCase):
     def test_sample_is_required_and_invalid_ids_rejected(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
         with self.assertRaises(ValueError):
-            activator.build_definition(*ids, {})
+            activator.build_definition(*ids, {}, run_id="run")
         with self.assertRaises(ValueError):
-            activator.build_definition("not-a-guid", *ids[1:], self.event)
+            activator.build_definition("not-a-guid", *ids[1:], self.event, run_id="run")
         with self.assertRaises(ValueError):
-            activator.build_definition(*ids, {**self.event, "source": "/other-lakehouse"})
+            activator.build_definition(*ids, {**self.event, "source": "/other-lakehouse"}, run_id="run")
+
+    def test_run_filter_is_bound_to_the_approved_run(self):
+        ids = [str(uuid.uuid4()) for _ in range(4)]
+        sample = {**self.event, "source": f"/tenants/{ids[0]}/workspaces/{ids[1]}/items/{ids[2]}"}
+        entities = activator.build_definition(*ids, sample, run_id="new_run-2026")
+        source = next(entity for entity in entities if entity["type"] == "realTimeHubSource-v1")
+        self.assertEqual(source["payload"]["filterSettings"]["filters"][0]["values"],
+                         ["/Files/incoming/sales/sales_new_run-2026_"])
+        for invalid in ("", "../run", "x/y", "x" * 65, None):
+            with self.subTest(run_id=invalid), self.assertRaises(ValueError):
+                activator.build_definition(*ids, sample, run_id=invalid)
 
 
 class EntrypointTests(unittest.TestCase):
@@ -277,6 +290,7 @@ class SetupNotebookTests(unittest.TestCase):
         parameters = "".join(notebook["cells"][0]["source"])
         self.assertIn("setup_start_date = '2026-01-01'", parameters)
         self.assertIn("setup_customer_count = 100", parameters)
+        self.assertIn("setup_allow_dimension_expansion = False", parameters)
         for cell in notebook["cells"]:
             compile("".join(cell["source"]), cell["id"], "exec")
         namespace = {}
@@ -285,6 +299,17 @@ class SetupNotebookTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, namespace["_setup_generator_name"], None)
         self.assertEqual(namespace["_setup_generator_path"].read_bytes(), self.generator.encode("utf-8"))
         self.assertEqual(namespace["dimensions"](namespace["RunConfig"]()), {})
+
+    def test_dimension_expansion_is_explicit_and_boolean(self):
+        notebook = setup.build_notebook(
+            self.generator, self.config, self.workspace_id, self.lakehouse_id, "DemoLakehouse",
+            allow_dimension_expansion=True)
+        self.assertIn("setup_allow_dimension_expansion = True", "".join(notebook["cells"][0]["source"]))
+        for invalid in ("yes", 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                setup.build_notebook(
+                    self.generator, self.config, self.workspace_id, self.lakehouse_id, "DemoLakehouse",
+                    allow_dimension_expansion=invalid)
 
     def test_invalid_dimension_inputs_are_rejected(self):
         for field, value in (("date_count", 0), ("product_count", True),
@@ -320,8 +345,22 @@ class SetupNotebookTests(unittest.TestCase):
 
     def test_incompatible_fact_protocol_is_rejected(self):
         view_validation.validate_copy_protocol({"minReaderVersion": 1, "minWriterVersion": 2})
-        for detail in ({"minReaderVersion": 3, "minWriterVersion": 7}, {},
-                       {"minReaderVersion": True, "minWriterVersion": 2}):
+        supported_features = {
+            "minReaderVersion": 3, "minWriterVersion": 7,
+            "tableFeatures": ["deletionVectors", "invariants"],
+            "properties": {"delta.enableDeletionVectors": "false"},
+        }
+        view_validation.validate_copy_protocol(supported_features)
+        for detail in (
+            {"minReaderVersion": 3, "minWriterVersion": 7},
+            {**supported_features, "tableFeatures": [["deletionVectors"], "invariants"]},
+            {**supported_features, "tableFeatures": ["deletionVectors", "invariants", "appendOnly"]},
+            {**supported_features, "tableFeatures": ["deletionVectors", "invariants", "columnMapping"]},
+            {**supported_features, "properties": {"delta.enableDeletionVectors": "true"}},
+            {**supported_features, "properties": {}},
+            {},
+            {"minReaderVersion": True, "minWriterVersion": 2},
+        ):
             with self.subTest(detail=detail), self.assertRaises(RuntimeError):
                 view_validation.validate_copy_protocol(detail)
 
@@ -530,6 +569,20 @@ class ReconciliationTests(unittest.TestCase):
                 guard_spark.onelake_endpoint("https://other.invalid/")
         config = producer.RunConfig("integration", date_count=4, products=3, customers=5,
                                     file_count=1, rows_per_file=12)
+        shared = {"contract_version": 1, "data": {
+            "run_id": "integration", "start_date": config.start_date, "seed": config.seed,
+            "date_count": 4, "product_count": 3, "customer_count": 5, "file_count": 1,
+            "rows_per_file": 12, "interval_seconds": config.interval_seconds,
+        }}
+        from dataclasses import asdict
+        self.assertEqual(guarded_notebook.run_config_from_shared(producer, shared), asdict(config))
+        for invalid in (
+            {"contract_version": 1, "data": {}},
+            {**shared, "data": {**shared["data"], "run_id": "../unsafe"}},
+            {**shared, "data": {**shared["data"], "file_count": True}},
+        ):
+            with self.subTest(config=invalid), self.assertRaises(ValueError):
+                guarded_notebook.run_config_from_shared(producer, invalid)
         notebook = setup.build_notebook(
             producer_path.read_text(encoding="utf-8"),
             {"contract_version": 1, "data": {"start_date": "2024-01-01", "date_count": 4,

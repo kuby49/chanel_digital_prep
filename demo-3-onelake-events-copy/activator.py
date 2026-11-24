@@ -12,6 +12,7 @@ import uuid
 EVENT_TYPE = "Microsoft.Fabric.OneLake.FileCreated"
 FOLDER = "/Files/incoming/sales/"
 FILE = re.compile(r"sales_[A-Za-z0-9_-]+_[0-9]+\.csv", re.ASCII)
+RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", re.ASCII)
 
 
 def validate_event(event):
@@ -57,9 +58,11 @@ def _parameter(name, field):
     }
 
 
-def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample):
+def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample, *, run_id):
     """Return a disabled candidate; a representative event is mandatory."""
     validate_event(sample)
+    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+        raise ValueError("invalid producer run ID")
     tenant_id, workspace_id, lakehouse_id, pipeline_id = map(
         _id, (tenant_id, workspace_id, lakehouse_id, pipeline_id)
     )
@@ -119,7 +122,8 @@ def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample)
                            "workspaceId": workspace_id, "artifactId": lakehouse_id,
                            "eventGroupType": "Microsoft.Fabric.OneLakeEvents"},
             "filterSettings": {"eventTypes": [{"name": EVENT_TYPE}], "filters": [
-                {"operatorType": "StringBeginsWith", "key": "subject", "values": [FOLDER]},
+                {"operatorType": "StringBeginsWith", "key": "subject",
+                 "values": [f"{FOLDER}sales_{run_id}_"]},
                 {"operatorType": "StringEndsWith", "key": "subject", "values": [".csv"]},
             ]},
         }},

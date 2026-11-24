@@ -2,9 +2,30 @@
 
 import json
 import re
+from dataclasses import asdict
 from pathlib import Path
 
 from deploy import _guid
+
+
+def run_config_from_shared(generator, config):
+    if (not isinstance(config, dict) or type(config.get("contract_version")) is not int
+            or config["contract_version"] != 1 or not isinstance(config.get("data"), dict)):
+        raise ValueError("v1 configuration must contain a data object")
+    data = config["data"]
+    fields = {
+        "run_id": "run_id", "start_date": "start_date", "seed": "seed",
+        "date_count": "date_count", "products": "product_count", "customers": "customer_count",
+        "file_count": "file_count", "rows_per_file": "rows_per_file", "interval_seconds": "interval_seconds",
+    }
+    if any(key not in data for key in fields.values()):
+        raise ValueError("shared producer run configuration is incomplete")
+    try:
+        run = generator.RunConfig(**{name: data[key] for name, key in fields.items()})
+        run.validate()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("invalid shared producer run configuration") from exc
+    return asdict(run)
 
 
 def build_notebook(producer_dir, run_config, workspace_id, item_id, lakehouse_name,

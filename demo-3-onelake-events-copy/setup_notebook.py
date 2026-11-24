@@ -15,7 +15,8 @@ def _positive_integer(value, name):
     return value
 
 
-def build_notebook(generator_source, config, workspace_id, lakehouse_id, lakehouse_name):
+def build_notebook(generator_source, config, workspace_id, lakehouse_id, lakehouse_name,
+                   *, allow_dimension_expansion=False):
     if not isinstance(generator_source, str) or not generator_source.strip():
         raise ValueError("the shared generator source is required")
     source_tree = ast.parse(generator_source)
@@ -42,6 +43,8 @@ def build_notebook(generator_source, config, workspace_id, lakehouse_id, lakehou
         raise ValueError("date range is outside supported dates") from exc
     if type(data.get("seed")) is not int:
         raise ValueError("seed must be an integer")
+    if type(allow_dimension_expansion) is not bool:
+        raise ValueError("allow_dimension_expansion must be a boolean")
     if not isinstance(lakehouse_name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", lakehouse_name):
         raise ValueError("lakehouse name must be a simple Spark identifier")
     workspace_id = str(uuid.UUID(workspace_id))
@@ -55,11 +58,14 @@ def build_notebook(generator_source, config, workspace_id, lakehouse_id, lakehou
         "setup_date_count": date_count,
         "setup_product_count": product_count,
         "setup_customer_count": customer_count,
+        "setup_allow_dimension_expansion": allow_dimension_expansion,
     }
     parameter_source = "".join(f"{key} = {value!r}\n" for key, value in parameters.items())
     validation_source = (Path(__file__).parent / "view_validation.py").read_text(encoding="utf-8")
+    expansion_source = (Path(__file__).parent / "dimension_expansion.py").read_text(encoding="utf-8")
     setup_source = (Path(__file__).parent / "setup_spark.py").read_text(encoding="utf-8")
     compile(validation_source, "view_validation.py", "exec")
+    compile(expansion_source, "dimension_expansion.py", "exec")
     compile(setup_source, "setup_spark.py", "exec")
 
     def cell(cell_id, source, metadata=None):
@@ -106,6 +112,7 @@ dimensions = _setup_generator.dimensions
             cell("parameters", parameter_source, {"tags": ["parameters"]}),
             cell("shared-generator", generator_loader),
             cell("view-validation", validation_source),
+            cell("dimension-expansion", expansion_source),
             cell("demo3-setup", setup_source),
         ],
     }
@@ -118,12 +125,14 @@ def main():
     parser.add_argument("--workspace-id", required=True)
     parser.add_argument("--lakehouse-id", required=True)
     parser.add_argument("--lakehouse-name", required=True)
+    parser.add_argument("--allow-dimension-expansion", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     notebook = build_notebook(
         args.generator.read_text(encoding="utf-8"),
         json.loads(args.config.read_text(encoding="utf-8")),
         args.workspace_id, args.lakehouse_id, args.lakehouse_name,
+        allow_dimension_expansion=args.allow_dimension_expansion,
     )
     args.output.write_text(json.dumps(notebook, indent=2) + "\n", encoding="utf-8")
 

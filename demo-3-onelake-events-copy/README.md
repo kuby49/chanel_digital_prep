@@ -209,6 +209,16 @@ guarded recovery path. This is not an unlimited queue or a guarantee that every
 Copy finishes inside 60 seconds. Keep the 60-second producer cadence; do not
 silently stretch it to hide lock contention.
 
+`native_stop.stop` provides an offline-tested barrier for cooperating native
+guards after the producer has durably written the exact per-run stop marker.
+It waits for their shared writer lock, rechecks that marker while holding the
+lock, and conditionally releases only its own lock. This assumes the stop
+marker remains immutable and every writer uses the guarded path. A timeout,
+changed marker, or uncertain storage outcome requires reconciliation and
+retaining the producer's lifecycle lock. The barrier does not establish that
+Fabric's event queue or jobs are drained, and it is not a complete native
+readiness or delivery-verification hook.
+
 After coordinated stopped-state verification, exclusively create
 `demo3-native-binding-state.json` with the existing resource IDs, generator
 fingerprint, `native_policy`, `native_policy_sha256`, the disabled graph and

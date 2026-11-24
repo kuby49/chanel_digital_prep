@@ -14,6 +14,8 @@ The first default-run attempt on 2026-11-24 failed at the pipeline level with
 proof that no child existed. Reconcile the exact attempt and any owned work
 before another measured launch. Subsequent local runtime pagination and
 bodyless-request fixes have not yet been published to the Fabric notebook.
+The original bounded Demo 1 setup schedule was disabled and read back; a new
+run requires a separately confirmed schedule and updated profile.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer

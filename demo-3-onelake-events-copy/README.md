@@ -4,8 +4,9 @@
 With `demo-3.customer_preflight: true`, read-only `validate-only` checks the
 original customer binding and the existing run-specific resources. It does not
 claim the new file was delivered or that the ten-file acceptance run passed.
-Reusable native binding support is locally tested but has not been installed
-or exercised against the live items.
+The reusable native binding and corrected guard were published and read back
+with the rule stopped during publication; an integrated recurring run remains
+unverified.
 An isolated MCAP preflight
 workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
 stopped probe Activator exist. They do not constitute a deployable production
@@ -142,7 +143,7 @@ creation as a course correction; do not silently substitute another connection.
 
 ## Binding a bounded shared run
 
-### Reusable native event path (local candidate, not deployed)
+### Reusable native event path (not end-to-end verified)
 
 Use `activator.build_native_definition(...)` and
 `guarded_notebook.build_native_notebook(producer_dir, policy, workspace_id,
@@ -219,7 +220,7 @@ retaining the producer's lifecycle lock. The barrier does not establish that
 Fabric's event queue or jobs are drained, and it is not a complete native
 readiness or delivery-verification hook.
 
-`native_demo3.py` contains local-only producer hooks. Before generating the
+`native_demo3.py` contains producer hooks. Before generating the
 reusable producer profile, a future authorized setup must pin
 `demo-3.native_proof`: version, owned workspace/Lakehouse/guard/pipeline/Reflex/
 connection IDs, owner marker, native policy and generator SHA-256, plus
@@ -269,7 +270,7 @@ in the common configuration; remove `customer_preflight`. Standard
 `deploy.py --mode validate-only ...` then verifies the native notebook, broad
 event binding, unchanged exact-file Copy, ownership, dimensions and writer/job
 quiescence without pinning a specific `data.run_id`. It cannot pass against
-the currently deployed fixed-run notebook.
+a fixed-run notebook and does not enable the rule or prove delivery.
 
 The separately journaled `native_guard_hc.py` corrects the native guard once
 by inserting `spark.conf.set("spark.fabric.session.highConcurrency.enabled",

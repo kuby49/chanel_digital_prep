@@ -4,11 +4,11 @@ The [specification](SPECIFICATION.md) defines three isolated comparisons using t
 
 **Native recurring launch is not yet ready.** Reusable producer and track
 lifecycle hooks and the Demo 3 publisher are integrated and locally tested.
-The Demo 3 native definitions and stopped-rule proof have been read back in
-Fabric; its rule remains stopped. Producer publication, rule enablement, live
-setup and repeated-run verification remain incomplete. The older prepared
-profile is single-use and requires a separately started monitor. No
-coordinated 10-file run has been verified.
+The Demo 3 native definitions, corrected guard and stopped-rule proof have been
+read back in Fabric. The updated producer notebook and reusable pipeline have
+also been read back, but end-to-end execution and repeated-run verification
+remain incomplete. The older prepared profile is single-use and requires a
+separately started monitor. No coordinated 10-file run has been verified.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer
@@ -21,7 +21,7 @@ The default one-minute source cadence is not a downstream visibility guarantee. 
 
 Copy `config.example.json` to a private, untracked location and fill in the resolved IDs, names, feature settings and bounded run parameters. The `workspace_name` defaults contain `{prefix}`; each track expands it using the effective `--prefix`. The config is version 1 and consists of shared `environment`, `tenant_id`, `subscription_id`, `capacity`, `authentication`, `execution`, and `data` objects and `demo-1`, `demo-2`, `demo-3`, and `shared` track objects. Each demo's `verification_timeout_seconds` applies per batch and takes precedence over `execution.verification_timeout_seconds`; `execution.poll_interval_seconds` controls validation polling. Null IDs must be resolved and recorded by each track before it reports readiness. Configuration may contain secret **references**, never tokens or secret values. State files and logs must contain only sanitized data.
 
-Use the signed-in MCAP identity where supported. In each PowerShell process set `$env:AZURE_CONFIG_DIR = "$HOME\.azure-mcap"` before invoking Azure CLI-backed operations; verify the active tenant, subscription and capacity. The configured identity alone does not grant cross-workspace permissions. The user has approved access and other changes needed for live testing; determine and record the least-privilege scope before making changes. All feature, permission, API-coverage and charge checks in the specification remain required.
+Use the signed-in MCAP identity where supported. Before invoking Azure CLI-backed operations, check any existing `AZURE_CONFIG_DIR` and confirm whether to keep or override a conflicting value; set `$env:AZURE_CONFIG_DIR = "$HOME\.azure-mcap"` only in the authorized PowerShell process. Verify the active tenant, subscription and capacity. The configured identity alone does not grant cross-workspace permissions. The user has approved access and other changes needed for live testing; determine and record the least-privilege scope before making changes. All feature, permission, API-coverage and charge checks in the specification remain required.
 
 ### Current preflight limits
 

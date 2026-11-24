@@ -106,9 +106,10 @@ notebook-resident MLV schedule mutations are not bundled. The shared setup
 schedule intentionally remains enabled between runs, and its remaining
 coverage must include the fresh run's complete verification deadline.
 Demo 3's readiness, verification and cooperating-writer drain hooks require
-a confirmed deployment proof and enabled rule; their publisher and live
-integration remain unverified. Missing or unsuccessful
-hooks fail before sales, rather than assuming a manually started monitor
+a confirmed deployment proof and enabled rule. Its publisher and corrected
+guard were read back with the rule stopped during publication, but live
+integration remains unverified. Missing or unsuccessful hooks fail before
+sales, rather than assuming a manually started monitor
 or accepting recorded readiness. Demo 2's native hook must establish and
 observe its exact owned monitor/verifier jobs automatically. No live result
 is implied by the local producer implementation.

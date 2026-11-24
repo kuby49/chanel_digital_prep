@@ -84,7 +84,12 @@ OneLake reads/writes can skew staging, and a blocking SDK call can outlast
 cooperative stop or the deadline. Demo 2's separate downstream verifier
 applies its own deadline.
 
-## Run a prepared customer demo from Fabric
+## Interim single-use Fabric profile
+
+This profile has not been published or verified for the recurring customer
+demo. It is not the requested reusable one-click experience: each run needs
+new preparation and a separately started monitor. Do not select **Run** until
+the coordinated native path is ready.
 
 After the operator confirms the exact run ID and downstream readiness, open
 the producer workspace, open its **producer_wrapper** Data Pipeline, and select

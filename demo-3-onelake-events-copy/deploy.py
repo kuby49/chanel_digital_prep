@@ -1,4 +1,4 @@
-"""Fail-closed Demo 3 orchestration contract; no Fabric writes are performed."""
+"""Fail-closed Demo 3 orchestration; owned-shell provisioning is explicit."""
 
 import argparse
 import json
@@ -170,7 +170,8 @@ def verification_timeout(config):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=(
-        "dry-run", "validate-only", "deploy", "cleanup", "resolve-target-candidate"))
+        "dry-run", "validate-only", "deploy", "cleanup", "resolve-target-candidate",
+        "provision-owned", "verify-owned"))
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True, type=Path)
@@ -215,6 +216,20 @@ def main(argv=None):
             result["diagnostics"].append(
                 "Local ownership candidate only; live identity, access, and readiness are not established."
             )
+        elif args.mode in ("provision-owned", "verify-owned"):
+            from ownership import FabricControl, provision
+
+            create = args.mode == "provision-owned"
+            if create and not args.yes:
+                raise ValueError("provision-owned requires --yes")
+            api = FabricControl.from_cli(_guid(config.get("tenant_id")))
+            if create:
+                args.state_dir.mkdir(parents=True, exist_ok=True)
+            provision(config, args.prefix, args.state_dir, api, create=create)
+            result["diagnostics"].append(
+                "Owned workspace and Lakehouse verified. No fact table, writer fence, or "
+                "production pipeline readiness established."
+            )
         else:
             result["diagnostics"].append(
                 "Blocked: production exact-file Copy, serialized writes, recovery, event binding and "
@@ -236,4 +251,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    sys.modules.setdefault("deploy", sys.modules[__name__])
     sys.exit(main())

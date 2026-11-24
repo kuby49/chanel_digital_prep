@@ -38,7 +38,7 @@ def reconcile(manifest, observed):
         raise ValueError("query export batches must be an object keyed by batch ID")
     actual = observed["batches"]
     errors = []
-    for name in ("duplicate_sales_line_ids", "orphan_rows"):
+    for name in ("duplicate_batch_sales_line_ids", "orphan_rows"):
         value = observed.get(name)
         if not _integer(value) or value != 0:
             errors.append(f"{name} must be zero")

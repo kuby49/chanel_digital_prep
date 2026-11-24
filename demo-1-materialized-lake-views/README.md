@@ -165,6 +165,119 @@ Record first and subsequent batch arrival-to-silver min/median/max separately,
 alongside refresh history and capacity contention. Repeat deployment to verify
 idempotency without destructive replacement.
 
+## Reusable native Run with a preconfigured schedule
+
+`native_demo1.py` supplies standalone `prepare`, `check_ready`, `verify` and
+`stop` hooks for the native producer orchestrator. It imports only the Python
+standard library. **Notebook code never creates, updates, disables or cancels
+an MLV schedule or refresh job.** Scheduling remains on the supported external
+control plane. These hooks are locally tested; fresh-target managed scheduling,
+the integrated notebook identity and cross-workspace Spark reads still require
+coordinated live verification. They are not measured customer-run acceptance.
+
+One-time setup, after approval, uses the existing controller and the immutable
+setup config with the original local ownership journal. Choose an explicitly
+bounded operating window (19-60 minutes); the native path can reuse that same
+schedule for different fresh run IDs while the window has sufficient coverage.
+After `start` confirms its receipt, the following **local-only** command exports
+the sanitized schedule receipt without acquiring tokens or calling Fabric:
+
+```powershell
+python .\demo-1-materialized-lake-views\managed_refresh.py export-native `
+  --config C:\demo\setup-common.json > C:\demo\native-schedule-export.json
+```
+
+The one-time native template builder must project the export's `native_schedule`
+object into `document["demo-1"]["native_schedule"]`. This is the only additional
+Demo 1 profile field; there is no per-click CLI or hand-built schedule request.
+The receipt contains `contract_version`, `track`, `status`, `setup_run_id`,
+`tenant_id`, `principal_id`, `workspace_id`, `lakehouse_id`, `schedule_id`,
+`request` and `create_response`. Its exact ID, owner/type, five-minute UTC
+configuration, approved start/end and full-lineage scope are pinned and checked
+against live GET/list readbacks. Do not copy the original resource ownership
+journal into Fabric. Protect the exported receipt and template: they are
+operator-provided evidence, not signed service creator attestation. Exporting
+alone does not establish current readiness.
+
+The runtime context supplies the resolved `document`, checked-identity,
+telemetry-bearing `fabric.get/list_all` client, active `spark`, conditional
+OneLake `store.read/create/replace`, authoritative `read_manifest()`, aware UTC
+`clock()`, `sleep(seconds)`, `stop_requested()`, and UTC ISO-string
+`preparation_deadline_utc`, `verification_deadline_utc`,
+`cleanup_deadline_utc` and `expires_at_utc`. The producer must check its runtime
+identity, target/resource/name bindings and permissions and hold its global
+native writer lock throughout all hooks and delivery. Demo 1 preparation runs
+last, followed by `check_ready` directly before the source clock starts.
+
+Admission checks the original 365/20/100 dimension keys and labels, matching
+tenant/principal/target/landing, no pre-existing facts for this fresh run's
+BatchIDs, one matching enabled schedule, no enabled/unknown competitors, and
+successful idle lineage history. **No active job is assumed to belong to this
+run or exempted because it is scheduled.** A scheduled refresh already active
+at admission blocks that click; the hook does not wait or cancel it.
+`prepare` conditionally creates and reads back
+`Files/producer/runs/<run_id>/demo1/schedule.json`. That per-run record pins the
+receipt, data, target and all fixed deadlines. `check_ready` checks those pins,
+the fresh empty manifest, absent run BatchIDs, live schedule and idle jobs again.
+No hook extends or silently shortens any deadline.
+
+At source admission the exact timing requirements are:
+
+```text
+schedule_start <= now
+now + 19 minutes <= verification_deadline <= schedule_end
+preparation_deadline > now
+preparation_deadline < verification_deadline < cleanup_deadline <= expires_at
+```
+
+The 19-minute minimum is nine source intervals plus one five-minute refresh
+interval and five minutes of processing margin; it is not a freshness SLA.
+The schedule can already be running within its bounded operating window; it
+does not need a new future start for each click. Late clicks fail closed.
+**The producer's default two-hour native window and allocation+6,900-second
+verification deadline cannot fit the controller's maximum one-hour setup
+schedule.** Configure approved native preparation/run/cleanup budgets once in
+the template so the full fixed verification deadline fits. The hook rejects
+the incompatible default rather than guessing shorter budgets or widening the
+approved schedule. Each subsequent fresh run must independently satisfy the
+same checks; repeated clicks are not promised beyond the operating window.
+
+After durable producer delivery completes, `verify` accepts only the actual
+ten measured manifest BatchIDs, 1,000 distinct IDs `1..1000` per batch in both
+Bronze and Silver, exact totals, clean source/quality diagnostics and exact
+Silver aggregates by date/category/region. It rejects missing or duplicated
+fresh-run rows, preserves the bootstrap and synthetic baseline, and waits
+boundedly for terminal successful lineage with a completed scheduled refresh
+after the **final**, not first, delivery acknowledgement. Job history does not
+identify the originating schedule, so it is recorded without claiming that
+attribution. Source acknowledgements use the manifest's
+`submission_result_at_utc` with `submission_status: submitted`; the generic
+`timestamp_utc` is overwritten during producer verification and is not an
+arrival timestamp. Unknown submission acknowledgements require reconciliation,
+not inferred timing.
+
+Successful verification retains per-batch first **post-delivery verification
+observation** times and delivery-to-observation seconds alongside job start/end.
+These are latency upper bounds, not the first actual Silver visibility:
+earlier batches may already have appeared while the producer was running.
+Sixty seconds remains source cadence; managed downstream cadence is five
+minutes plus queueing/processing.
+
+`stop` returns `status: stopped` with
+`scope: "run-specific; shared bounded setup schedule remains enabled"`.
+It does not disable that shared schedule, submit or cancel jobs, or delete
+data. It waits only until the fixed cleanup deadline for idle successful
+lineage, verifies the unchanged schedule and conditionally persists run
+completion, even when cooperative stop was requested. Unresolved evidence,
+changed schedule or active/unknown jobs block cleanup and retain the producer's
+global lock for reconciliation. Forced notebook termination cannot promise
+finally/cleanup; the shared schedule remains under its explicit bound.
+
+At the end of the operating window, use `managed_refresh.py status/stop --yes`
+with the **original setup config and journal**, not a fresh native run ID.
+Confirm disabled readback and wait for any active lineage refresh to become
+terminal. There is no automatic job cancellation or schedule extension.
+
 ## Entry point
 
 Azure CLI calls are bounded at 120 seconds or the remaining Fabric deadline.
@@ -177,8 +290,9 @@ For the specified 10-file, 1,000-row recurring run, `managed_refresh.py`
 provides `plan`, `start`, `status`, and `stop` controls for a receipt-bound
 native five-minute full-lineage schedule. `start` and `stop` require `--yes`
 and the original ownership state; reconcile ambiguous operations before retry.
-Admission requires the exact enabled schedule, a future first refresh, and no
-conflicting schedules or active lineage jobs. Source files are targeted at
+The older run-bound CLI admission requires the exact enabled schedule, a
+future first refresh, and no conflicting schedules or active lineage jobs.
+Source files are targeted at
 60-second intervals; scheduled refresh and query visibility are slower.
 The controller is locally tested but has not yet been verified on this target.
 With a frozen recurring config and coordinated approval, run:
@@ -191,9 +305,9 @@ python .\demo-1-materialized-lake-views\managed_refresh.py stop --config <absolu
 ```
 
 `start` performs preparation checks before creating one future-start schedule,
-retains the create receipt, and verifies its owner, scope and bounds. Complete
-coordinated admission and start the producer before the first scheduled refresh.
-If the first-fire deadline is missed, admission blocks; do not bypass it.
+retains the create receipt, and verifies its owner, scope and bounds. The older
+run-bound CLI requires admission before the first scheduled refresh; the
+reusable hook instead checks the active bounded window as described above.
 Observe the actual delivery times, refresh jobs and Silver BatchIDs, then
 disable only the owned schedule after the final batch is reconciled. `stop`
 reports blocked while any lineage job is nonterminal; it does not cancel jobs.

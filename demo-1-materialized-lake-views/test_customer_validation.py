@@ -171,7 +171,7 @@ class CustomerValidationTest(unittest.TestCase):
             if method == "POST":
                 self.assertEqual(state["status"], "pending")
                 self.assertEqual(path, root + "/schedules")
-                live = {"id": INTENT, "owner": {"id": OWNER}, **copy.deepcopy(body)}
+                live = {"id": INTENT, "owner": {"id": OWNER, "type": "User"}, **copy.deepcopy(body)}
                 self.overrides[root + "/schedules"] = {"value": [live]}
                 self.overrides[root + "/schedules/" + INTENT] = live
                 return 201, {}, live, True
@@ -230,6 +230,31 @@ class CustomerValidationTest(unittest.TestCase):
         self.config["data"]["run_id"] = "another_run"
         with self.assertRaises(CandidateBlocked):
             validate_customer(self.config, "chanel", self.root)
+
+    def test_native_export_is_local_sanitized_and_preserves_original_journals(self):
+        self.recurring()
+        client, _ = self.schedule_transport()
+        managed_refresh.manage(self.config, "chanel", self.root, "start", yes=True)
+        paths = (self.root / STATE_FILE, managed_refresh.schedule_file(self.root, self.config))
+        before = [path.read_bytes() for path in paths]
+        client.request.reset_mock()
+        with patch("managed_refresh.FabricClient", side_effect=AssertionError("Must not acquire a token")):
+            result = managed_refresh.manage(self.config, "chanel", self.root, "export-native")
+        self.assertEqual(result["status"], "pass")
+        receipt = result["native_schedule"]
+        self.assertEqual(set(receipt), {
+            "contract_version", "track", "status", "setup_run_id", "schedule_id", "tenant_id",
+            "principal_id", "workspace_id", "lakehouse_id", "request", "create_response",
+        })
+        self.assertEqual((receipt["schedule_id"], receipt["setup_run_id"]), (INTENT, "customer_demo"))
+        self.assertEqual(receipt["create_response"]["owner"], {"id": OWNER, "type": "User"})
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        client.request.assert_not_called()
+        record = json.loads(paths[1].read_text())
+        record["status"] = "stop-pending"
+        paths[1].write_text(json.dumps(record))
+        with self.assertRaisesRegex(CandidateBlocked, "confirmed setup"):
+            managed_refresh.manage(self.config, "chanel", self.root, "export-native")
 
     def test_ambiguous_schedule_post_is_not_repeated(self):
         self.recurring()

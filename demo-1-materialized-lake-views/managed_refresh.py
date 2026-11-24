@@ -195,7 +195,7 @@ def plan(config, start_delay_minutes=10, duration_minutes=30):
 def manage(config, prefix, state_dir, action, *, yes=False, start_delay_minutes=10, duration_minutes=30):
     if action == "plan":
         return {"action": action, "status": "pass", "request": plan(config, start_delay_minutes, duration_minutes)}
-    if action not in ("start", "status", "stop"):
+    if action not in ("start", "status", "stop", "export-native"):
         raise ValueError("Unknown native schedule action.")
     if action in ("start", "stop") and not yes:
         raise ValueError(f"{action} requires --yes; no cloud mutation was attempted.")
@@ -210,6 +210,22 @@ def manage(config, prefix, state_dir, action, *, yes=False, start_delay_minutes=
     with _state_lock(state_dir):
         journal = _read(state_dir / STATE_FILE)
         binding = _binding(config, prefix, journal)
+        if action == "export-native":
+            record = _record(config, prefix, state_dir, journal)
+            if (record["status"] != "confirmed"
+                    or record["create_response"]["owner"].get("type")
+                    not in ("User", "ServicePrincipal", "ManagedIdentity")):
+                raise CandidateBlocked("Native export requires a confirmed setup schedule and known owner type.")
+            receipt = {
+                "contract_version": 1, "track": "demo-1", "status": "confirmed",
+                "setup_run_id": config["data"]["run_id"], "schedule_id": record["schedule_id"],
+                **{key: binding[key] for key in ("tenant_id", "principal_id", "workspace_id", "lakehouse_id")},
+                "request": record["request"],
+                "create_response": {key: value for key, value in record["create_response"].items() if key in (
+                    "id", "enabled", "configuration", "owner", "executionData")},
+            }
+            return {"action": action, "status": "pass", "native_schedule": receipt,
+                    "diagnostics": ["Local schedule receipt export only; no live readiness or creator attestation."]}
         azure_config = Path(os.environ.get("AZURE_CONFIG_DIR", ""))
         if not azure_config.is_absolute() or not azure_config.is_dir():
             raise CandidateBlocked("Select the existing isolated AZURE_CONFIG_DIR.")
@@ -280,7 +296,7 @@ def manage(config, prefix, state_dir, action, *, yes=False, start_delay_minutes=
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("plan", "start", "status", "stop"))
+    parser.add_argument("action", choices=("plan", "start", "status", "stop", "export-native"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--prefix")

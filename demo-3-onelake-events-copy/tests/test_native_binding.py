@@ -17,6 +17,7 @@ import activator
 import customer_preflight as check
 import guarded_notebook
 import native_binding
+import native_rule
 from deploy import CandidateBlocked
 
 
@@ -327,6 +328,89 @@ class NativeBindingTests(unittest.TestCase):
         native_binding._create(self.binding.journal, state)
         with self.assertRaisesRegex(CandidateBlocked, "journal differs"):
             self.binding.reconcile()
+        self.api.request.assert_not_called()
+
+    def rule_controller(self):
+        state = copy.deepcopy(self.template)
+        state["publisher"] = self.binding.pinned
+        state["actions"] = {name: {"status": "confirmed-readback", "http": 200,
+                                    "time_utc": "start", "confirmed_at_utc": "end"}
+                            for name in native_binding._ACTIONS}
+        native_binding._create(self.binding.journal, state)
+        return native_rule.NativeRule(self.binding)
+
+    def test_native_rule_one_shot_enable_disable_and_point_in_time_drain(self):
+        controller = self.rule_controller()
+        operation = "468567aa-fc56-4b9f-b61a-0e39ae31fe51"
+        location = "https://wabi-west-us3-a-primary-redirect.analysis.windows.net/v1/operations/" + operation
+        current = copy.deepcopy(self.binding.graph)
+
+        def request(method, url, body, **kwargs):
+            self.assertEqual((method, url, kwargs["skill"]),
+                             ("POST", native_rule._RESOURCE + "/updateDefinition", "activator-cli"))
+            state = json.loads(controller.journal.read_text(encoding="utf-8"))
+            action = "disable" if "disable" in state["actions"] else "enable"
+            self.assertEqual(state["actions"][action]["status"], "in-flight")
+            current[:] = native_binding._decode_part(body, "ReflexEntities.json")
+            if action == "enable":
+                return 202, {"x-ms-operation-id": operation, "Location": location}, None
+            return 200, {}, None
+
+        self.api.request.side_effect = request
+        with mock.patch.object(controller, "_verify_proof", return_value="a" * 64), \
+             mock.patch.object(check, "_owned"), \
+             mock.patch.object(native_binding, "_graph", return_value=current), \
+             mock.patch.object(native_binding, "_quiescent") as quiescent:
+            controller.change("enable", self.root / "proof.json")
+            with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
+                controller.change("enable", self.root / "proof.json")
+            self.poll.assert_called_once_with(self.api, location, operation, "activator-cli")
+            controller.change("disable")
+            with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
+                controller.change("disable")
+            self.assertEqual(current, self.binding.graph)
+            self.assertEqual(controller.drain()["event_queue"], "unverified")
+            quiescent.assert_called_once_with(self.api, self.root)
+        self.assertEqual(self.api.request.call_count, 2)
+
+    def test_native_rule_reconciles_exact_receipt_without_resubmitting(self):
+        controller = self.rule_controller()
+        operation = "468567aa-fc56-4b9f-b61a-0e39ae31fe51"
+        location = "https://api.fabric.microsoft.com/v1/operations/" + operation
+        self.api.request.return_value = (202, {"x-ms-operation-id": operation, "Location": location}, None)
+        self.poll.side_effect = [TimeoutError("still running"), None]
+        with mock.patch.object(controller, "_verify_proof", return_value="a" * 64), \
+             mock.patch.object(controller, "_readback"):
+            with self.assertRaises(TimeoutError):
+                controller.change("enable", self.root / "proof.json")
+            with self.assertRaisesRegex(CandidateBlocked, "enable unconfirmed"):
+                controller.change("disable")
+            state = controller.reconcile()
+        self.assertEqual(state["actions"]["enable"]["status"], "confirmed-readback")
+        self.assertEqual(self.api.request.call_count, 1)
+        self.assertEqual(self.poll.call_args_list, [mock.call(self.api, location, operation, "activator-cli")] * 2)
+
+    def test_native_rule_lost_receipt_blocks_reconcile_and_disable(self):
+        controller = self.rule_controller()
+        self.api.request.side_effect = RuntimeError("response lost")
+        with mock.patch.object(controller, "_verify_proof", return_value="a" * 64), \
+             mock.patch.object(controller, "_readback") as readback:
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                controller.change("enable", self.root / "proof.json")
+            with self.assertRaisesRegex(CandidateBlocked, "acceptance is unknown"):
+                controller.reconcile()
+            with self.assertRaisesRegex(CandidateBlocked, "enable unconfirmed"):
+                controller.change("disable")
+            readback.assert_called_once_with(False)
+        self.assertEqual(self.api.request.call_count, 1)
+
+    def test_native_rule_enable_rejects_changed_proof_without_creating_intent(self):
+        controller = self.rule_controller()
+        self.write("proof.json", {"guard_sha256": "stale"})
+        with mock.patch.object(self.binding, "_read_proof", return_value={"guard_sha256": "fresh"}):
+            with self.assertRaisesRegex(CandidateBlocked, "proof differs"):
+                controller.change("enable", self.root / "proof.json")
+        self.assertFalse(controller.journal.exists())
         self.api.request.assert_not_called()
 
 

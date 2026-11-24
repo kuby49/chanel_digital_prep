@@ -167,6 +167,62 @@ class SharedManifestIntegrationTest(unittest.TestCase):
             self.assertFalse((rejected / "demo-2-target-candidate.json").exists())
             self.assertEqual(journal.read_bytes(), before)
 
+    def test_orchestrator_resolves_real_demo3_candidate_with_exact_fact_case(self):
+        demo = load_script("demo3_candidate_integration", ROOT / "demo-3-onelake-events-copy" / "deploy.py")
+        orchestration = load_script("orchestration_demo3_integration", ROOT / "scripts" / "deploy-demos")
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["shared"].update({"workspace_id": "11111111-1111-4111-8111-111111111111",
+                                 "staging_lakehouse_id": "22222222-2222-4222-8222-222222222222"})
+        workspace = "33333333-3333-4333-8333-333333333333"
+        lakehouse = "44444444-4444-4444-8444-444444444444"
+        owner = "55555555-5555-4555-8555-555555555555"
+        marker = f"chanel-demo3-{owner}"
+        target = {"workspace_id": workspace, "item_id": lakehouse, "fact": "dbo.factsales"}
+        journal = {
+            "contract_version": 1, "track": "demo-3", "tenant_id": config["tenant_id"], "prefix": "chanel",
+            "owner": {"id": owner, "marker": marker}, "pending_operations": [], "uncertain_operations": [],
+            "workspace": {"id": workspace, "type": "Workspace", "status": "confirmed",
+                          "created_by_owner": owner, "create_intent_id": "66666666-6666-4666-8666-666666666666",
+                          "readback": {"id": workspace, "type": "Workspace", "owner_marker": marker}},
+            "lakehouse": {"id": lakehouse, "type": "Lakehouse", "status": "confirmed",
+                          "workspace_id": workspace, "created_by_owner": owner,
+                          "create_intent_id": "77777777-7777-4777-8777-777777777777",
+                          "readback": {"id": lakehouse, "type": "Lakehouse",
+                                       "workspace_id": workspace, "owner_marker": marker}},
+            "fact": {"status": "confirmed", "workspace_id": workspace,
+                     "item_id": lakehouse, "name": "dbo.factsales"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            journal_path = state / demo.STATE_FILE
+            journal_path.write_text(json.dumps(journal), encoding="utf-8")
+            before = journal_path.read_bytes()
+            invocation = root / "invocation"
+            invocation.mkdir()
+            phases, resolved, path = orchestration.effective_run_config(
+                config, "chanel", state, invocation, 30, ["demo-3"], 1)
+            candidate_result = phases["resolve-target-candidate"]["demo-3"]
+            self.assertEqual((candidate_result["status"], candidate_result["ready"]), ("pass", False))
+            self.assertEqual(resolved["shared"]["target_bindings"], {"demo-3": target})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), resolved)
+            self.assertEqual(journal_path.read_bytes(), before)
+            self.assertFalse((state / demo.LOCK_FILE).exists())
+            self.assertEqual(config["shared"]["target_bindings"], {})
+
+            conflict = json.loads(json.dumps(config))
+            conflict["demo-3"]["destination_table"] = "dbo.FactSales"
+            rejected = root / "rejected"
+            rejected.mkdir()
+            phases, resolved, path = orchestration.effective_run_config(
+                conflict, "chanel", state, rejected, 30, ["demo-3"], 1)
+            self.assertEqual(phases["resolve-target-candidate"]["demo-3"]["status"], "blocked")
+            self.assertIsNone(resolved)
+            self.assertIsNone(path)
+            self.assertFalse((rejected / demo.CANDIDATE_FILE).exists())
+            self.assertEqual(journal_path.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

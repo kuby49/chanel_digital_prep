@@ -149,6 +149,11 @@
   "reported_observations": [
     {
       "track": "demo-3",
+      "source": "Demo 3 owner isolated audit response-loss probe",
+      "note": "A client wrapper discarded responses after real OneLake lock creation and Copy-intent writes. Both persisted locks blocked a competing cooperative writer, and an in-flight intent could not be released. No Copy or target query was sent; the known test objects were conditionally removed. This simulated lost client responses, not a network interruption, process crash, pipeline identity or fencing of external writers."
+    },
+    {
+      "track": "demo-3",
       "source": "Shared integration CLI-principal selected-target metadata readback",
       "recorded_utc": "2026-11-24T02:41:06Z",
       "candidate_fact_binding": {"workspace_id": "744223de-ceab-4c4f-82ba-f811bcb5c7d7", "item_id": "02fd5f73-32d5-4295-bfb5-c5436e9c3b62", "fact": "dbo.factsales"},

@@ -29,6 +29,7 @@ _PREVIOUS = "demo3-customer-" + check.FRESH_RUN_ID + "-binding-state.json"
 _BASE = "/v1/workspaces/" + check.WORKSPACE
 _ACTIONS = ("guard_update", "activator_update")
 RULE_JOURNAL = "demo3-native-rule-state.json"
+RULE_SECOND_JOURNAL = "demo3-native-rule-cycle-2-state.json"
 HC_JOURNAL = "demo3-native-guard-hc-state.json"
 HC_FLAG = 'spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")\n'
 
@@ -481,7 +482,8 @@ class NativeBinding:
     def proof(self, output):
         output = Path(output)
         protected = (self.candidate_path, self.native_config_path, self.previous_config_path,
-                     self.journal, self.root / RULE_JOURNAL, self.root / HC_JOURNAL,
+                     self.journal, self.root / RULE_JOURNAL, self.root / RULE_SECOND_JOURNAL,
+                     self.root / HC_JOURNAL,
                      self.root / _PREVIOUS, self.root / check.JOURNAL)
         if not output.is_absolute() or any(output.resolve() == path.resolve() for path in protected):
             raise ValueError("proof output must be a distinct absolute path")

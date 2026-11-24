@@ -1,4 +1,4 @@
-"""Journal one enable/disable cycle for a published Demo 3 native rule."""
+"""Journal up to two explicitly selected cycles for a published Demo 3 native rule."""
 
 import argparse
 import base64
@@ -18,11 +18,16 @@ _SKILL = "activator-cli"
 
 
 class NativeRule:
-    def __init__(self, publisher):
+    def __init__(self, publisher, *, cycle=1):
+        if type(cycle) is not int or cycle not in (1, 2):
+            raise ValueError("Only rule cycles 1 and 2 are supported.")
         self.publisher = publisher
         self.api = publisher.api
         self.graph = publisher.graph
-        self.journal = publisher.root / binding.RULE_JOURNAL
+        self.cycle = cycle
+        self.predecessor = publisher.root / binding.RULE_JOURNAL
+        self.journal = publisher.root / (binding.RULE_JOURNAL if cycle == 1
+                                          else binding.RULE_SECOND_JOURNAL)
 
     def _binding_hash(self):
         return check.config_sha256(self.publisher._published())
@@ -35,8 +40,7 @@ class NativeRule:
         if running is not enabled:
             raise CandidateBlocked("Native rule is not in the expected state.")
 
-    def _state(self, fingerprint):
-        state = _load_json(self.journal)
+    def _validate_state(self, state, fingerprint):
         actions = state.get("actions")
         if (state.get("binding_sha256") != fingerprint
                 or not isinstance(state.get("proof_sha256"), str)
@@ -53,6 +57,24 @@ class NativeRule:
                 if record.get("http") not in (200, 202) or not record.get("confirmed_at_utc"):
                     raise CandidateBlocked("Confirmed rule update is missing a receipt.")
                 self._operation(record)
+        return state
+
+    def _predecessor_hash(self, fingerprint):
+        raw = binding._bytes(self.predecessor)
+        previous = self._validate_state(binding._json_bytes(raw), fingerprint)
+        if (previous["actions"].get("enable", {}).get("status") != "confirmed-readback"
+                or previous["actions"].get("disable", {}).get("status") != "confirmed-readback"):
+            raise CandidateBlocked("First rule cycle must have confirmed enable and disable.")
+        return binding._sha(raw)
+
+    def _assert_predecessor(self, state, fingerprint):
+        if self.cycle == 2 and (state.get("previous_journal") != binding.RULE_JOURNAL
+                                or state.get("previous_journal_sha256") != self._predecessor_hash(fingerprint)):
+            raise CandidateBlocked("First rule-cycle journal changed; reconcile manually.")
+
+    def _state(self, fingerprint):
+        state = self._validate_state(_load_json(self.journal), fingerprint)
+        self._assert_predecessor(state, fingerprint)
         return state
 
     @staticmethod
@@ -73,6 +95,7 @@ class NativeRule:
         self._readback(action == "enable")
         if self._binding_hash() != state["binding_sha256"]:
             raise CandidateBlocked("Native binding changed since the rule intent.")
+        self._assert_predecessor(state, state["binding_sha256"])
         record.update(status="confirmed-readback", confirmed_at_utc=binding._utc())
         binding._save(self.journal, state)
 
@@ -95,6 +118,9 @@ class NativeRule:
                     raise ValueError("Enable requires an absolute confirmed proof path.")
                 proof_sha = self._verify_proof(proof_path)
                 state = {"binding_sha256": fingerprint, "proof_sha256": proof_sha, "actions": {}}
+                if self.cycle == 2:
+                    state.update(previous_journal=binding.RULE_JOURNAL,
+                                 previous_journal_sha256=self._predecessor_hash(fingerprint))
             else:
                 state = self._state(fingerprint)
                 if "disable" in state["actions"] or state["actions"]["enable"]["status"] != "confirmed-readback":
@@ -102,6 +128,7 @@ class NativeRule:
             self._readback(not enabled)
             if self._binding_hash() != fingerprint:
                 raise CandidateBlocked("Native binding changed before the rule update.")
+            self._assert_predecessor(state, fingerprint)
             graph = copy.deepcopy(self.graph)
             for entity in graph:
                 definition = entity.get("payload", {}).get("definition", {})
@@ -153,6 +180,7 @@ def main(argv=None):
     for arg in ("candidate", "native-config", "previous-config", "state-dir"):
         parser.add_argument("--" + arg, required=True, type=Path)
     parser.add_argument("--proof", type=Path)
+    parser.add_argument("--cycle", type=int, choices=(1, 2), default=1)
     parser.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
     if args.mode in ("enable", "disable") and not args.yes:
@@ -161,7 +189,7 @@ def main(argv=None):
         parser.error("--proof is required only for enable")
     api = FabricControl.from_cli(check.TENANT, timeout=120)
     rule = NativeRule(binding.NativeBinding(args.state_dir, args.candidate, args.native_config,
-                                            args.previous_config, api))
+                                            args.previous_config, api), cycle=args.cycle)
     if args.mode == "drain":
         result = rule.drain()
     else:

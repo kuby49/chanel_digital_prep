@@ -270,9 +270,14 @@ python native_rule.py --mode drain @inputs
 Here `@inputs` is a PowerShell array containing `--candidate`, `--native-config`,
 `--previous-config`, and `--state-dir`, each followed by its absolute path.
 Enable checks the proof against fresh stopped readback and changes only
-`Copy sales file`. The separate `demo3-native-rule-state.json` permits **one**
-enable/disable cycle; leave the rule enabled across recurring launches until
-it is time to stop it. Do not reset the journal to repeat a cycle. On an
+`Copy sales file`. The separate `demo3-native-rule-state.json` records the
+first enable/disable cycle; leave the rule enabled across recurring launches
+until it is time to stop it. After confirmed disable and coordinated shutdown,
+a separately authorized second cycle can use `--cycle 2` with each of the
+same commands. Its separate journal pins the unchanged first journal, requires
+confirmed first-cycle enable and disable, and rechecks the stopped graph and
+fresh proof before re-enabling. This does not establish that the event queue
+has drained; do not reset either journal or attempt a third cycle. On an
 interrupted update run `--mode reconcile @inputs` only: it uses the recorded
 operation ID and Location and never resubmits. If acceptance is unknown,
 stop and reconcile with the operator; neither a second submission nor a

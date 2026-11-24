@@ -11,9 +11,19 @@ remain incomplete. The older prepared profile is single-use and requires a
 separately started monitor. No coordinated 10-file run has been verified.
 The first default-run attempt on 2026-11-24 failed at the pipeline level with
 `BadRequest`; no activity or notebook child was observed. This absence is not
-proof that no child existed. Reconcile the exact attempt and any owned work
-before another measured launch. Subsequent local runtime pagination and
-bodyless-request fixes have not yet been published to the Fabric notebook.
+proof that no child existed. Before another measured launch, establish current
+non-interference from that attempt and any owned work; a capacity restart alone
+does not establish it. The disabled Demo 1 schedule and its insufficient
+remaining coverage block a newly starting old child from producing sales, but
+that child can acquire the shared
+producer lock and start Demo 2 verification and monitoring before Demo 1
+admission. Reusing the same producer or target resources therefore requires
+additional fencing or isolation. A possible fence is a distinct staging
+Lakehouse for the new producer and an exclusively created, retained lock in
+the old staging Lakehouse, after reconciling existing work; this has not been
+installed. Already admitted Copy and queued ingestion work must also be
+reconciled or isolated. Subsequent local runtime pagination and bodyless-request
+fixes have not yet been published to the Fabric notebook.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
 run requires a separately confirmed schedule and updated profile.
 The first-cycle Demo 3 rule was also disabled and read back. A requested

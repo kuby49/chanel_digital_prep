@@ -30,7 +30,7 @@ def build_pipeline(workspace_id, lakehouse_id, connection_id, notebook_id, copy_
                        "secureInput": True},
             "typeProperties": {
                 "workspaceId": workspace_id, "notebookId": notebook_id,
-                "sessionTag": "demo3-guarded-copy",
+                "sessionTag": "demo3_guarded_copy",
                 "parameters": {
                     "phase": {"value": phase, "type": "string"},
                     "job_id": {"value": _expr("@pipeline().RunId"), "type": "string"},

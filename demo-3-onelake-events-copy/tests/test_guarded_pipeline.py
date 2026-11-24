@@ -43,6 +43,7 @@ class GuardedPipelineTests(unittest.TestCase):
                          {"type": "Expression", "value": "@json(activity('PrepareCopy').output.result.exitValue).filename"})
         self.assertEqual(verify["dependsOn"], [{"activity": "CopyEventFile", "dependencyConditions": ["Succeeded"]}])
         self.assertEqual(prepare["typeProperties"]["sessionTag"], verify["typeProperties"]["sessionTag"])
+        self.assertRegex(prepare["typeProperties"]["sessionTag"], r"^[A-Za-z0-9_]+$")
         activity["typeProperties"]["sink"]["upsertSettings"]["keys"] = ["SalesLineID"]
         with self.assertRaisesRegex(ValueError, "BatchID"):
             build_pipeline(workspace, lakehouse, connection, notebook, activity)

@@ -214,7 +214,7 @@ def monitor_config(config):
     return f"{root}/{config['data']['run_id']}/manifest.json", duration
 
 
-def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, selected):
+def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, selected, check_monitor=False):
     phases = {}
     resolved = copy.deepcopy(config)
     shared = resolved.get("shared")
@@ -241,7 +241,7 @@ def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, sel
         else:
             for key in keys:
                 shared[key] = str(uuid.UUID(shared[key]))
-        if "demo-2" in selected:
+        if check_monitor and "demo-2" in selected:
             monitor_config(resolved)
         effective_path = invocation_dir / "effective-config.json"
         effective_path.write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
@@ -430,11 +430,19 @@ def main(argv=None):
             config_path = invocation_dir / "input-config.json"
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
             tracks = args.selector + (["shared"] if args.mode != "cleanup" or len(args.selector) == 3 else [])
-            phases = {args.mode: run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
-                                           timeout, args.selector, concurrency, args.yes)}
-            if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
+            phases = {}
+            if args.mode == "validate-only":
                 resolution_phases, effective_config, effective_path = effective_run_config(
                     config, prefix, state_dir, invocation_dir, timeout, args.selector)
+                phases.update(resolution_phases)
+                if effective_config is not None:
+                    config = effective_config
+                    config_path = effective_path
+            phases[args.mode] = run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
+                                          timeout, args.selector, concurrency, args.yes)
+            if args.run_data and all(item["status"] == "pass" for item in phases["deploy"].values()):
+                resolution_phases, effective_config, effective_path = effective_run_config(
+                    config, prefix, state_dir, invocation_dir, timeout, args.selector, check_monitor=True)
                 phases.update(resolution_phases)
                 if effective_config is not None:
                     config = effective_config

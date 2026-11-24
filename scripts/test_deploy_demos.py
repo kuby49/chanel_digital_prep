@@ -339,6 +339,28 @@ class OrchestrationTests(unittest.TestCase):
         self.assertNotIn("start-monitor", [event["mode"] for event in events])
         self.assertNotIn("run-data", summary["phases"])
 
+    def test_validate_only_resolves_missing_ids_without_requiring_run_id(self):
+        self.config["shared"]["workspace_id"] = None
+        self.config["data"]["run_id"] = None
+        code, summary, events = self.run_cli("demo-2", "--validate-only")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["phases"]["resolve-candidate-ids"]["shared"]["status"], "pass")
+        validations = [event for event in events if event["mode"] == "validate-only"]
+        self.assertEqual(len(validations), 2)
+        self.assertEqual(len({event["config_path"] for event in validations}), 1)
+        self.assertTrue(all(event["shared"]["workspace_id"] == "11111111-1111-4111-8111-111111111111"
+                            for event in validations))
+        self.assertNotIn("start-monitor", [event["mode"] for event in events])
+
+    def test_validate_only_resolution_failure_reports_other_track_results_but_fails(self):
+        self.config["shared"]["workspace_id"] = None
+        self.config["behavior"] = {"shared:resolve-candidate-ids": {"status": "blocked", "ready": False}}
+        code, summary, events = self.run_cli("demo-1", "--validate-only")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["phases"]["resolve-candidate-ids"]["shared"]["status"], "blocked")
+        self.assertEqual(set(summary["phases"]["validate-only"]), {"demo-1", "shared"})
+        self.assertEqual({event["mode"] for event in events}, {"resolve-candidate-ids", "validate-only"})
+
     def test_failed_monitor_start_attempts_stop_and_blocks_producer(self):
         self.config["behavior"] = {"demo-2:start-monitor": {"status": "blocked", "ready": False}}
         code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")

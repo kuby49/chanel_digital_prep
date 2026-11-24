@@ -154,6 +154,35 @@ enable anything or require a future manifest/file, SQL synchronization or live
 delivery. `ready:true` means admission to this bounded customer demonstration
 only, not general deployment or completion of the acceptance run.
 
+The first attempt was enabled and safely stopped after the common producer
+blocked before submission; its journal must not be reset or reused. The only
+additional approved attempt is `customer_demo_20261124_dc2792654b5b`, with the
+same generation parameters and resources. Keep the original state directory,
+ownership and proof files; set `data.run_id` to that value and
+`demo-3.customer_binding_journal` to
+`demo3-customer-customer_demo_20261124_dc2792654b5b-binding-state.json`.
+No arbitrary run or journal path is admitted.
+
+Create that fresh journal exclusively only when performing the coordinated
+rebind, preserving the old definitions and predecessor journal. It must include
+`config_sha256` for the final complete common config, `previous_journal` naming
+`demo3-customer-binding-state.json`, and `previous_journal_sha256`. Both hashes
+use UTF-8 JSON with sorted keys, separators `(",", ":")`, `ensure_ascii=False`,
+and `allow_nan=False`, without a trailing newline. The predecessor must retain
+its confirmed disabled/terminal/lock-absent result. The validator checks the
+new run, full config hash, preserved predecessor and current definitions.
+Changing any common config field after binding requires explicit reconciliation,
+not overwriting the journal. Historical dimension/access proofs are not new
+delivery evidence.
+
+Before that rebind, a stopped read-only preparation check can verify the exact
+old notebook/rule, terminal owned jobs, absent writer lock, and absent new
+source/audit/staging-manifest paths, but it cannot report `ready:true` for the
+new run. The guard must subsequently be rebound and read back for the new run,
+and the Activator must get a new source/filter graph that remains disabled.
+Enable only after the new run's stopped admission passes and the coordinator
+provides a fresh deadline and all-paths signal.
+
 The owned SQL endpoint's `dbo.factsales` visibility was restored with one
 targeted `refreshMetadata` call using `recreateTables:false`: SQL subsequently
 returned the three bootstrap facts totaling 116125 minor units. No tables or

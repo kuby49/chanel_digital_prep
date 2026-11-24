@@ -30,7 +30,12 @@ class CustomerPreflightTests(unittest.TestCase):
                 "lakehouse_id": preflight.LAKEHOUSE, "lakehouse_name": preflight.HOUSE_NAME,
                 "destination_table": "dbo.factsales", "landing_path": "Files/incoming/sales",
             },
-            "data": {"max_duration_seconds": 1800, "currency": "USD"},
+            "data": {
+                "run_id": preflight.RUN["run_id"], "seed": 42, "start_date": "2026-01-01",
+                "date_count": 365, "product_count": 20, "customer_count": 100,
+                "file_count": 1, "rows_per_file": 10, "interval_seconds": 60,
+                "max_duration_seconds": 1800, "currency": "USD",
+            },
             "shared": {
                 "workspace_id": preflight.STAGING_WORKSPACE,
                 "staging_lakehouse_id": preflight.STAGING_LAKEHOUSE,
@@ -145,6 +150,96 @@ class CustomerPreflightTests(unittest.TestCase):
             journal.write_text('{"original":true}')
             self.assertEqual(deploy.main([
                 "--mode", "validate-only", "--config", str(config), "--prefix", "chanel",
+                "--state-dir", str(folder), "--result", str(journal),
+            ]), 1)
+            self.assertEqual(journal.read_text(), '{"original":true}')
+
+    def test_fresh_run_requires_its_exact_distinct_journal_and_hash(self):
+        config = copy.deepcopy(self.config)
+        config["data"]["run_id"] = preflight.FRESH_RUN_ID
+        expected = "demo3-customer-" + preflight.FRESH_RUN_ID + "-binding-state.json"
+        with self.assertRaisesRegex(deploy.CandidateBlocked, "run-specific basename"):
+            preflight.binding_journal(config)
+        config["demo-3"]["customer_binding_journal"] = expected
+        self.assertEqual(preflight.binding_journal(config), expected)
+        self.assertNotEqual(expected, preflight.JOURNAL)
+        self.assertEqual(preflight.customer_run(config), {**preflight.RUN, "run_id": preflight.FRESH_RUN_ID})
+        for invalid in ("..\\" + expected, str(Path.cwd() / expected), preflight.JOURNAL):
+            config["demo-3"]["customer_binding_journal"] = invalid
+            with self.subTest(path=invalid), self.assertRaises(deploy.CandidateBlocked):
+                preflight.binding_journal(config)
+        config["demo-3"]["customer_binding_journal"] = expected
+        state = {
+            "workspace_id": preflight.WORKSPACE, "lakehouse_id": preflight.LAKEHOUSE,
+            "guard_notebook_id": preflight.NOTEBOOK, "pipeline_id": preflight.PIPELINE,
+            "reflex_id": preflight.REFLEX, "producer_workspace_id": preflight.STAGING_WORKSPACE,
+            "producer_lakehouse_id": preflight.STAGING_LAKEHOUSE,
+            "generator_sha256": preflight.GENERATOR_SHA, "run_config": preflight.customer_run(config),
+            "actions": {key: {"status": "confirmed-readback"} for key in ("guard_update", "activator_update")},
+            "config_sha256": "wrong-hash",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / expected).write_text(json.dumps(state))
+            api = mock.Mock()
+            with self.assertRaisesRegex(deploy.CandidateBlocked, "config hash"):
+                preflight.validate(config, "chanel", root, api=api)
+            self.assertEqual(api.method_calls, [])
+
+    def test_fresh_run_requires_preserved_stopped_predecessor(self):
+        config = copy.deepcopy(self.config)
+        config["data"]["run_id"] = preflight.FRESH_RUN_ID
+        name = "demo3-customer-" + preflight.FRESH_RUN_ID + "-binding-state.json"
+        config["demo-3"]["customer_binding_journal"] = name
+        previous = {"actions": {"disable": {"status": "confirmed-readback"}},
+                    "runtime_stop": "rule-disabled-jobs-terminal-lock-absent"}
+        state = {
+            "workspace_id": preflight.WORKSPACE, "lakehouse_id": preflight.LAKEHOUSE,
+            "guard_notebook_id": preflight.NOTEBOOK, "pipeline_id": preflight.PIPELINE,
+            "reflex_id": preflight.REFLEX, "producer_workspace_id": preflight.STAGING_WORKSPACE,
+            "producer_lakehouse_id": preflight.STAGING_LAKEHOUSE,
+            "generator_sha256": preflight.GENERATOR_SHA, "run_config": preflight.customer_run(config),
+            "actions": {key: {"status": "confirmed-readback"} for key in ("guard_update", "activator_update")},
+            "config_sha256": preflight.config_sha256(config),
+            "previous_journal": preflight.JOURNAL,
+            "previous_journal_sha256": preflight.config_sha256(previous),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_path = root / preflight.JOURNAL
+            old_path.write_text(json.dumps(previous))
+            (root / name).write_text(json.dumps(state))
+            with mock.patch.object(preflight, "_producer", side_effect=deploy.CandidateBlocked("passed lineage gate")):
+                with self.assertRaisesRegex(deploy.CandidateBlocked, "passed lineage gate"):
+                    preflight.validate(config, "chanel", root)
+                previous["runtime_stop"] = "changed"
+                old_path.write_text(json.dumps(previous))
+                with self.assertRaisesRegex(deploy.CandidateBlocked, "preserved and safely stopped"):
+                    preflight.validate(config, "chanel", root)
+
+    def test_config_hash_is_canonical_and_unknown_runs_remain_blocked(self):
+        self.assertEqual(preflight.config_sha256({"b": 2, "a": "x"}),
+                         preflight.config_sha256({"a": "x", "b": 2}))
+        self.assertNotEqual(preflight.config_sha256(self.config),
+                            preflight.config_sha256({**self.config, "changed": True}))
+        config = copy.deepcopy(self.config)
+        config["data"]["run_id"] = "unapproved"
+        with self.assertRaisesRegex(deploy.CandidateBlocked, "not explicitly approved"):
+            preflight.customer_run(config)
+
+    def test_result_cannot_overwrite_selected_fresh_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            config = copy.deepcopy(self.config)
+            config["data"]["run_id"] = preflight.FRESH_RUN_ID
+            name = "demo3-customer-" + preflight.FRESH_RUN_ID + "-binding-state.json"
+            config["demo-3"]["customer_binding_journal"] = name
+            path = folder / "config.json"
+            path.write_text(json.dumps(config))
+            journal = folder / name
+            journal.write_text('{"original":true}')
+            self.assertEqual(deploy.main([
+                "--mode", "validate-only", "--config", str(path), "--prefix", "chanel",
                 "--state-dir", str(folder), "--result", str(journal),
             ]), 1)
             self.assertEqual(journal.read_text(), '{"original":true}')

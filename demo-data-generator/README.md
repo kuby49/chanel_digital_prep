@@ -13,6 +13,115 @@ for new data. Every manifest records contract version 1 and a fixed batch class
 (`measured`, `bootstrap`, or `negative-test`). Classification alone does not
 create malformed data.
 
+## SalesLineID reservations
+
+`SalesLineID` is a positive signed BIGINT and the logical fact key across
+retained runs, not merely within one run. Every run, including producer-created
+bootstrap runs, must reserve its full inclusive range before staging or delivery.
+`batch_bytes()` alone only calculates candidate bytes; it does not reserve keys.
+
+The Fabric registry is the single deployment-scoped object at
+`https://onelake.blob.fabric.microsoft.com/<producer-workspace-id>/<staging-lakehouse-id>/Files/producer/allocations/sales-line-id-v1.json`.
+Its exact v1 shape is:
+
+```json
+{
+  "version": 1,
+  "scope": {
+    "version": 1,
+    "kind": "fabric",
+    "owner": "chanel_digital_prep/demo-data-generator",
+    "tenant_id": "<canonical-uuid>",
+    "producer_workspace_id": "<canonical-uuid>",
+    "staging_lakehouse_id": "<canonical-uuid>"
+  },
+  "allocator_id": "<sha256>",
+  "target_bindings": {
+    "demo-2": {"workspace_id": "<canonical-uuid>", "item_id": "<canonical-uuid>", "fact": "FactSales"}
+  },
+  "retained_ranges": [{"source": "<inventory-identifier>", "start": "1", "end": "5"}],
+  "reservations": {
+    "<run-id>": {
+      "reservation": {
+        "version": 1, "allocator_id": "<sha256>", "run_id": "<run-id>", "batch_class": "measured",
+        "start": "<decimal>", "end": "<decimal>", "count": "<decimal>",
+        "generator_sha256": "<sha256>", "fingerprint": "<sha256>"
+      },
+      "binding": {
+        "config": {
+          "run_id": "<run-id>", "batch_class": "measured", "start_date": "2024-01-01", "seed": 42,
+          "date_count": 365, "products": 20, "customers": 100, "file_count": 10,
+          "rows_per_file": 1000, "interval_seconds": 60
+        },
+        "selected_demos": ["demo-2"],
+        "targets": {
+          "demo-2": {"workspace_id": "<canonical-uuid>", "item_id": "<canonical-uuid>", "fact": "FactSales"}
+        },
+        "generator_sha256": "<sha256>"
+      }
+    }
+  },
+  "integrity_sha256": "<sha256>"
+}
+```
+
+The manifest adds `sales_line_id_reservation`, exactly equal to its registry
+record's `reservation`. The `config` is `dataclasses.asdict(RunConfig(...))`;
+external `product_count` and `customer_count` map to `products` and
+`customers`. Start, end and count are canonical decimal strings; a reservation
+has `count = file_count * rows_per_file` and `end = start + count - 1`.
+Existing retained ranges can include signed BIGINT values and must be a
+non-overlapping union across all retained destinations.
+
+For each logical run, `start` is `1 + int.from_bytes(SHA256(
+b"chanel-sales-line-id-v1\0" + run_id.encode("ascii")), "big") %
+(9223372036854775807 - count + 1)`. It is only a candidate: the registry
+rejects collisions and overflow rather than assuming a hash is unique. All
+batches use consecutive IDs within the reserved range.
+
+All hashes are lowercase SHA-256 hex. Canonical JSON means UTF-8 bytes from
+`json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+allow_nan=False)` with no trailing newline. `allocator_id` hashes `scope`;
+`fingerprint` hashes `{"allocator_id": allocator_id, "binding": binding}`;
+`integrity_sha256` hashes the entire registry excluding that field. Registry
+storage is canonical JSON plus one LF. `generator_sha256` hashes `generator.py`
+after strict UTF-8 decoding and replacing CRLF and lone CR with LF, with no
+other normalization. A process refuses staging if that source changed after it
+was imported.
+
+The allocator validates the registry and checks the selected target bindings,
+retained ranges and all prior reservations. A separate exclusive
+`Files/producer/allocations/sales-line-id-v1.lock` serializes Fabric producer
+runs; its bytes and ETag are rechecked before staging or a manifest transition.
+The allocator conditionally replaces the
+registry using its ETag, retries definite conflicts, and reads back the exact
+record after a successful or ambiguous write. A rejected conditional operation
+is never treated as success. Ambiguous writes retain the allocator and affected
+run locks;
+missing or corrupt registries, mismatched bindings, a manifest without its
+reservation, and a reservation without its manifest all require explicit
+reconciliation. If conditional enforcement is rejected or uncertain, halt all
+writers and reconcile the entire registry against retained facts before
+restarting. A checksum is not an ownership signature.
+
+The scope remains stable when a subset of demos is selected. Adding a target
+requires a separately authorized onboarding process that preserves existing
+bindings, inventories all retained facts under quiesced writers, updates the
+same registry conditionally, and proves no other allocator or writer can bypass
+it. This process, runtime target-to-adapter identity and fresh authorization
+are **not yet implemented or verified**. No live registry has been initialized.
+The previously observed Demo 2 bootstrap had IDs 1–5; its point-in-time inventory
+alone does not establish a safe baseline. Demo 1's header-only bootstrap had no
+keys. The independent verifier must read the authoritative registry, compare
+scope, binding and manifest, verify IDs fall in range and check other retained
+fact batches for collisions.
+
+Local staging uses a separate root-scoped `.sales-line-id-v1.json` registry and
+an exclusive `.sales-line-id-v1.lock`; it is not the Fabric authority. Local
+registry writes use file synchronization and atomic replacement, with directory
+synchronization on non-Windows systems. Power-loss durability on Windows and
+concurrent external writers have not been established.
+
 ## Staging and delivery
 
 `stage_batch` and `runner.run_batches` are local single-writer primitives.
@@ -66,6 +175,19 @@ pinned `environment.yml`, and refuses to adopt unknown resources or retry an
 ambiguous creation. `validate-only` performs readbacks but still reports
 blocked while readiness is incomplete. `cleanup` and `run-data` are blocked;
 the notebook independently refuses `run-data`. No measured run is enabled.
+
+For a fresh deployment, `deploy.py --mode resolve-candidate-ids` accepts the
+normal v1 arguments, reads and validates the owned `shared-producer-v1.json`
+journal under its lock, and atomically creates
+`shared-producer-candidate-ids.json` beside the per-invocation `--result` file.
+The sidecar contains only `version`, `workspace_id` and
+`staging_lakehouse_id`; an existing sidecar is never overwritten. The mode
+rejects pending, missing or mismatched state and does not change `config`.
+Consume the sidecar only when this invocation's result says `pass`. These IDs
+are candidates for an orchestrator-owned effective configuration, not evidence
+of live ownership, permission or readiness; fresh producer and
+selected-destination readbacks are still required. This mode does not adopt the
+legacy MCAP manifest.
 
 The isolated MCAP producer workspace, staging Lakehouse, notebook, pipeline and
 published Environment are recorded in `deployment-mcap.json`. A no-sales

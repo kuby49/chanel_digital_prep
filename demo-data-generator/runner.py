@@ -1,6 +1,5 @@
 """Cooperative bounded runner for injected delivery adapters; not wired to Fabric."""
 
-import json
 import os
 import time
 from dataclasses import dataclass
@@ -9,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from delivery import begin_submission, record_submission
-from generator import _atomic_json, initialize_run, stage_batch
+from generator import _atomic_json, initialize_run, stage_batch, strict_json_loads
 
 
 @dataclass(frozen=True)
@@ -94,7 +93,7 @@ def _run_batches_locked(root, config, adapters, max_duration_seconds, max_attemp
                 errors.append("deadline reached before next batch")
                 break
             starts[key] = clock().isoformat()
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = strict_json_loads(manifest_path.read_text(encoding="utf-8"))
             manifest["scheduler"] = scheduler
             _atomic_json(manifest_path, manifest)
         if clock() >= deadline:
@@ -103,7 +102,7 @@ def _run_batches_locked(root, config, adapters, max_duration_seconds, max_attemp
         stage_batch(root, config, batch_number, list(adapters))
         for destination, adapter in adapters.items():
             while True:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = strict_json_loads(manifest_path.read_text(encoding="utf-8"))
                 delivery = manifest["batches"][key]["deliveries"][destination]
                 status = delivery["status"]
                 if status in ("submitted", "verified"):
@@ -133,6 +132,6 @@ def _run_batches_locked(root, config, adapters, max_duration_seconds, max_attemp
                 if clock() >= deadline:
                     errors.append(f"{destination} batch {batch_number}: deadline reached during submission")
                     break
-    final = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    final = strict_json_loads(Path(manifest_path).read_text(encoding="utf-8"))
     return {"submitted": not errors and len(final["batches"]) == config.file_count,
             "errors": errors, "deadline_utc": deadline.isoformat()}

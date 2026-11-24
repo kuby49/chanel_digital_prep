@@ -1,11 +1,11 @@
 """Persisted, fail-closed delivery transitions for a single-writer run."""
 
 import hashlib
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from generator import RunConfig, _atomic_json
+from generator import RunConfig, _atomic_json, batch_bytes, batch_metadata_matches, strict_json_loads
+from sales_ids import canonical_bytes, local_reservation
 
 
 def _load(root, run_id, batch_number, destination):
@@ -13,16 +13,24 @@ def _load(root, run_id, batch_number, destination):
     if not isinstance(batch_number, int) or isinstance(batch_number, bool) or batch_number < 1:
         raise ValueError("batch_number must be a positive integer")
     path = Path(root) / run_id / "manifest.json"
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("contract_version") != 1 or manifest.get("run_id") != run_id:
+    manifest = strict_json_loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(manifest, dict) or type(manifest.get("contract_version")) is not int
+            or manifest["contract_version"] != 1 or manifest.get("run_id") != run_id):
         raise ValueError("manifest identity or version mismatch")
+    config = RunConfig(**manifest["config"])
+    if config.run_id != run_id:
+        raise ValueError("manifest configuration has a different run ID")
+    reservation = local_reservation(root, config, manifest["destinations"], require_existing=True)
+    if canonical_bytes(manifest.get("sales_line_id_reservation")) != canonical_bytes(reservation):
+        raise RuntimeError("run manifest reservation differs from the allocator")
     batch = manifest["batches"][str(batch_number)]
-    if batch["filename"] != f"sales_{run_id}_{batch_number:04d}.csv":
-        raise ValueError("manifest filename does not match batch identity")
+    _, expected = batch_bytes(config, batch_number)
+    if not batch_metadata_matches(batch, expected):
+        raise ValueError("manifest batch metadata differs from deterministic input")
     if destination not in batch["deliveries"]:
         raise ValueError("destination is not selected for this run")
     staged = path.parent / batch["filename"]
-    if not staged.is_file() or hashlib.sha256(staged.read_bytes()).hexdigest() != batch["sha256"]:
+    if not staged.is_file() or hashlib.sha256(staged.read_bytes()).hexdigest() != expected["sha256"]:
         raise RuntimeError("staged batch missing or corrupt")
     return path, manifest, batch, batch["deliveries"][destination]
 

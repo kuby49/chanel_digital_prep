@@ -5,6 +5,21 @@ from urllib.error import HTTPError
 from fabric_ledger import FabricLedger
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import RunConfig
+from sales_ids import LOCK_PATH, OWNER, REGISTRY_PATH, registry_bytes
+
+
+TEST_SCOPE = {"version": 1, "kind": "fabric", "owner": OWNER,
+              "tenant_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+              "producer_workspace_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              "staging_lakehouse_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+TEST_TARGETS = {
+    "demo-1": {"workspace_id": "11111111-1111-4111-8111-111111111111",
+               "item_id": "44444444-4444-4444-8444-444444444444", "fact": "silver.fact"},
+    "demo-2": {"workspace_id": "22222222-2222-4222-8222-222222222222",
+               "item_id": "55555555-5555-4555-8555-555555555555", "fact": "FactSales"},
+    "demo-3": {"workspace_id": "33333333-3333-4333-8333-333333333333",
+               "item_id": "66666666-6666-4666-8666-666666666666", "fact": "FactSales"},
+}
 
 
 class StorageResponse:
@@ -65,6 +80,8 @@ class MemoryStore:
         self.files = {}
         self.version = 0
         self.unknown_create_suffix = None
+        self.workspace_id = TEST_SCOPE["producer_workspace_id"]
+        self.lakehouse_id = TEST_SCOPE["staging_lakehouse_id"]
 
     def _etag(self):
         self.version += 1
@@ -98,18 +115,29 @@ class MemoryStore:
         del self.files[path]
 
 
+def initialized_store(store=None, retained=None):
+    store = store or MemoryStore()
+    store.create(REGISTRY_PATH, registry_bytes(TEST_SCOPE, TEST_TARGETS, retained or []))
+    return store
+
+
+def ledger_for(store, config, destinations):
+    return FabricLedger(store, config, destinations, allocator_scope=TEST_SCOPE,
+                        selected_targets={name: TEST_TARGETS[name] for name in destinations})
+
+
 class FabricLedgerTests(unittest.TestCase):
     def setUp(self):
-        self.store = MemoryStore()
+        self.store = initialized_store()
         self.config = RunConfig("run-1", file_count=1, rows_per_file=3)
 
     def test_resume_reconciles_without_resubmitting_and_checks_evidence(self):
-        with FabricLedger(self.store, self.config, ["demo-2"]) as ledger:
+        with ledger_for(self.store, self.config, ["demo-2"]) as ledger:
             batch = ledger.stage_batch(1)
             request = ledger.begin_submission(1, "demo-2", 2)
             self.assertEqual(request["sha256"], batch["sha256"])
             ledger.record_submission(1, "demo-2", "unknown", diagnostic="response lost")
-        with FabricLedger(self.store, self.config, ["demo-2"]) as resumed:
+        with ledger_for(self.store, self.config, ["demo-2"]) as resumed:
             self.assertEqual(resumed.stage_batch(1)["sha256"], batch["sha256"])
             with self.assertRaises(RuntimeError):
                 resumed.begin_submission(1, "demo-2", 2)
@@ -119,7 +147,7 @@ class FabricLedgerTests(unittest.TestCase):
 
     def test_eventhouse_verification_requires_matching_terminal_source(self):
         source_id = "9eebc93c-a700-4f87-91b7-a1471c389aa1"
-        with FabricLedger(self.store, self.config, ["demo-2"]) as ledger:
+        with ledger_for(self.store, self.config, ["demo-2"]) as ledger:
             batch = ledger.stage_batch(1)
             ledger.begin_submission(1, "demo-2", 1)
             ledger.record_submission(1, "demo-2", "submitted", source_id)
@@ -151,16 +179,17 @@ class FabricLedgerTests(unittest.TestCase):
     def test_lost_staging_response_retains_lock_and_recovers_exact_bytes(self):
         self.store.unknown_create_suffix = ".csv"
         with self.assertRaises(StorageOutcomeUnknown):
-            with FabricLedger(self.store, self.config, ["demo-1"]) as ledger:
+            with ledger_for(self.store, self.config, ["demo-1"]) as ledger:
                 ledger.stage_batch(1)
         lock = "Files/producer/runs/run-1/writer.lock"
         self.assertIn(lock, self.store.files)
         with self.assertRaisesRegex(RuntimeError, "locked"):
-            with FabricLedger(self.store, self.config, ["demo-1"]):
+            with ledger_for(self.store, self.config, ["demo-1"]):
                 pass
         # An operator may release the exact lock only after confirming the old writer stopped.
         self.store.delete(lock, self.store.files[lock][1])
-        with FabricLedger(self.store, self.config, ["demo-1"]) as recovered:
+        self.store.delete(LOCK_PATH, self.store.files[LOCK_PATH][1])
+        with ledger_for(self.store, self.config, ["demo-1"]) as recovered:
             entry = recovered.stage_batch(1)
             self.assertEqual(entry["row_count"], 3)
             self.assertEqual(recovered.staged_bytes(1).count(b"\n"), 4)
@@ -168,20 +197,21 @@ class FabricLedgerTests(unittest.TestCase):
     def test_stale_manifest_and_config_mismatch_fail_closed(self):
         lock = "Files/producer/runs/run-1/writer.lock"
         with self.assertRaises(StorageConflict):
-            with FabricLedger(self.store, self.config, ["demo-3"]) as ledger:
+            with ledger_for(self.store, self.config, ["demo-3"]) as ledger:
                 path = ledger.manifest_path
                 original, etag = self.store.read(path)
                 self.store.replace(path, original, etag)
                 ledger.stage_batch(1)
         self.assertIn(lock, self.store.files)
         self.store.delete(lock, self.store.files[lock][1])
+        self.store.delete(LOCK_PATH, self.store.files[LOCK_PATH][1])
         with self.assertRaises(ValueError):
-            with FabricLedger(self.store, RunConfig("run-1", rows_per_file=4), ["demo-3"]):
+            with ledger_for(self.store, RunConfig("run-1", rows_per_file=4), ["demo-3"]):
                 pass
         self.assertNotIn(lock, self.store.files)
 
     def test_failed_verification_is_persisted_and_cannot_be_retried(self):
-        with FabricLedger(self.store, self.config, ["demo-2"]) as ledger:
+        with ledger_for(self.store, self.config, ["demo-2"]) as ledger:
             ledger.stage_batch(1)
             ledger.begin_submission(1, "demo-2", 2)
             ledger.record_submission(1, "demo-2", "submitted", "source-id")
@@ -190,12 +220,12 @@ class FabricLedgerTests(unittest.TestCase):
         manifest = json.loads(self.store.read(manifest_path)[0])
         delivery = manifest["batches"]["1"]["deliveries"]["demo-2"]
         self.assertEqual(delivery["status"], "verification_failed")
-        with FabricLedger(self.store, self.config, ["demo-2"]) as ledger:
+        with ledger_for(self.store, self.config, ["demo-2"]) as ledger:
             with self.assertRaises(RuntimeError):
                 ledger.begin_submission(1, "demo-2", 2)
 
     def test_retry_clears_previous_submission_timestamp_and_status(self):
-        with FabricLedger(self.store, self.config, ["demo-2"]) as ledger:
+        with ledger_for(self.store, self.config, ["demo-2"]) as ledger:
             ledger.stage_batch(1)
             ledger.begin_submission(1, "demo-2", 2)
             ledger.record_submission(1, "demo-2", "retryable_failure")

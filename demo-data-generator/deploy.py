@@ -33,7 +33,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib import error, parse, request
 
-from generator import RunConfig
+from generator import RunConfig, strict_json_loads
 
 
 HERE = Path(__file__).resolve().parent
@@ -41,6 +41,7 @@ ENVIRONMENT_YML = HERE / "environment.yml"
 API_ROOT = "https://api.fabric.microsoft.com"
 STATE_NAME = "shared-producer-v1.json"
 LOCK_NAME = ".shared-producer-v1.lock"
+CANDIDATE_NAME = "shared-producer-candidate-ids.json"
 OWNER = "chanel_digital_prep/demo-data-generator"
 MCAP_TENANT_ID = "4526cee1-4399-4e4b-9134-46fabd583527"
 KINDS = ("workspace", "staging_lakehouse", "environment_item", "notebook", "pipeline")
@@ -289,6 +290,31 @@ def _atomic_json(path, value):
             pass
 
 
+def _atomic_new_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sibling = path.with_name(f".{path.name}.{uuid.uuid4().hex}.write")
+    fd = None
+    try:
+        fd = os.open(str(sibling), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+            fd = None
+            json.dump(value, file, indent=2, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.link(sibling, path)
+        if os.name != "nt":
+            directory_fd = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        sibling.unlink(missing_ok=True)
+
+
 class StateStore:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -299,7 +325,7 @@ class StateStore:
         if not self.path.exists():
             return None
         try:
-            state = json.loads(self.path.read_text(encoding="utf-8"))
+            state = strict_json_loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
             raise Blocked("Owned deployment state is unreadable; do not create or adopt resources.") from None
         if not isinstance(state, dict):
@@ -503,6 +529,34 @@ def load_owned_state(store, plan):
     if any(plan["ids"].values()):
         raise Blocked("Configured resource IDs require matching owned deployment state or manifest.")
     return None
+
+
+def resolve_candidate_ids(config, prefix, state_dir, *, candidate_path=None):
+    """Return journal IDs as candidates, not as evidence of live readiness."""
+    plan = parse_config(config, prefix)
+    if any(not plan[field] for field in ("tenant_id", "capacity_id", "identity_id")) or not plan["names"]["workspace"]:
+        raise ContractError("Candidate IDs require tenant, capacity, identity and workspace name.")
+    if not Path(state_dir).is_absolute():
+        raise ContractError("state-dir must be an absolute path.")
+    store = StateStore(state_dir)
+    with store.lock():
+        state = store.read()
+        if state is None:
+            raise Blocked("No owned producer deployment journal exists.")
+        state = validate_state(state, plan)
+        if state.get("pending") is not None:
+            raise Blocked("Producer deployment has a pending operation; reconcile before resolving IDs.")
+        resources = state["resources"]
+        if "workspace" not in resources or "staging_lakehouse" not in resources:
+            raise Blocked("Producer deployment journal does not contain both candidate IDs.")
+        result = {"workspace_id": resources["workspace"]["id"],
+                  "staging_lakehouse_id": resources["staging_lakehouse"]["id"]}
+        if candidate_path is not None:
+            candidate_path = Path(candidate_path)
+            if not candidate_path.is_absolute():
+                raise ContractError("Candidate path must be absolute.")
+            _atomic_new_json(candidate_path, {"version": 1, **result})
+        return result
 
 
 def _token_claims(token):
@@ -1116,7 +1170,7 @@ def _check_assets(plan):
     return spec
 
 
-def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False):
+def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, candidate_path=None):
     plan = parse_config(config, prefix)
     if mode == "cleanup" and not yes:
         raise ContractError("cleanup requires --yes.")
@@ -1127,6 +1181,11 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False):
         return ["Plan only; no resources were changed.",
                 "Plan: verify owned state, tenant, identity, workspace and item readbacks before any reuse.",
                 "Plan: provision only missing owned producer resources, publish the pinned Environment, then verify definitions; data execution and cleanup remain blocked."]
+    if mode == "resolve-candidate-ids":
+        if candidate_path is None:
+            raise ContractError("Candidate output path is required.")
+        resolve_candidate_ids(config, prefix, state_dir, candidate_path=candidate_path)
+        return ["Candidate IDs resolved from owned journal only; live ownership and readiness remain unproven."]
     if mode == "cleanup":
         return ["Blocked: cleanup is disabled until deletion ownership and dependencies can be verified; nothing was deleted.", *BLOCKERS]
     missing = [field for field in ("tenant_id", "capacity_id", "identity_id") if not plan[field]]
@@ -1199,7 +1258,8 @@ def _result_target(args):
         "README.md"))
     source_path = result.is_relative_to(HERE) and result.suffix.lower() in (
         ".py", ".ipynb", ".yml", ".yaml", ".md")
-    if (result in protected or source_path or result.name.casefold() in (STATE_NAME.casefold(), LOCK_NAME.casefold())
+    if (result in protected or source_path or result.name.casefold() in
+            (STATE_NAME.casefold(), LOCK_NAME.casefold(), CANDIDATE_NAME.casefold())
             or config in (directory / STATE_NAME, directory / LOCK_NAME)):
         raise ContractError("result and state paths must not overwrite config, source files or owned state.")
     return result
@@ -1223,7 +1283,7 @@ def _raw_options(argv, name):
 def _write_argument_error(argv, diagnostic):
     modes = _raw_options(argv, "--mode")
     mode = modes[0] if len(modes) == 1 else "unknown"
-    if mode not in ("dry-run", "validate-only", "deploy", "cleanup", "run-data"):
+    if mode not in ("dry-run", "validate-only", "deploy", "cleanup", "run-data", "resolve-candidate-ids"):
         mode = "unknown"
     result = _envelope(mode, "fail", [diagnostic])
     targets = _raw_options(argv, "--result")
@@ -1248,7 +1308,8 @@ def _write_argument_error(argv, diagnostic):
 
 def main(argv=None):
     parser = _ArgumentParser(add_help=False, allow_abbrev=False)
-    parser.add_argument("--mode", required=True, choices=("dry-run", "validate-only", "deploy", "cleanup", "run-data"))
+    parser.add_argument("--mode", required=True, choices=("dry-run", "validate-only", "deploy", "cleanup",
+                                                          "run-data", "resolve-candidate-ids"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True)
@@ -1268,12 +1329,19 @@ def main(argv=None):
         _atomic_json(result_path, result)
         if not Path(args.config).is_absolute() or not Path(args.state_dir).is_absolute():
             raise ContractError("config, state-dir and result must be absolute paths.")
+        candidate_path = result_path.parent / CANDIDATE_NAME if args.mode == "resolve-candidate-ids" else None
+        if candidate_path is not None and candidate_path.parent == Path(args.state_dir).resolve():
+            raise ContractError("Candidate output must be outside the durable state directory.")
+        if candidate_path is not None and candidate_path.resolve() == Path(args.config).resolve():
+            raise ContractError("Candidate output must not overwrite the input config.")
         try:
             config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
             raise ContractError("Config is unreadable or is not valid JSON.") from None
-        diagnostics = perform(args.mode, config, args.prefix, args.state_dir, args.selected_demos, args.yes)
-        result = _envelope(args.mode, "pass" if args.mode == "dry-run" else "blocked", diagnostics)
+        diagnostics = perform(args.mode, config, args.prefix, args.state_dir, args.selected_demos, args.yes,
+                              candidate_path=candidate_path)
+        result = _envelope(args.mode, "pass" if args.mode in ("dry-run", "resolve-candidate-ids") else "blocked",
+                           diagnostics)
     except ContractError as exc:
         result = _envelope(args.mode, "fail", [str(exc)])
     except Blocked as exc:

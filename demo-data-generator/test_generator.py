@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from unittest.mock import patch
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
-from generator import HEADER, RunConfig, batch_bytes, dimensions, stage_batch
+from generator import HEADER, RunConfig, batch_bytes, dimensions, generator_source_sha256, stage_batch
 from delivery import begin_submission, record_submission, record_verification
 from fabric_files import materialize_staged
 from fabric_assets import notebook_definition, pipeline_definition
@@ -172,6 +173,20 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(activity["typeProperties"]["workspaceId"], workspace)
         with self.assertRaises(ValueError):
             pipeline_definition("not-an-id", notebook_id)
+
+    def test_notebook_bundle_loads_the_exact_generator_and_allocator(self):
+        definition = notebook_definition("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                                         "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                                         "producer_staging")
+        notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+        bundle = "".join(notebook["cells"][1]["source"])
+        script = bundle + "\nimport generator, sales_ids, fabric_ledger\nprint(generator.generator_source_sha256())\n"
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ, TEMP=directory, TMP=directory, PYTHONDONTWRITEBYTECODE="1")
+            completed = subprocess.run([sys.executable, "-"], input=script, text=True, capture_output=True,
+                                       env=environment, timeout=30, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), generator_source_sha256())
 
     def test_preflight_probe_persists_identity_without_the_token(self):
         notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))

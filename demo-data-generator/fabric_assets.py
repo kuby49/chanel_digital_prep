@@ -9,7 +9,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 PRODUCER_MODULES = (
-    "generator.py", "delivery.py", "runner.py", "fabric_storage.py",
+    "generator.py", "delivery.py", "runner.py", "fabric_storage.py", "sales_ids.py",
     "fabric_ledger.py", "fabric_delivery.py", "fabric_runner.py", "fabric_runtime.py",
 )
 

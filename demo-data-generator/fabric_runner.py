@@ -9,7 +9,7 @@ from fabric_ledger import FabricLedger
 
 
 def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attempts, *,
-                       clock=None, sleep=None, poll_seconds=5):
+                       allocator_scope, selected_targets, clock=None, sleep=None, poll_seconds=5):
     config.validate()
     if not adapters or any(not callable(getattr(adapter, "submit", None))
                            or not callable(getattr(adapter, "verify", None)) for adapter in adapters.values()):
@@ -29,7 +29,8 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
     if now.tzinfo is None or now.utcoffset() != timedelta(0):
         raise ValueError("clock must return a UTC-aware datetime")
     errors = []
-    with FabricLedger(store, config, list(adapters)) as ledger:
+    with FabricLedger(store, config, list(adapters), allocator_scope=allocator_scope,
+                      selected_targets=selected_targets) as ledger:
         scheduler = ledger.manifest.get("scheduler")
         if scheduler is None:
             if ledger.manifest["batches"]:

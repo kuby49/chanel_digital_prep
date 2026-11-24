@@ -4,6 +4,8 @@ import io
 import json
 import os
 import subprocess
+import sys
+import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -343,6 +345,143 @@ class ContractTests(unittest.TestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_candidate_cli_publishes_per_invocation_sidecar_without_overwriting(self):
+        document = config()
+        state = owned_state(deploy.parse_config(document, "sample"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            store = deploy.StateStore(state_dir)
+            store.write(state)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            original_config = config_path.read_bytes()
+            result_path = root / "invocation" / "result.json"
+            args = [sys.executable, str(deploy.HERE / "deploy.py"), "--mode", "resolve-candidate-ids",
+                    "--config", str(config_path), "--prefix", "sample", "--state-dir", str(state_dir),
+                    "--result", str(result_path)]
+            completed = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(result), {"contract_version", "track", "mode", "status", "ready", "diagnostics"})
+            self.assertEqual((result["mode"], result["status"], result["ready"]),
+                             ("resolve-candidate-ids", "pass", False))
+            sidecar = result_path.parent / deploy.CANDIDATE_NAME
+            self.assertEqual(json.loads(sidecar.read_text(encoding="utf-8")),
+                             {"version": 1, "workspace_id": WORKSPACE, "staging_lakehouse_id": LAKEHOUSE})
+            self.assertFalse((state_dir / deploy.CANDIDATE_NAME).exists())
+            self.assertEqual(config_path.read_bytes(), original_config)
+
+            old_sidecar = sidecar.read_bytes()
+            repeated = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(repeated.returncode, 1)
+            self.assertEqual(json.loads(result_path.read_text(encoding="utf-8"))["status"], "fail")
+            self.assertEqual(sidecar.read_bytes(), old_sidecar)
+
+            bad = copy.deepcopy(document)
+            bad["shared"]["workspace_id"] = PIPELINE
+            config_path.write_text(json.dumps(bad), encoding="utf-8")
+            result_path = root / "another-invocation" / "result.json"
+            args[-1] = str(result_path)
+            blocked = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(blocked.returncode, 1)
+            self.assertEqual(json.loads(result_path.read_text(encoding="utf-8"))["status"], "blocked")
+            self.assertFalse((result_path.parent / deploy.CANDIDATE_NAME).exists())
+
+    def test_candidate_cli_refuses_config_or_state_dir_as_output(self):
+        document = config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            store = deploy.StateStore(state_dir)
+            store.write(owned_state(deploy.parse_config(document, "sample")))
+            config_path = root / deploy.CANDIDATE_NAME
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            original = config_path.read_bytes()
+            args = ["--mode", "resolve-candidate-ids", "--config", str(config_path), "--prefix", "sample",
+                    "--state-dir", str(state_dir), "--result", str(root / "result.json")]
+            self.assertEqual(deploy.main(args), 1)
+            self.assertEqual(config_path.read_bytes(), original)
+            self.assertEqual(json.loads((root / "result.json").read_text(encoding="utf-8"))["status"], "fail")
+            args[-1] = str(state_dir / "result.json")
+            self.assertEqual(deploy.main(args), 1)
+            self.assertFalse((state_dir / deploy.CANDIDATE_NAME).exists())
+
+    def test_candidate_ids_use_owned_journal_without_mutating_config_or_calling_fabric(self):
+        document = config()
+        original = copy.deepcopy(document)
+        state = owned_state(deploy.parse_config(document, "sample"))
+        with tempfile.TemporaryDirectory() as directory:
+            store = deploy.StateStore(directory)
+            store.write(state)
+            before = store.path.read_bytes()
+            with (mock.patch.object(deploy, "azure_cli_token") as token,
+                  mock.patch.object(deploy, "FabricClient") as client):
+                result = deploy.resolve_candidate_ids(document, "sample", directory)
+            token.assert_not_called()
+            client.assert_not_called()
+            self.assertEqual(result, {"workspace_id": WORKSPACE, "staging_lakehouse_id": LAKEHOUSE})
+            self.assertEqual(document, original)
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertFalse(store.lock_path.exists())
+
+    def test_candidate_ids_reject_missing_pending_mismatched_and_corrupt_state(self):
+        document = config()
+        plan = deploy.parse_config(document, "sample")
+        with tempfile.TemporaryDirectory() as directory:
+            store = deploy.StateStore(directory)
+            with self.assertRaisesRegex(deploy.Blocked, "journal"):
+                deploy.resolve_candidate_ids(document, "sample", directory)
+            missing = owned_state(plan, ("workspace",))
+            store.write(missing)
+            with self.assertRaisesRegex(deploy.Blocked, "both candidate IDs"):
+                deploy.resolve_candidate_ids(document, "sample", directory)
+            state = owned_state(plan, ("workspace", "staging_lakehouse"))
+            state["pending"] = {"kind": "environment_item", "operation_id": OPERATION, "result_id": None}
+            store.write(state)
+            with self.assertRaisesRegex(deploy.Blocked, "pending"):
+                deploy.resolve_candidate_ids(document, "sample", directory)
+            state["pending"] = None
+            store.write(state)
+            bad = copy.deepcopy(document)
+            bad["shared"]["workspace_id"] = PIPELINE
+            with self.assertRaisesRegex(deploy.Blocked, "resource ID"):
+                deploy.resolve_candidate_ids(bad, "sample", directory)
+            bad = copy.deepcopy(document)
+            bad["shared"]["staging_lakehouse_id"] = PIPELINE
+            with self.assertRaisesRegex(deploy.Blocked, "resource ID"):
+                deploy.resolve_candidate_ids(bad, "sample", directory)
+            bad = copy.deepcopy(document)
+            bad["shared"]["identity_id"] = PIPELINE
+            with self.assertRaisesRegex(deploy.Blocked, "identity_id"):
+                deploy.resolve_candidate_ids(bad, "sample", directory)
+            state["resources"]["staging_lakehouse"]["workspace_id"] = PIPELINE
+            store.write(state)
+            with self.assertRaisesRegex(deploy.Blocked, "parent"):
+                deploy.resolve_candidate_ids(document, "sample", directory)
+            state["resources"]["staging_lakehouse"]["workspace_id"] = WORKSPACE
+            store.write(state)
+            raw = store.path.read_text(encoding="utf-8")
+            store.path.write_text('{"pending":null,' + raw.lstrip()[1:], encoding="utf-8")
+            with self.assertRaisesRegex(deploy.Blocked, "unreadable"):
+                deploy.resolve_candidate_ids(document, "sample", directory)
+
+    def test_candidate_ids_require_complete_config_and_honor_existing_lock(self):
+        document = config()
+        with self.assertRaisesRegex(deploy.ContractError, "absolute"):
+            deploy.resolve_candidate_ids(document, "sample", "relative-state")
+        with tempfile.TemporaryDirectory() as directory:
+            incomplete = copy.deepcopy(document)
+            del incomplete["shared"]["identity_id"]
+            with self.assertRaisesRegex(deploy.ContractError, "require tenant"):
+                deploy.resolve_candidate_ids(incomplete, "sample", directory)
+            store = deploy.StateStore(directory)
+            store.write(owned_state(deploy.parse_config(document, "sample")))
+            store.lock_path.write_text("other writer", encoding="utf-8")
+            with self.assertRaisesRegex(deploy.Blocked, "locked"):
+                deploy.resolve_candidate_ids(document, "sample", directory)
+            self.assertEqual(store.lock_path.read_text(encoding="utf-8"), "other writer")
+
     def test_names_expand_and_config_ids_cannot_be_adopted(self):
         document = config()
         document["shared"]["producer_notebook_name"] = "{prefix}_notebook"

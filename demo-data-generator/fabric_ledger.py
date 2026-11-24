@@ -5,11 +5,13 @@ import hashlib
 import json
 import re
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from delivery import finish_delivery_submission, start_delivery, verify_delivery
 from fabric_storage import StorageConflict, StorageError
-from generator import batch_bytes, new_manifest
+from generator import batch_bytes, batch_metadata_matches, new_manifest, strict_json_loads
+from sales_ids import AllocationError, AllocationUncertain, LOCK_PATH, canonical_bytes, reserve, validate_scope
 
 
 def _encoded(value):
@@ -45,26 +47,50 @@ def _validate_ingestion_outcome(outcome, operation_id):
 
 
 class FabricLedger:
-    def __init__(self, store, config, destinations):
+    def __init__(self, store, config, destinations, *, allocator_scope, selected_targets):
         self.store = store
         self.config = config
-        self.expected = new_manifest(config, destinations)
+        config.validate()
+        if (not isinstance(destinations, (list, tuple)) or not destinations
+                or len(destinations) != len(set(destinations))
+                or any(name not in ("demo-1", "demo-2", "demo-3") for name in destinations)
+                or not isinstance(selected_targets, dict) or set(selected_targets) != set(destinations)):
+            raise ValueError("selected destinations and allocator targets must match")
+        self.destinations = sorted(destinations)
+        self.allocator_scope = validate_scope(allocator_scope)
+        if (self.allocator_scope["kind"] != "fabric"
+                or getattr(store, "workspace_id", None) != self.allocator_scope["producer_workspace_id"]
+                or getattr(store, "lakehouse_id", None) != self.allocator_scope["staging_lakehouse_id"]):
+            raise ValueError("allocator scope must match the producer OneLake store")
+        self.selected_targets = copy.deepcopy(selected_targets)
+        self.expected = None
         self.directory = f"Files/producer/runs/{config.run_id}"
         self.lock_path = f"{self.directory}/writer.lock"
         self.manifest_path = f"{self.directory}/manifest.json"
+        self.allocator_lock_value = None
+        self.allocator_lock_etag = None
         self.lock_etag = None
         self.manifest_etag = None
         self.manifest = None
         self.unsafe = False
 
     def __enter__(self):
+        self.allocator_lock_value = uuid.uuid4().hex.encode("ascii")
         try:
-            self.lock_etag = self.store.create(self.lock_path, uuid.uuid4().hex.encode("ascii"))
+            self.allocator_lock_etag = self.store.create(LOCK_PATH, self.allocator_lock_value)
         except StorageConflict:
-            raise RuntimeError("run is locked; confirm the previous writer is stopped before recovery") from None
+            raise RuntimeError("allocator is locked; confirm the previous writer is stopped before recovery") from None
         try:
+            try:
+                self.lock_etag = self.store.create(self.lock_path, uuid.uuid4().hex.encode("ascii"))
+            except StorageConflict:
+                raise RuntimeError("run is locked; confirm the previous writer is stopped before recovery") from None
+            except StorageError:
+                self.unsafe = True
+                raise
+            self._assert_allocator_lock()
             self._initialize()
-        except Exception:
+        except BaseException:
             self._release()
             raise
         return self
@@ -73,9 +99,26 @@ class FabricLedger:
         self._release()
 
     def _release(self):
-        if self.lock_etag is not None and not self.unsafe:
-            self.store.delete(self.lock_path, self.lock_etag)
-            self.lock_etag = None
+        if not self.unsafe:
+            try:
+                if self.lock_etag is not None:
+                    self.store.delete(self.lock_path, self.lock_etag)
+                    self.lock_etag = None
+                if self.allocator_lock_etag is not None:
+                    self.store.delete(LOCK_PATH, self.allocator_lock_etag)
+                    self.allocator_lock_etag = None
+            except BaseException:
+                self.unsafe = True
+                raise
+
+    def _assert_allocator_lock(self):
+        try:
+            raw, etag = self.store.read(LOCK_PATH)
+            if raw != self.allocator_lock_value or etag != self.allocator_lock_etag:
+                raise AllocationError("Allocator lock changed; reconcile all writers")
+        except (FileNotFoundError, RuntimeError):
+            self.unsafe = True
+            raise
 
     def _write(self, path, data, etag=None):
         try:
@@ -95,27 +138,56 @@ class FabricLedger:
         try:
             raw, etag = self.store.read(self.manifest_path)
         except FileNotFoundError:
+            raw, etag = None, None
+        if raw is not None:
+            manifest = strict_json_loads(raw.decode("utf-8"))
+            if (not isinstance(manifest, dict) or type(manifest.get("contract_version")) is not int
+                    or manifest["contract_version"] != 1
+                    or manifest.get("run_id") != self.config.run_id
+                    or canonical_bytes(manifest.get("config")) != canonical_bytes(asdict(self.config))
+                    or manifest.get("destinations") != self.destinations
+                    or not isinstance(manifest.get("batches"), dict)
+                    or not isinstance(manifest.get("sales_line_id_reservation"), dict)):
+                raise ValueError("existing run identity, configuration or destinations differ")
+        try:
+            reservation = reserve(self.store, self.allocator_scope, self.config, self.selected_targets,
+                                  require_existing=raw is not None, require_new=raw is None)
+        except AllocationUncertain:
+            self.unsafe = True
+            raise
+        self.expected = new_manifest(self.config, self.destinations, reservation)
+        if raw is None:
             raw = _encoded(self.expected)
             etag = self._write(self.manifest_path, raw)
-        manifest = json.loads(raw.decode("utf-8"))
-        for key in ("contract_version", "run_id", "config", "destinations"):
-            if manifest.get(key) != self.expected[key]:
-                raise ValueError("existing run identity, configuration or destinations differ")
-        if not isinstance(manifest.get("batches"), dict):
-            raise ValueError("existing run manifest is invalid")
+            manifest = self.expected
+        elif canonical_bytes(manifest["sales_line_id_reservation"]) != canonical_bytes(reservation):
+            raise ValueError("existing manifest reservation differs from the allocator")
         self.manifest, self.manifest_etag = manifest, etag
 
+    def _assert_reservation(self):
+        try:
+            self._assert_allocator_lock()
+            reservation = reserve(self.store, self.allocator_scope, self.config, self.selected_targets,
+                                  require_existing=True)
+            if canonical_bytes(self.manifest["sales_line_id_reservation"]) != canonical_bytes(reservation):
+                raise AllocationError("run manifest reservation differs from the allocator")
+        except RuntimeError:
+            self.unsafe = True
+            raise
+
     def _save(self, manifest):
+        self._assert_reservation()
         self.manifest_etag = self._write(self.manifest_path, _encoded(manifest), self.manifest_etag)
         self.manifest = manifest
 
     def stage_batch(self, batch_number):
+        self._assert_reservation()
         payload, expected = batch_bytes(self.config, batch_number)
         key = str(batch_number)
         entry = self.manifest["batches"].get(key)
         path = f"{self.directory}/{expected['filename']}"
         if entry is not None:
-            if any(entry.get(name) != value for name, value in expected.items()):
+            if not batch_metadata_matches(entry, expected):
                 raise ValueError("staged batch metadata does not match deterministic input")
             actual, _ = self.store.read(path)
             if hashlib.sha256(actual).hexdigest() != expected["sha256"]:
@@ -139,13 +211,18 @@ class FabricLedger:
         return entry
 
     def staged_bytes(self, batch_number):
+        self._assert_reservation()
         entry = self.manifest["batches"][str(batch_number)]
-        raw, _ = self.store.read(f"{self.directory}/{entry['filename']}")
-        if hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+        _, expected = batch_bytes(self.config, batch_number)
+        if not batch_metadata_matches(entry, expected):
+            raise RuntimeError("staged batch metadata differs from deterministic input")
+        raw, _ = self.store.read(f"{self.directory}/{expected['filename']}")
+        if hashlib.sha256(raw).hexdigest() != expected["sha256"]:
             raise RuntimeError("staged batch checksum differs; manual recovery required")
         return raw
 
     def begin_submission(self, batch_number, destination, max_attempts):
+        self.staged_bytes(batch_number)
         updated = copy.deepcopy(self.manifest)
         batch = updated["batches"][str(batch_number)]
         delivery = batch["deliveries"][destination]

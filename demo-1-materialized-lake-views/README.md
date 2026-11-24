@@ -221,6 +221,14 @@ receipt, data, target and all fixed deadlines. `check_ready` checks those pins,
 the fresh empty manifest, absent run BatchIDs, live schedule and idle jobs again.
 No hook extends or silently shortens any deadline.
 
+Demo 1 uses four-part Spark names to read the schema-enabled target across
+workspaces. The producer notebook's default lakehouse must also be
+schema-enabled, or no default lakehouse may be selected; a non-schema default
+causes `REQUIRES_SINGLE_PART_NAMESPACE` during preparation. See
+[Lakehouse schemas in notebooks](https://learn.microsoft.com/en-us/fabric/data-engineering/lakehouse-schemas#lakehouse-schemas-in-notebook).
+Changing the default must not redirect the producer's explicitly bound staging
+and manifest paths.
+
 At source admission the exact timing requirements are:
 
 ```text

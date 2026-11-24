@@ -47,6 +47,7 @@ def build_notebook(
     schema=None,
     verification_timeout_seconds=900,
     poll_interval_seconds=15,
+    synthetic_run_id=None,
 ):
     """Build an ipynb; source modules are embedded without a runtime install."""
     workspace_id = _uuid(workspace_id, "workspace_id")
@@ -110,8 +111,8 @@ for name, payload in {encoded!r}.items():
 
 import chanel_generator as generator
 from lakehouse_validation import (
-    measured_batches, measured_reservation, preload_dimensions, verify_batch_with_timeout,
-    verify_dimensions, verify_run_keys,
+    measured_batches, preload_dimensions, verify_batch_with_timeout,
+    verify_dimensions, verify_run_keys, validate_synthetic_batch,
 )
 
 spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")
@@ -127,12 +128,23 @@ if type(POLL_INTERVAL_SECONDS) is not int or POLL_INTERVAL_SECONDS <= 0:
     raise ValueError("POLL_INTERVAL_SECONDS must be a positive integer")
 data = json.loads(DATA_JSON)
 schema = LAKEHOUSE_SCHEMA or None
+synthetic_run_id = {synthetic_run_id!r}
 
 def verify_batch(batch):
+    if synthetic_run_id is not None:
+        validate_synthetic_batch(batch, synthetic_run_id)
     return verify_batch_with_timeout(
         spark, batch, LAKEHOUSE_NAME, SHORTCUT_NAME, schema,
         VERIFICATION_TIMEOUT_SECONDS, POLL_INTERVAL_SECONDS,
     )
+
+def current_batches():
+    manifest = json.loads(MANIFEST_JSON)
+    if not isinstance(manifest, dict) or manifest.get("generator_sha256") != GENERATOR_SHA256:
+        raise ValueError("Producer manifest does not match the packaged generator")
+    if synthetic_run_id is not None:
+        return measured_batches(manifest, synthetic_run_id=synthetic_run_id)
+    return measured_batches(manifest)
 
 if MODE == "preload":
     preload_dimensions(spark, data, generator, LAKEHOUSE_NAME, schema)
@@ -142,10 +154,11 @@ elif MODE == "verify_batch":
     result = {{"mode": MODE, "status": "verified", "batch": verify_batch(json.loads(BATCH_JSON))}}
 elif MODE == "verify_run_keys":
     verify_dimensions(spark, data, generator, LAKEHOUSE_NAME, schema)
-    manifest = json.loads(MANIFEST_JSON)
-    batches = measured_batches(manifest)
-    reservation = measured_reservation(manifest, batches, GENERATOR_SHA256)
-    verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema, reservation=reservation)
+    batches = current_batches()
+    if synthetic_run_id is not None:
+        verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema, synthetic_run_id=synthetic_run_id)
+    else:
+        verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema)
     result = {{
         "mode": MODE, "status": "verified",
         "batch_ids": sorted(batch["batch_id"] for batch in batches),
@@ -154,11 +167,12 @@ elif MODE == "verify_run_keys":
     }}
 elif MODE == "verify_run":
     verify_dimensions(spark, data, generator, LAKEHOUSE_NAME, schema)
-    manifest = json.loads(MANIFEST_JSON)
-    batches = measured_batches(manifest)
-    reservation = measured_reservation(manifest, batches, GENERATOR_SHA256)
+    batches = current_batches()
     results = [verify_batch(batch) for batch in batches]
-    verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema, reservation=reservation)
+    if synthetic_run_id is not None:
+        verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema, synthetic_run_id=synthetic_run_id)
+    else:
+        verify_run_keys(spark, batches, LAKEHOUSE_NAME, SHORTCUT_NAME, schema)
     result = {{"mode": MODE, "status": "verified", "batches": results}}
 else:
     raise ValueError("Unsupported Demo 2 notebook mode")

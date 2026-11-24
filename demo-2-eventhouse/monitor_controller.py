@@ -61,6 +61,15 @@ def _positive(value, name):
     return value
 
 
+def _canonical_json(value):
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise MonitorError("Monitor binding is not valid JSON") from exc
+
+
 def _blob_parts(value, name):
     if not isinstance(value, str):
         raise MonitorError(f"{name} must be an HTTPS OneLake Blob URL")
@@ -107,6 +116,42 @@ def settings(parameters, *, lakehouse_id):
     concurrency = _positive(parameters.get("MAX_CONCURRENT_BATCHES"), "MAX_CONCURRENT_BATCHES")
     if concurrency > 64:
         raise MonitorError("MAX_CONCURRENT_BATCHES cannot exceed 64")
+    generator_sha256 = parameters.get("EXPECTED_GENERATOR_SHA256")
+    if not isinstance(generator_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", generator_sha256):
+        raise MonitorError("EXPECTED_GENERATOR_SHA256 must be a lowercase SHA-256 digest")
+    count = _positive(parameters.get("EXPECTED_BATCH_COUNT"), "EXPECTED_BATCH_COUNT")
+    try:
+        producer_config = json.loads(parameters["EXPECTED_PRODUCER_CONFIG_JSON"])
+        targets = json.loads(parameters["EXPECTED_TARGET_BINDINGS_JSON"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MonitorError("Expected producer configuration or targets are invalid JSON") from exc
+    if (
+        not isinstance(producer_config, dict)
+        or producer_config.get("run_id") != run_id
+        or type(producer_config.get("file_count")) is not int
+        or producer_config["file_count"] != count
+        or not isinstance(targets, dict)
+        or "demo-2" not in targets
+        or any(name not in ("demo-1", "demo-2", "demo-3") or not isinstance(target, dict)
+               for name, target in targets.items())
+    ):
+        raise MonitorError("Expected producer configuration or targets do not match this run")
+    synthetic = run_id.casefold().startswith("demo2synthetic_")
+    if synthetic:
+        target = targets["demo-2"]
+        if (not re.fullmatch(r"demo2synthetic_[0-9a-f]{12}", run_id)
+                or producer_config.get("batch_class") != "bootstrap"
+                or set(targets) != {"demo-2"} or target.get("workspace_id") != workspace_id
+                or target.get("fact") != "SyntheticFactSales" or manifest[0] == workspace_id):
+            raise MonitorError("Synthetic monitor must bind an isolated bootstrap target")
+    elif (producer_config.get("batch_class", "measured") != "measured"
+          or any(str(target.get("fact", "")).casefold() == "syntheticfactsales" for target in targets.values())):
+        raise MonitorError("Production monitor requires a measured run and nonsynthetic targets")
+    binding = hashlib.sha256(_canonical_json({
+        "targets": targets, "generator_sha256": generator_sha256, "config": producer_config,
+    })).hexdigest()
+    if parameters.get("EXPECTED_MONITOR_BINDING_SHA256") != binding:
+        raise MonitorError("Expected monitor binding does not match the producer configuration and targets")
     return {
         "run_id": run_id,
         "manifest_url": parameters["MANIFEST_URL"],
@@ -118,8 +163,14 @@ def settings(parameters, *, lakehouse_id):
         "notebook_id": _uuid(parameters.get("VERIFIER_NOTEBOOK_ID"), "VERIFIER_NOTEBOOK_ID"),
         "identity_id": _uuid(parameters.get("EXPECTED_IDENTITY_ID"), "EXPECTED_IDENTITY_ID"),
         "tenant_id": _uuid(parameters.get("EXPECTED_TENANT_ID"), "EXPECTED_TENANT_ID"),
+        "generator_sha256": generator_sha256,
+        "producer_config": producer_config,
+        "synthetic_run_id": run_id if synthetic else None,
+        "destinations": sorted(targets),
+        "target_bindings": targets,
+        "monitor_binding_sha256": binding,
         "deadline": _utc(parameters.get("DEADLINE_UTC"), "DEADLINE_UTC"),
-        "count": _positive(parameters.get("EXPECTED_BATCH_COUNT"), "EXPECTED_BATCH_COUNT"),
+        "count": count,
         "timeout": _positive(parameters.get("VERIFICATION_TIMEOUT_SECONDS"), "VERIFICATION_TIMEOUT_SECONDS"),
         "poll": _positive(parameters.get("POLL_INTERVAL_SECONDS"), "POLL_INTERVAL_SECONDS"),
         "concurrency": concurrency,
@@ -172,8 +223,17 @@ def verify_delivery_evidence(batch, record):
         outcome.get("diagnostic") is not None and not isinstance(outcome["diagnostic"], str)
     ):
         raise MonitorError("Kusto terminal success evidence has invalid details")
-    _utc(outcome.get("timestamp_utc"), "ingestion outcome timestamp")
-    _utc(delivery.get("verified_at_utc"), "delivery verification timestamp")
+    started_at = _utc(delivery.get("submission_started_at_utc"), "submission start timestamp")
+    submitted_at = _utc(delivery.get("submission_result_at_utc"), "submission result timestamp")
+    outcome_at = _utc(outcome.get("timestamp_utc"), "ingestion outcome timestamp")
+    verified_at = _utc(delivery.get("verified_at_utc"), "delivery verification timestamp")
+    deadline = _utc(record.get("deadline_utc"), "batch deadline")
+    if not started_at <= submitted_at <= outcome_at <= verified_at < deadline:
+        raise MonitorError("Kusto terminal evidence does not fit the batch verification deadline")
+    if record.get("status") == "verified":
+        monitor_verified_at = _utc(record.get("verified_at_utc"), "monitor verification timestamp")
+        if not verified_at <= monitor_verified_at < deadline:
+            raise MonitorError("Monitor verification did not complete before the batch deadline")
     expected = {
         "verified_row_count": batch["row_count"],
         "verified_total_minor_units": batch["sales_amount_minor_units"],
@@ -191,14 +251,16 @@ def _measured(manifest, cfg):
     ):
         raise MonitorError("Producer manifest contract version is invalid")
     config = manifest.get("config")
+    destinations = manifest.get("destinations")
     if (
         manifest.get("run_id") != cfg["run_id"]
+        or manifest.get("generator_sha256") != cfg["generator_sha256"]
         or not isinstance(config, dict)
-        or config.get("run_id") != cfg["run_id"]
-        or type(config.get("file_count")) is not int
-        or config["file_count"] != cfg["count"]
-        or not isinstance(manifest.get("destinations"), list)
-        or "demo-2" not in manifest["destinations"]
+        or _canonical_json(config) != _canonical_json(cfg["producer_config"])
+        or not isinstance(destinations, list)
+        or any(not isinstance(name, str) for name in destinations)
+        or sorted(destinations) != cfg["destinations"]
+        or _canonical_json(manifest.get("target_bindings")) != _canonical_json(cfg["target_bindings"])
     ):
         raise MonitorError("Producer manifest does not match the monitored run")
     batches = manifest.get("batches")
@@ -206,6 +268,8 @@ def _measured(manifest, cfg):
         raise MonitorError("Producer manifest batches are invalid")
     seen = set()
     has_measured = False
+    synthetic_run_id = cfg.get("synthetic_run_id")
+    expected_class = "bootstrap" if synthetic_run_id else "measured"
     for key, batch in batches.items():
         if not isinstance(batch, dict) or batch.get("batch_class") not in (
             "measured", "bootstrap", "negative-test"
@@ -215,11 +279,14 @@ def _measured(manifest, cfg):
         if not isinstance(batch_id, str) or batch_id in seen:
             raise MonitorError("Producer manifest contains duplicate or invalid batch IDs")
         seen.add(batch_id)
-        if batch["batch_class"] == "measured":
+        if synthetic_run_id and batch["batch_class"] != expected_class:
+            raise MonitorError("Synthetic monitor accepts bootstrap batches only")
+        if batch["batch_class"] == expected_class:
             has_measured = True
             if (
                 not isinstance(key, str)
                 or not key.isdecimal()
+                or len(key) > len(str(cfg["count"]))
                 or str(int(key)) != key
                 or not 1 <= int(key) <= cfg["count"]
                 or type(batch.get("batch_number")) is not int
@@ -230,7 +297,7 @@ def _measured(manifest, cfg):
     if not has_measured:
         return []
     try:
-        return measured_batches(manifest)
+        return measured_batches(manifest, synthetic_run_id=synthetic_run_id)
     except (VerificationError, TypeError, ValueError) as exc:
         raise MonitorError(f"Producer manifest batch evidence is invalid: {exc}") from exc
 
@@ -300,6 +367,8 @@ class Controller:
                 or previous_state.get("contract_version") != 1
                 or previous_state.get("run_id") != self.cfg["run_id"]
                 or previous_state.get("manifest_uri") != self.cfg["manifest_url"]
+                or previous_state.get("generator_sha256") != self.cfg["generator_sha256"]
+                or previous_state.get("monitor_binding_sha256") != self.cfg["monitor_binding_sha256"]
                 or not isinstance(previous_state.get("batches"), dict)
                 or previous_state.get("state") in ("completed", "failed")
             ):
@@ -309,6 +378,15 @@ class Controller:
                 records.append(previous_state["run_verification"])
             if any(not isinstance(record, dict) or record.get("status") == "submitting" for record in records):
                 raise MonitorError("A previous verification submission is uncertain; do not resubmit it")
+            try:
+                for record in previous_state["batches"].values():
+                    if record.get("status") == "verified":
+                        verified_at = _utc(record.get("verified_at_utc"), "monitor verification timestamp")
+                        deadline = _utc(record.get("deadline_utc"), "batch deadline")
+                        if verified_at > now or verified_at >= deadline:
+                            raise ValueError
+            except (MonitorError, ValueError) as exc:
+                raise MonitorError("A previous verified batch lacks valid deadline evidence") from exc
             self.state = previous_state
         self.state.update({
             "run_id": self.cfg["run_id"],
@@ -320,6 +398,8 @@ class Controller:
             "job_access_verified": True,
             "identity_id": self.cfg["identity_id"],
             "tenant_id": self.cfg["tenant_id"],
+            "generator_sha256": self.cfg["generator_sha256"],
+            "monitor_binding_sha256": self.cfg["monitor_binding_sha256"],
             "manifest_observed": self.state.get("manifest_observed", False),
         })
         self._save()
@@ -464,7 +544,12 @@ class Controller:
                 raise MonitorError(f"Measured batch {batch['batch_id']} lost its transport verification")
             if record.get("status") in ("spark_verified", "verified") and delivery.get("status") == "verified":
                 verify_delivery_evidence(batch, record)
-                record["status"] = "verified"
+                if record["status"] == "spark_verified":
+                    verified_at = self.clock()
+                    if not _utc(delivery["verified_at_utc"], "delivery verification timestamp") \
+                            <= verified_at < deadline:
+                        raise MonitorError(f"Measured batch {batch['batch_id']} exceeded its verification deadline")
+                    record.update(status="verified", verified_at_utc=_stamp(verified_at))
 
         active = sum(
             record.get("status") in ("submitting", "running")

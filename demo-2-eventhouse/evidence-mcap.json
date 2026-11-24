@@ -141,11 +141,25 @@
     "started": false,
     "bootstrap_exclusion": "Manifest batch-class filter; not yet exercised by a measured run"
   },
+  "read_only_followup": {
+    "tenant": "MCAP",
+    "observed_utc": "2026-11-24T06:09:32Z",
+    "demo_2_owner_markers_present": false,
+    "fact_update_policy": [],
+    "verifier_run_notebook_schedules": [],
+    "retained_fact_rows": 5,
+    "retained_key_min": "1",
+    "retained_key_max": "5",
+    "writer_fence_verified": false,
+    "queue_drain_verified": false,
+    "notebook_interactive_high_concurrency_enabled": true,
+    "notebook_pipeline_high_concurrency_enabled": false,
+    "jobs_api_runtime_high_concurrency": "Not reported for the concurrent and nested verifier jobs inspected"
+  },
   "limitations": [
     "Producer OneLake-to-local staging and packaged queued submission have not been verified in a measured run.",
     "Fresh producer-runtime identity and effective ingestion permissions are not established by historical probes.",
     "The manually provisioned workspace has no matching Demo 2 CLI ownership ledger or markers.",
-    "No live global sales-line reservation or quiesced retained-key inventory is established.",
     "The independent per-batch monitor has not been verified against a measured run.",
     "Two concurrent verifier jobs succeeded, but Fabric reported high-concurrency mode disabled.",
     "Serialized replay was verified; concurrent duplicate submission safety was not established.",

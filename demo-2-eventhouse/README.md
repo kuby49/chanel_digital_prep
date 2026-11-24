@@ -53,7 +53,7 @@ flowchart LR
   A non-null per-demo `verification_timeout_seconds` overrides the global
   value; the default is 900 seconds. The reusable verifier keeps `run_id`
   null and takes the current run's manifest as a job parameter; a new run
-  still requires its own reservation and readiness proof.
+  still requires its own readiness proof.
 
 The documented narrow KQL role combination for an existing table is Database
 User plus Table Ingestor. Query verification also needs database read access.
@@ -90,8 +90,15 @@ the result. It reports `ready:false`:
 the candidate is not a live ownership or access proof. Monitor starts require
 the complete selected `shared.target_bindings` map and bind it, the normalized
 generator digest and the producer configuration into the immutable start
-record. Changed bindings require a new monitor; stopping an existing monitor
-uses its original recorded identity, including for legacy records.
+record. Each manifest snapshot must match that generator, configuration, selected
+destination set and complete target map. Changed bindings require a new monitor;
+stopping an existing monitor uses its original recorded identity, including for
+legacy records.
+`verify-target-ownership` is the read-only counterpart. It requires the
+existing non-pending deployment ledger and checks the live workspace,
+Eventhouse, parent-linked KQL Database, and table schema/docstring against
+that exact record. It does not emit a portable attestation or establish
+producer permissions and always reports `ready:false`.
 Run the shared producer only after fresh validation passes for it and every
 selected destination. `submitted` means queued, not ingested.
 
@@ -100,6 +107,10 @@ selected destination. `submitted` means queued, not ingested.
    producer runs. The orchestrator uses the track's `start-monitor`,
    `monitor-status`, `wait-monitor` and `stop-monitor` modes with the same
    config and state directory.
+   The monitor deadline is `4*T + D + 1050 + V` seconds after submission,
+   where `T` is the track timeout, `D` the producer's maximum duration, and
+   `V` the verification timeout. Existing records retain their original
+   `2*T + D + V` deadline for reconciliation.
 3. Run the producer for the selected, ready demos. The monitor independently
    reads its durable manifest and launches bounded shortcut-verification jobs;
    Spark waiting does not block the one-minute generator. Each batch deadline
@@ -107,8 +118,10 @@ selected destination. `submitted` means queued, not ingested.
 4. Confirm the monitor's terminal completion and per-batch outcomes. Each
    measured batch must have matching terminal ingestion evidence, KQL
    reconciliation, all three dimension joins, exact decimals and grouped
-   totals. A final run-wide check rejects sales keys duplicated within the run
-   or already present in another batch, including the retained bootstrap.
+   totals. Completion independently rereads each batch from the owned KQL
+   table and checks its persisted verification timestamp against its
+   deadline. A final run-wide check verifies row counts and unique sales keys
+   within each measured batch.
 5. Use only manifest-selected measured BatchIDs in any additional KQL or
    Lakehouse aggregate. Do not aggregate all rows in `FactSales`: bootstrap and
    negative-test batches are not part of the measured results.
@@ -122,16 +135,13 @@ retained lock is a blocker; do not guess an operation ID or blindly restart.
 Until prior-source serialization evidence is available, a duplicate-tag skip
 is unresolved even when KQL totals match.
 
-Two concurrent bootstrap verification jobs succeeded in MCAP, but Fabric
-reported high-concurrency mode disabled for both. Do not assume those jobs
-share a Spark session without separately verifying the workspace configuration
-and execution mode. Fabric requires the workspace's
-[high-concurrency setting](https://learn.microsoft.com/en-us/fabric/data-engineering/configure-high-concurrency-session-notebooks)
-and compatible identity, workspace, Lakehouse and libraries.
+The monitor launches independent on-demand notebook jobs; they do not need to
+share a high-concurrency Spark session.
 
 The producer's staging helper copies each closed OneLake file to driver-local
-storage and checks its SHA-256 before calling `EventhouseAdapter.submit`; its
-Fabric runtime path still needs verification. The adapter uses the
+storage and checks its SHA-256 before calling `EventhouseAdapter.submit`. This
+path was verified for the bounded synthetic run below, not for a measured run.
+The adapter uses the
 named CSV mapping, ignores the header, and uses matching `ingestIfNotExists`
 and `ingest-by` tags. `ingestion_status(source_id)` peeks at status queues
 without deleting messages; absence of a terminal message is not proof of
@@ -146,14 +156,86 @@ the producer must serialize writers and retain its durable ledger. KQL extent
 tags have retention and performance implications; do not rely on a deleted
 extent's tag to prevent a later replay.
 
-The finalized shared producer uses globally unique `SalesLineID` reservations.
-The local verifier checks the run identity, normalized packaged-generator
-digest, canonical inclusive range, count, and measured keys. Its independent
-registry validator was exercised with synthetic fixtures, but is not yet
-connected to live, independently verified target identities or a quiesced
-retained-key inventory. No live reservation has been established. A manifest
-or scan of mirrored data cannot replace that durable, exclusive reservation
-or prove that other writers are stopped.
+### Controlled synthetic monitoring
+
+Use the reserved prefix `demo2synthetic-<12 lowercase hex>` and corresponding
+run ID `demo2synthetic_<12 lowercase hex>`. `provision-synthetic` creates and
+journals the dedicated workspace, Eventhouse, KQL Database, Lakehouse,
+`SyntheticFactSales`, mapping and policy. It neither ingests nor reports
+readiness. Do not supply IDs for unowned resources or reuse a production state
+directory. A distinct staging workspace publishes the regular manifest format
+under the reserved run ID, with `batch_class: bootstrap` and exactly one
+destination, the isolated Demo 2 target.
+
+The explicit test modes are `prepare-synthetic-monitor`,
+`start-synthetic-monitor`, `synthetic-monitor-status`, and
+`wait-synthetic-monitor`, each with `--selected-demos demo-2`; use
+`stop-monitor` with the same config and state to reconcile the exact owned
+jobs. Preparation journals the dimension-preload job and verifies the owned
+notebook definitions and shortcut before the short-lived runtime proof is
+obtained. It neither starts the monitor nor reports readiness. Synthetic
+completion uses the same KQL/Spark
+checks and deadlines as production but always reports `ready:false`. Live
+start requires `synthetic_proof` locators for the producer workspace, staging
+Lakehouse, notebook, environment, pipeline, fresh preflight parent/child jobs
+and nonce, separate authorization parent/child jobs, source and service
+operation IDs, and the notebook, effective-config and authorization-CSV
+SHA-256 digests. These are locators, not trusted claims: admission rereads the
+live definitions, jobs, manifest, CSVs, KQL and status queue. It admits only
+the bounded two-file, five-row bootstrap fixture and blocks on stale or
+ambiguous evidence. Neither a local fixture nor the creation journal is
+runtime access proof. Production readiness remains separately blocked.
+
+The MCAP synthetic run `demo2synthetic_38bb0e3e0d0e` completed end to end using
+producer workspace `48593f2f-d3ac-474b-ba96-08282d6f69df`, staging Lakehouse
+`fca649c9-0297-4997-8e2d-8ac5338aaa1a`, and this isolated destination:
+
+```json
+{
+  "workspace_id": "0a0499fe-51b5-42b1-bc99-31c121cc74a6",
+  "item_id": "25159007-a6dd-4020-8afc-01d393378727",
+  "fact": "SyntheticFactSales"
+}
+```
+
+The mapping was `SalesCsvV1`; the Eventhouse was
+`a585c196-beb8-432a-bf11-f0f2530de92c` and the target Lakehouse was
+`f565aeac-f321-46f2-8262-076e06490707`. Each of the two batches was delivered
+once and independently verified through KQL and the Lakehouse shortcut:
+five rows totaling 526232 minor units and five rows totaling 351377 minor
+units, respectively. The monitor and its batch and run-wide verifiers
+completed. A separate authorization-probe row is not part of those batches.
+This historical result does not authorize another run or target.
+
+To evaluate reusing this dedicated target for the normal demonstration, keep
+the original owner prefix and state directory. With the measured data config
+and `demo-2.sales_table: SyntheticFactSales`, use `resolve-target-candidate`
+to recover the exact destination from its journal, then
+`verify-target-ownership` to check it live against `shared.target_bindings`.
+These modes do not authorize measured execution. The candidate's `item_id`
+is the `SalesDatabase` KQL database, not the Eventhouse or Lakehouse.
+
+For seed 42 and start date `2026-01-01`, the synthetic dimensions (4 dates,
+3 products, 3 customers) are generated subsets of the normal dimensions
+(365 dates, 20 products, 100 customers). In an explicitly coordinated,
+Lakehouse-bound Spark maintenance job, `dimension_expansion.dimension_gaps`
+checks the three live tables without writing. If compatible and other
+dimension writers are stopped, `expand_dimensions` inserts only missing
+keys, never updates existing rows, and verifies the full result. It is not
+run by deployment, validation, or any monitor command. Measured execution
+still needs the matching verifier definitions, a reconciled monitor
+transition, and fresh producer-runtime authorization for the exact target.
+Keep the retained bootstrap and authorization rows out of measured results
+by filtering to the measured manifest's batch IDs.
+
+The producer uses `SalesLineID` values 1 through the row count in each batch,
+reusing those values across batches and on replay. The fact key is
+`(BatchID, SalesLineID)`, not `SalesLineID` alone. The verifier checks each
+batch's count and distinct keys separately; other batches, including retained
+bootstrap data, may use the same IDs. No global allocator or retained-key
+inventory is needed. The batch manifest and stable ingestion tag still bind
+replay to its original batch, and ambiguous or concurrent submissions require
+the delivery ledger and reconciliation described above.
 
 ## OneLake semantics and troubleshooting
 
@@ -185,10 +267,10 @@ policy, shortcut, and observed outcomes. The live bootstrap
 it has five rows totaling 526232 minor units. It is classified `bootstrap` and
 must be excluded from every measured count, total and grouped aggregate. Its
 retained `SalesLineID` values are 1 through 5; a read-only KQL inventory found
-no other fact batches. That historical inventory does not establish writer
-quiescence. The separate malformed batch `demo2negative_5f7d11269579_0001` was
-rejected before ingestion and has zero KQL rows. Deleting their staged files
-is not cleanup of the KQL or mirrored data.
+no other fact batches. Those IDs may be reused by later batches. The separate
+malformed batch `demo2negative_5f7d11269579_0001` was rejected before ingestion
+and has zero KQL rows. Deleting their staged files is not cleanup of the KQL or
+mirrored data.
 
 ## Cleanup
 

@@ -28,6 +28,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+if __name__ == "__main__":
+    sys.modules["deploy"] = sys.modules[__name__]
+
 from eventhouse_core import (
     CSV_COLUMNS,
     ConfigurationError,
@@ -37,8 +40,7 @@ from eventhouse_core import (
     schema_commands,
     shortcut_payload,
 )
-from lakehouse_validation import VerificationError, measured_batches
-from reservation_verification import ReservationError, _targets
+from lakehouse_validation import VerificationError, validate_batch_evidence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +54,7 @@ MONITOR_FILE = "demo-2-monitor.json"
 MONITOR_START_FILE = "demo-2-monitor-start.json"
 ONELAKE = "https://onelake.blob.fabric.microsoft.com"
 MAX_SECONDS = 2**31 - 1
+MONITOR_STARTUP_HEADROOM_SECONDS = 1050
 PREFIX = re.compile(r"[a-z0-9][a-z0-9-]{0,39}\Z")
 KUSTO_HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.kusto\.fabric\.microsoft\.com\Z")
 
@@ -66,6 +69,34 @@ class Blocked(Exception):
 
 class BatchPending(Blocked):
     """A valid batch has not yet fully arrived."""
+
+
+class TargetBindingError(ValueError):
+    """The selected target map is malformed."""
+
+
+def _targets(value):
+    if not isinstance(value, dict) or not value or any(
+        name not in ("demo-1", "demo-2", "demo-3") for name in value
+    ):
+        raise TargetBindingError("Target bindings are invalid")
+    for target in value.values():
+        if not isinstance(target, dict) or set(target) != {"workspace_id", "item_id", "fact"}:
+            raise TargetBindingError("Target identity is invalid")
+        for field in ("workspace_id", "item_id"):
+            try:
+                raw = target[field]
+                parsed = uuid.UUID(raw)
+                if not isinstance(raw, str) or str(parsed) != raw or parsed.int == 0:
+                    raise ValueError
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise TargetBindingError("Target identity is invalid") from exc
+        if (
+            not isinstance(target["fact"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,255}", target["fact"])
+        ):
+            raise TargetBindingError("Target identity is invalid")
+    return value
 
 
 def _uuid(value, label):
@@ -120,10 +151,8 @@ def _batch(value):
         return None
     if not isinstance(value, dict) or value.get("batch_class") not in ("bootstrap", "measured"):
         raise Failure("demo-2.verification_batch must be a bootstrap or measured batch")
-    candidate = dict(value)
-    candidate["batch_class"] = "measured"
     try:
-        measured_batches({"contract_version": 1, "batches": {"1": candidate}})
+        validate_batch_evidence(value)
     except (VerificationError, TypeError, ValueError) as exc:
         raise Failure("demo-2.verification_batch is not a valid complete v1 batch") from exc
     return dict(value)
@@ -262,6 +291,7 @@ def validate_config(config, prefix):
         "expected_location": expected_location,
         "producer_identity": _optional_uuid(shared.get("identity_id"), "shared.identity_id"),
         "target_bindings": shared.get("target_bindings"),
+        "synthetic_proof": config.get("synthetic_proof"),
         "shared_workspace_id": _optional_uuid(shared.get("workspace_id"), "shared.workspace_id"),
         "shared_lakehouse_id": _optional_uuid(shared.get("staging_lakehouse_id"),
                                                "shared.staging_lakehouse_id"),
@@ -502,8 +532,15 @@ class FabricClient:
         self.deadline = deadline
         self.opener = build_opener(_NoRedirect())
         self.fabric_skill = "eventhouse-cli"
+        self._tokens = {}
 
     def _token(self, audience):
+        self.deadline.remaining()
+        key = (audience, os.environ.get("AZURE_CONFIG_DIR"))
+        cached = self._tokens.get(key)
+        if cached is not None and time.time() < cached[1]:
+            return cached[0]
+        self._tokens.pop(key, None)
         az = shutil.which("az")
         if not az:
             raise Blocked("Azure CLI is unavailable; sign in using the intended isolated Azure configuration.")
@@ -522,6 +559,11 @@ class FabricClient:
             if (_uuid(token["tenant"], "token tenant") != self.tenant_id
                     or not isinstance(token["accessToken"], str) or not token["accessToken"]):
                 raise ValueError
+            expires = token.get("expires_on")
+            if (type(expires) is int or isinstance(expires, str) and expires.isascii() and expires.isdecimal()):
+                refresh_at = min(time.time() + 60, int(expires) - 60)
+                if refresh_at > time.time():
+                    self._tokens[key] = (token["accessToken"], refresh_at)
             return token["accessToken"]
         except (KeyError, TypeError, ValueError, Failure, json.JSONDecodeError) as exc:
             raise Blocked("Azure CLI returned a token for an unverifiable or different tenant.") from exc
@@ -849,24 +891,32 @@ def verify_producer_access(settings, client, database):
     )
 
 
-def verify_global_reservation(settings, client, evidence, manifest, state, batches):
-    """Integration seam for independently verified global SalesLineID allocation."""
-    raise Blocked(
-        "Global SalesLineID allocation is provisional; independent reservation and collision verification "
-        "are required before completion can be claimed."
-    )
-
-
 def verify_monitor_readiness(deployment):
     """Require fresh producer proof and an authenticated overall readiness binding."""
-    deployment.workspace(False)
-    deployment.item("eventhouse", "Eventhouse", deployment.s["eventhouse_name"], False)
-    database = deployment.database(False)
+    database = deployment.verify_target_ownership()
     verify_producer_access(deployment.s, deployment.client, database)
     raise Blocked(
         "A fresh authenticated binding of Demo 2 artifacts, dimensions, configuration and producer "
         "permissions is unavailable; a monitor heartbeat cannot establish overall readiness."
     )
+
+
+def verify_synthetic_runtime_access(deployment, monitor_config):
+    try:
+        module = importlib.import_module("synthetic_admission")
+    except ImportError as exc:
+        raise Blocked("The synthetic runtime admission verifier is unavailable.") from exc
+    verify = getattr(module, "verify_synthetic_runtime_access", None)
+    if not callable(verify):
+        raise Blocked("The synthetic runtime admission verifier is incompatible.")
+    with _spark_client(deployment.client):
+        return verify(deployment, monitor_config, deployment.s["synthetic_proof"])
+
+
+def _require_synthetic_fresh(expires):
+    if (not isinstance(expires, datetime) or expires.utcoffset() != timedelta(0)
+            or _now() >= expires):
+        raise Blocked("Synthetic runtime preflight expired or has no valid expiry.")
 
 
 class Deployment:
@@ -1054,13 +1104,31 @@ class Deployment:
             raise Blocked("The configured query endpoint differs from the KQL database readback.")
         if self.s["ingestion_endpoint"] is not None and self.s["ingestion_endpoint"] != ingestion_uri:
             raise Blocked("The configured ingestion endpoint differs from the KQL database readback.")
-        entry["confirmed"] = True
-        self.ledger.save()
+        if not entry.get("confirmed"):
+            entry["confirmed"] = True
+            self.ledger.save()
         return {"id": entry["id"], "name": entry["name"], "query_uri": query_uri,
                 "ingestion_uri": ingestion_uri}
 
     def _kql(self, database, command, query=False):
         return self.client.kusto(database["query_uri"], database["name"], command, query)
+
+    def verify_target_ownership(self, *, expected_pending=None):
+        target = _journal_target(self.s, self.ledger, expected_pending=expected_pending)
+        bindings = self.s["target_bindings"]
+        if bindings is not None:
+            try:
+                configured = _targets(bindings).get("demo-2")
+            except TargetBindingError as exc:
+                raise Blocked("Configured selected target bindings are invalid.") from exc
+            if configured != target:
+                raise Blocked("The selected Demo 2 target does not match the owned deployment.")
+        self.workspace(False)
+        self.item("eventhouse", "Eventhouse", self.s["eventhouse_name"], False)
+        database = self.database(False)
+        table = target["fact"]
+        verify_schema(self._kql(database, f".show table {table} schema as json"), table, self.marker)
+        return database
 
     def configure_kql(self, database):
         table, mapping = self.s["table"], self.s["mapping"]
@@ -1194,6 +1262,7 @@ class Deployment:
                 lakehouse_id=self.resources["lakehouse"]["id"], lakehouse_name=self.s["lakehouse_name"],
                 data=dimension_data, shortcut_name=self.s["shortcut"], schema=self.s["schema"],
                 verification_timeout_seconds=self.s["timeout"], poll_interval_seconds=self.s["poll"],
+                synthetic_run_id=self.s["data"]["run_id"] if self.s["prefix"].startswith("demo2synthetic-") else None,
             )
             definition = module.fabric_definition(notebook)
         except Exception as exc:
@@ -1244,7 +1313,7 @@ class Deployment:
             raise Blocked("The live monitor notebook definition or Lakehouse binding differs from the trusted builder.")
 
     @_spark_operation
-    def run_notebook(self, mode, batch=None):
+    def run_notebook(self, mode, batch=None, *, synthetic_preparation=None):
         ws = self.resources["workspace"]["id"]
         notebook_id = self.resources["notebook"]["id"]
         jobs_path = f"/v1/workspaces/{ws}/items/{notebook_id}/jobs/instances"
@@ -1257,7 +1326,10 @@ class Deployment:
                                "value": json.dumps(batch, separators=(",", ":"))})
         expected = ({key: batch[key] for key in ("batch_id", "row_count", "sales_amount_minor_units")}
                     if batch is not None else None)
-        self.ledger.intent("notebook-job", mode=mode, notebook_id=notebook_id, batch=expected)
+        fields = {"mode": mode, "notebook_id": notebook_id, "batch": expected}
+        if synthetic_preparation is not None:
+            fields["synthetic_preparation"] = synthetic_preparation
+        self.ledger.intent("notebook-job", **fields)
         status, headers, _ = self.client.fabric(
             "POST", f"/v1/workspaces/{ws}/notebooks/{notebook_id}/jobs/execute/instances?beta=false",
             {"parameters": parameters, "executionData": {"compute": "Spark"}},
@@ -1268,6 +1340,7 @@ class Deployment:
         self.ledger.data["pending"]["job_id"] = job_id
         self.ledger.save()
         self._poll_notebook_job(job_id, mode, expected, headers.get("retry-after"))
+        return job_id
 
     @_spark_operation
     def _poll_notebook_job(self, job_id, mode, batch, retry_after=None):
@@ -1284,8 +1357,28 @@ class Deployment:
                 raise Failure("Notebook job status readback is invalid.")
             state = job.get("status")
             if state == "Completed":
+                pending = self.ledger.data["pending"]
+                preparation = pending.get("synthetic_preparation")
+                try:
+                    _verify_notebook_exit(job, mode, batch)
+                except Blocked:
+                    if preparation is None:
+                        self.ledger.finish()
+                    raise
+                if preparation is not None:
+                    config = _monitor_config(self.s, {"demo-2"})
+                    expected = {
+                        "run_id": config["run_id"], "generator_sha256": config["generator_sha256"],
+                        "workspace_id": ws, "lakehouse_id": self.resources["lakehouse"]["id"],
+                        "notebook_id": notebook_id,
+                    }
+                    if (not re.fullmatch(r"demo2synthetic-[0-9a-f]{12}", self.s["prefix"])
+                            or mode != "preload" or batch is not None
+                            or preparation != expected or pending.get("job_id") != job_id
+                            or self.resources.get("synthetic_preparation") is not None):
+                        raise Blocked("The synthetic preload job does not match its preparation intent.")
+                    self.resources["synthetic_preparation"] = {**expected, "job_id": job_id}
                 self.ledger.finish()
-                _verify_notebook_exit(job, mode, batch)
                 return
             if state in ("Failed", "Cancelled", "Deduped"):
                 self.ledger.finish()
@@ -1450,7 +1543,22 @@ def _operation_id(headers):
     value = headers.get("x-ms-operation-id")
     location = headers.get("location")
     if location:
-        parsed = urlsplit(_fabric_url(location))
+        try:
+            parsed = urlsplit(location)
+            regional = (
+                parsed.scheme == "https"
+                and re.fullmatch(r"wabi-[a-z0-9-]+-primary-redirect\.analysis\.windows\.net",
+                                 parsed.hostname or "") is not None
+                and parsed.username is None and parsed.password is None
+                and parsed.port in (None, 443) and not parsed.fragment
+            )
+        except (TypeError, ValueError) as exc:
+            raise Failure("Fabric returned an unsafe operation location") from exc
+        if regional:
+            if value is None:
+                raise Failure("Fabric omitted the operation ID for a regional operation location")
+        else:
+            parsed = urlsplit(_fabric_url(location))
         match = re.fullmatch(r"/v1/operations/([0-9a-fA-F-]+)", parsed.path)
         if not match or parsed.query:
             raise Failure("Fabric returned an unsafe operation location")
@@ -1480,6 +1588,56 @@ def _recover_pending(deployment):
         return
     if not isinstance(pending, dict):
         raise Blocked("The ownership ledger contains invalid pending operation state.")
+    if (re.fullmatch(r"demo2synthetic-[0-9a-f]{12}", deployment.s["prefix"])
+            and pending.get("kind") == "create-item" and not pending.get("operation_id")
+            and pending.get("item_type") == "Notebook"
+            and pending.get("key") in ("notebook", "monitor_notebook")):
+        key = pending["key"]
+        expected = deployment.s["notebook_name" if key == "notebook" else "monitor_notebook_name"]
+        if pending.get("name") != expected or key in deployment.resources:
+            raise Blocked("The interrupted synthetic notebook creation has an ambiguous identity.")
+        with _spark_client(deployment.client):
+            deployment.verify_target_ownership(expected_pending=pending)
+            value = deployment._listed_notebook(expected)
+            deployment.resources[key] = {"id": _uuid(value.get("id"), "Notebook ID"),
+                                         "name": expected, "type": "Notebook", "confirmed": True}
+            try:
+                if key == "notebook":
+                    deployment.notebook(False)
+                else:
+                    deployment.monitor_notebook(False)
+            except Exception:
+                del deployment.resources[key]
+                raise
+        deployment.ledger.finish()
+        return
+    if (re.fullmatch(r"demo2synthetic-[0-9a-f]{12}", deployment.s["prefix"])
+            and pending.get("kind") == "create-item" and pending.get("key") == "database"
+            and not pending.get("operation_id") and "database" not in deployment.resources
+            and pending.get("item_type") == "KQLDatabase"
+            and pending.get("name") == deployment.s["database_name"]):
+        deployment.workspace(False)
+        parent = deployment.item("eventhouse", "Eventhouse", deployment.s["eventhouse_name"], False)
+        if pending.get("parent_eventhouse_id") != parent["id"]:
+            raise Blocked("The interrupted synthetic database creation has an ambiguous parent.")
+        ws = deployment.resources["workspace"]["id"]
+        rows = deployment.client.pages(f"/v1/workspaces/{ws}/kqlDatabases")
+        matching = [row for row in rows if isinstance(row, dict)
+                    and row.get("displayName") == pending["name"]]
+        value = _one(matching, "Interrupted synthetic KQL database")
+        if value.get("description") != deployment.marker:
+            raise Blocked("The interrupted synthetic database lacks the exact ownership marker.")
+        deployment.resources["database"] = {
+            "id": _uuid(value.get("id"), "KQLDatabase ID"), "name": pending["name"],
+            "type": "KQLDatabase", "confirmed": True, "parent_eventhouse_id": parent["id"],
+        }
+        try:
+            deployment.database(False)
+        except (Blocked, Failure):
+            del deployment.resources["database"]
+            raise
+        deployment.ledger.finish()
+        return
     if pending.get("kind") == "create-item" and pending.get("operation_id"):
         key, kind, name = pending.get("key"), pending.get("item_type"), pending.get("name")
         expected = {
@@ -1557,6 +1715,11 @@ def _monitor_binding(targets, generator_digest, producer_config):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _monitor_duration(track_timeout, max_duration, verification_timeout, *, legacy=False):
+    headroom = 2 * track_timeout if legacy else 4 * track_timeout + MONITOR_STARTUP_HEADROOM_SECONDS
+    return headroom + max_duration + verification_timeout
+
+
 def _monitor_config(settings, selected, *, bind=True):
     if selected is not None and "demo-2" not in selected:
         raise Failure("Demo 2 must be included in --selected-demos for monitor operations")
@@ -1581,16 +1744,18 @@ def _monitor_config(settings, selected, *, bind=True):
         raise Failure("shared.run_state_location must match the derived producer runs root")
     if settings["max_duration"] <= (settings["expected_batch_count"] - 1) * settings["interval_seconds"]:
         raise Failure("data.max_duration_seconds must exceed the final scheduled batch offset")
-    if settings["expected_batch_count"] * settings["rows_per_file"] > 2**63 - 1:
-        raise Failure("The configured sales line IDs exceed the producer's 64-bit range")
     data = settings["data"]
+    synthetic = settings["prefix"].startswith("demo2synthetic-")
+    if synthetic and bind and selected != {"demo-2"}:
+        raise Blocked("Synthetic monitor requires --selected-demos demo-2.")
     producer_config = {
-        "run_id": data["run_id"], "batch_class": "measured", "start_date": data["start_date"],
+        "run_id": data["run_id"], "batch_class": "bootstrap" if synthetic else "measured",
+        "start_date": data["start_date"],
         "seed": data["seed"], "date_count": data["date_count"], "products": data["product_count"],
         "customers": data["customer_count"], "file_count": settings["expected_batch_count"],
         "rows_per_file": settings["rows_per_file"], "interval_seconds": settings["interval_seconds"],
     }
-    duration = 2 * settings["track_timeout"] + settings["max_duration"] + settings["timeout"]
+    duration = _monitor_duration(settings["track_timeout"], settings["max_duration"], settings["timeout"])
     try:
         _now() + timedelta(seconds=duration + settings["track_timeout"])
     except (OverflowError, ValueError) as exc:
@@ -1601,7 +1766,7 @@ def _monitor_config(settings, selected, *, bind=True):
     if bind:
         try:
             targets = _targets(settings["target_bindings"])
-        except ReservationError as exc:
+        except TargetBindingError as exc:
             raise Blocked("Complete independently supplied selected target bindings are required.") from exc
         if "demo-2" not in targets or (selected is not None and set(targets) != selected):
             raise Blocked("The target binding map must match every selected demo, including Demo 2.")
@@ -1620,6 +1785,7 @@ def _monitor_config(settings, selected, *, bind=True):
                          "/Files/preflight/producer-monitor-heartbeat-v1.txt"),
         "duration": duration,
         "producer_config": producer_config,
+        "synthetic_run_id": data["run_id"] if synthetic else None,
         "target_bindings": targets,
         "generator_sha256": generator_digest,
         "monitor_binding_sha256": binding_digest,
@@ -1745,7 +1911,7 @@ class Monitor:
                          "max_concurrent_batches", "track_timeout_seconds", "max_duration_seconds"))
                 and isinstance(start.get("producer_config"), dict)
                 and start["producer_config"].get("run_id") == start["run_id"]
-                and start["producer_config"].get("batch_class") == "measured"
+                and start["producer_config"].get("batch_class") == self.config["producer_config"]["batch_class"]
                 and type(start["producer_config"].get("file_count")) is int
                 and start["producer_config"]["file_count"] == start["expected_batch_count"]
                 and all(key in record and key in start and _same_json(record[key], start[key]) for key in fixed)
@@ -1755,8 +1921,12 @@ class Monitor:
                 raise ValueError
             submitted = _utc(start["submitted_at_utc"], "submission time")
             deadline = _utc(start["deadline_utc"], "deadline")
-            if (start["duration_seconds"] != 2 * start["track_timeout_seconds"]
-                    + start["max_duration_seconds"] + start["verification_timeout_seconds"]
+            durations = {
+                _monitor_duration(start["track_timeout_seconds"], start["max_duration_seconds"],
+                                  start["verification_timeout_seconds"], legacy=legacy_duration)
+                for legacy_duration in (False, True)
+            }
+            if (start["duration_seconds"] not in durations
                     or submitted + timedelta(seconds=start["duration_seconds"]) != deadline
                     or start["max_concurrent_batches"] > 4):
                 raise ValueError
@@ -1767,7 +1937,6 @@ class Monitor:
                 raise ValueError
             if current_run and (
                 start["run_id"] != self.config["run_id"]
-                or start["duration_seconds"] != self.config["duration"]
                 or start.get("expected_batch_count") != self.s["expected_batch_count"]
                 or start.get("verification_timeout_seconds") != self.s["timeout"]
                 or start.get("poll_interval_seconds") != self.s["poll"]
@@ -1779,7 +1948,7 @@ class Monitor:
                                           for key in self.BINDING_FIELDS))
             ):
                 raise ValueError
-        except (Blocked, Failure, ReservationError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        except (Blocked, Failure, KeyError, TypeError, ValueError, OverflowError) as exc:
             raise Blocked("The immutable monitor start record and ownership ledger do not match; "
                           "termination cannot be established.") from exc
         if ledger_job is None:
@@ -1887,6 +2056,9 @@ class Monitor:
         if fresh:
             now = _now()
             freshness = min(300, max(60, 3 * self.s["poll"]))
+            if (value.get("generator_sha256") != evidence["generator_sha256"]
+                    or value.get("monitor_binding_sha256") != evidence["monitor_binding_sha256"]):
+                raise Blocked("The monitor heartbeat does not match the bound generator and targets.")
             if (value["state"] != "running" or deadline <= now
                     or heartbeat > now + timedelta(seconds=5)
                     or now - heartbeat > timedelta(seconds=freshness)):
@@ -1953,6 +2125,8 @@ class Monitor:
         state, state_etag = self._runtime_state(evidence, fresh=False)
         records = state["batches"]
         if (state["state"] != "completed" or state.get("manifest_observed") is not True
+                or state.get("generator_sha256") != evidence["generator_sha256"]
+                or state.get("monitor_binding_sha256") != evidence["monitor_binding_sha256"]
                 or len(records) != evidence["expected_batch_count"]):
             raise Blocked("The completed monitor state does not contain every expected measured batch.")
         for number in range(1, evidence["expected_batch_count"] + 1):
@@ -1982,11 +2156,17 @@ class Monitor:
                 or len(destinations) != len(set(destinations))
                 or "demo-2" not in destinations
                 or set(destinations) != set(evidence["target_bindings"])
+                or not _same_json(manifest.get("target_bindings"), evidence["target_bindings"])
                 or not _same_json(manifest.get("config"), evidence["producer_config"])):
             raise Blocked("The final producer manifest configuration or destinations do not match this run.")
         try:
             batches = contract._measured(
-                manifest, {"run_id": evidence["run_id"], "count": evidence["expected_batch_count"]}
+                manifest, {"run_id": evidence["run_id"], "count": evidence["expected_batch_count"],
+                           "generator_sha256": evidence["generator_sha256"],
+                           "producer_config": evidence["producer_config"],
+                           "destinations": sorted(evidence["target_bindings"]),
+                           "target_bindings": evidence["target_bindings"],
+                           "synthetic_run_id": self.config["synthetic_run_id"]}
             )
         except (contract.MonitorError, KeyError, TypeError, ValueError, OverflowError) as exc:
             raise Blocked("The final producer manifest does not prove the expected measured batches.") from exc
@@ -2015,14 +2195,27 @@ class Monitor:
         except (Blocked, OverflowError, ValueError) as exc:
             raise Blocked("The final producer scheduler timestamps do not prove bounded completion.") from exc
 
+        database = self.d.verify_target_ownership()
         for batch in batches:
             record = records[batch["batch_id"]]
             try:
                 if record["fingerprint"] != contract.batch_fingerprint(batch):
                     raise ValueError
                 contract.verify_delivery_evidence(batch, record)
+                submitted_at = _utc(
+                    batch["deliveries"]["demo-2"]["submission_result_at_utc"], "submission result"
+                )
+                if _utc(record["deadline_utc"], "batch deadline") > submitted_at + timedelta(
+                        seconds=evidence["verification_timeout_seconds"]):
+                    raise ValueError
             except (contract.MonitorError, KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise Blocked("A measured batch lacks matching fingerprint and Kusto delivery evidence.") from exc
+            verify_kql_batch(
+                self.d._kql(
+                    database, batch_verification_query(self.s["table"], batch["batch_id"]), query=True,
+                ),
+                batch,
+            )
             expected = {key: batch[key] for key in ("batch_id", "row_count", "sales_amount_minor_units")}
             self._verified_child(contract, record["job_id"], "verify_batch", expected)
 
@@ -2033,7 +2226,6 @@ class Monitor:
         }
         self._verified_child(contract, run["job_id"], "verify_run_keys", expected_run)
 
-        verify_global_reservation(self.s, self.client, evidence, manifest, state, batches)
         final_manifest, final_manifest_etag = self._object(evidence["manifest_uri"])
         final_state, final_state_etag = self._runtime_state(evidence, fresh=False)
         if manifest_etag != final_manifest_etag or not _same_json(manifest, final_manifest):
@@ -2189,7 +2381,7 @@ class Monitor:
             else:
                 _atomic_create_json(archive, value)
 
-    def start(self):
+    def start(self, *, admission_expires_at=None):
         replacing_prior = False
         if self.path.exists():
             self._load(current_run=False)
@@ -2221,6 +2413,8 @@ class Monitor:
             self.start_path.unlink()
         if self.start_path.exists():
             raise Blocked("An immutable monitor start record already exists; reconcile it before submitting.")
+        if admission_expires_at is not None:
+            _require_synthetic_fresh(admission_expires_at)
         submitted = _now()
         try:
             deadline = submitted + timedelta(seconds=self.config["duration"])
@@ -2261,6 +2455,10 @@ class Monitor:
             ("VERIFIER_NOTEBOOK_ID", verifier, "Text"),
             ("EXPECTED_IDENTITY_ID", evidence["identity_id"], "Text"),
             ("EXPECTED_TENANT_ID", evidence["tenant_id"], "Text"),
+            ("EXPECTED_GENERATOR_SHA256", evidence["generator_sha256"], "Text"),
+            ("EXPECTED_PRODUCER_CONFIG_JSON", json.dumps(evidence["producer_config"], sort_keys=True), "Text"),
+            ("EXPECTED_TARGET_BINDINGS_JSON", json.dumps(evidence["target_bindings"], sort_keys=True), "Text"),
+            ("EXPECTED_MONITOR_BINDING_SHA256", evidence["monitor_binding_sha256"], "Text"),
             ("EXPECTED_BATCH_COUNT", evidence["expected_batch_count"], "Integer"),
             ("VERIFICATION_TIMEOUT_SECONDS", evidence["verification_timeout_seconds"], "Integer"),
             ("POLL_INTERVAL_SECONDS", evidence["poll_interval_seconds"], "Integer"),
@@ -2268,6 +2466,12 @@ class Monitor:
         ]
         body = {"parameters": [{"name": name, "value": value, "type": kind}
                                for name, value, kind in parameters], "executionData": {"compute": "Spark"}}
+        if admission_expires_at is not None:
+            try:
+                _require_synthetic_fresh(admission_expires_at)
+            except Blocked as exc:
+                raise Blocked("Synthetic runtime preflight expired before monitor submission; "
+                              "reconcile the unsubmitted monitor intent.") from exc
         try:
             status, headers, _ = self.client.fabric(
                 "POST", f"/v1/workspaces/{ws}/notebooks/{monitor}/jobs/execute/instances?beta=false", body,
@@ -2391,13 +2595,13 @@ def _resolve_target_candidate(args, settings):
         raise Blocked("The existing Demo 2 ownership ledger could not be read.") from exc
 
 
-def _write_target_candidate(args, settings, ledger):
+def _journal_target(settings, ledger, *, expected_pending=None):
     try:
         resources = ledger.data["resources"]
         workspace, eventhouse, database, table = (resources[key] for key in
                                                    ("workspace", "eventhouse", "database", "table"))
         if (settings["tenant_id"] is None or uuid.UUID(settings["tenant_id"]).int == 0
-                or ledger.data["pending"] is not None
+                or ledger.data["pending"] != expected_pending
                 or any(not isinstance(item, dict) or item.get("confirmed") is not True
                        for item in (workspace, eventhouse, database, table))
                 or workspace.get("type") != "Workspace" or workspace.get("name") != settings["workspace_name"]
@@ -2414,6 +2618,11 @@ def _write_target_candidate(args, settings, ledger):
         _targets({"demo-2": target})
     except (KeyError, TypeError, ValueError) as exc:
         raise Blocked("A complete, confirmed Demo 2 ownership ledger is required for a target candidate.") from exc
+    return target
+
+
+def _write_target_candidate(args, settings, ledger):
+    target = _journal_target(settings, ledger)
     candidate = {"contract_version": 1, "track": "demo-2", "tenant_id": settings["tenant_id"],
                  "prefix": settings["prefix"], "target": target}
     path = args.result.parent / "demo-2-target-candidate.json"
@@ -2426,7 +2635,57 @@ def _write_target_candidate(args, settings, ledger):
     return "pass", False, ["A provisional ownership-ledger target candidate was recorded; live readiness is unverified."]
 
 
+def _verify_synthetic_preparation(deployment, monitor_config, *, verify_definitions=True):
+    resources = deployment.resources
+    preparation = resources.get("synthetic_preparation")
+    try:
+        if (not isinstance(preparation, dict)
+                or preparation.get("run_id") != monitor_config["run_id"]
+                or preparation.get("generator_sha256") != monitor_config["generator_sha256"]
+                or preparation.get("workspace_id") != resources["workspace"]["id"]
+                or preparation.get("lakehouse_id") != resources["lakehouse"]["id"]
+                or preparation.get("notebook_id") != resources["notebook"]["id"]
+                or _uuid(preparation.get("job_id"), "preload job ID") != preparation["job_id"]):
+            raise ValueError
+    except (Failure, KeyError, TypeError, ValueError) as exc:
+        raise Blocked("A verified, run-bound synthetic preparation is required before monitor start.") from exc
+    database = deployment.verify_target_ownership()
+    if verify_definitions:
+        deployment.notebook(False)
+        deployment.monitor_notebook(False)
+    deployment.shortcut(deployment.mirror(database), False)
+    with _spark_client(deployment.client):
+        ws = preparation["workspace_id"]
+        notebook = preparation["notebook_id"]
+        job_id = preparation["job_id"]
+        status, _, job = deployment.client.fabric(
+            "GET", f"/v1/workspaces/{ws}/notebooks/{notebook}/jobs/execute/instances/{job_id}?beta=true"
+        )
+    if (status != 200 or not isinstance(job, dict) or job.get("id") != job_id
+            or job.get("itemId") != notebook or job.get("status") != "Completed"):
+        raise Blocked("The recorded synthetic dimension-preload job is not confirmed completed.")
+    _verify_notebook_exit(job, "preload", None)
+
+
 def _run(args, settings):
+    synthetic = re.fullmatch(r"demo2synthetic-([0-9a-f]{12})", settings["prefix"])
+    synthetic_modes = {"provision-synthetic", "prepare-synthetic-monitor", "start-synthetic-monitor", "synthetic-monitor-status",
+                       "wait-synthetic-monitor"}
+    target_checks = {"resolve-target-candidate", "verify-target-ownership"}
+    if synthetic:
+        if (settings["workspace_name"] != f"{settings['prefix']}-demo2-eventhouse"
+                or settings["table"] != "SyntheticFactSales"):
+            raise Failure("Synthetic work requires the reserved workspace and table names.")
+        run_id = settings["data"]["run_id"]
+        if run_id != f"demo2synthetic_{synthetic[1]}" and (
+                args.mode not in target_checks or (run_id or "").casefold().startswith("demo2synthetic_")):
+            raise Failure("Synthetic work requires the matching reserved run ID outside ownership checks.")
+        if args.mode not in synthetic_modes | target_checks | {"dry-run", "stop-monitor"}:
+            raise Blocked("Production modes cannot use the reserved synthetic deployment scope.")
+    elif (args.mode in synthetic_modes or settings["prefix"].startswith("demo2synthetic-")
+          or (settings["data"]["run_id"] or "").casefold().startswith("demo2synthetic_")
+          or settings["table"].casefold() == "syntheticfactsales"):
+        raise Blocked("Synthetic runs and resources require an isolated synthetic deployment scope.")
     if args.mode == "dry-run":
         return "pass", False, [
             f"Offline configuration check only; no deployment or readiness was verified. "
@@ -2436,39 +2695,91 @@ def _run(args, settings):
         return _resolve_target_candidate(args, settings)
     if args.mode == "cleanup" and not args.yes:
         raise Failure("cleanup requires --yes; no resources were removed")
-    monitor_config = (_monitor_config(settings, args.selected_demos, bind=args.mode != "stop-monitor")
-                      if args.mode in ("start-monitor", "monitor-status", "wait-monitor", "stop-monitor") else None)
+    monitor_mode = {"start-synthetic-monitor": "start-monitor", "synthetic-monitor-status": "monitor-status",
+                    "wait-synthetic-monitor": "wait-monitor"}.get(args.mode, args.mode)
+    monitor_config = (_monitor_config(settings, args.selected_demos, bind=monitor_mode != "stop-monitor")
+                      if monitor_mode in ("prepare-synthetic-monitor", "start-monitor", "monitor-status",
+                                          "wait-monitor", "stop-monitor") else None)
     if settings["tenant_id"] is None:
         raise Blocked("tenant_id is required to verify the Azure CLI identity safely.")
-    builder = _load_builder() if args.mode in ("deploy", "start-monitor", "monitor-status", "wait-monitor") else None
-    if args.mode in ("start-monitor", "monitor-status", "wait-monitor"):
+    builder = _load_builder() if monitor_mode in ("deploy", "prepare-synthetic-monitor", "start-monitor", "monitor-status", "wait-monitor") else None
+    if monitor_mode in ("prepare-synthetic-monitor", "start-monitor", "monitor-status", "wait-monitor"):
         _load_monitor_builder()
     deadline = Deadline(settings["track_timeout"], label="track")
     if args.mode == "validate-only" and not (args.state_dir / STATE_FILE).exists():
         client = FabricClient(settings["tenant_id"], deadline)
         ReadOnlyDeployment(settings, client, deadline).validate()
         raise Blocked("Read-only validation did not establish all readiness evidence.")
-    with Ledger(args.state_dir, settings, create=args.mode == "deploy") as ledger:
+    with Ledger(args.state_dir, settings, create=args.mode in ("deploy", "provision-synthetic")) as ledger:
         client = FabricClient(settings["tenant_id"], deadline)
         deployment = Deployment(settings, client, deadline, ledger, builder)
+        if args.mode == "verify-target-ownership":
+            deployment.verify_target_ownership()
+            return "pass", False, ["Fresh Fabric and KQL readbacks match the recorded Demo 2 ownership; "
+                                   "producer permissions and readiness are unverified."]
         _recover_pending(deployment)
+        if args.mode == "provision-synthetic":
+            deployment.workspace(True)
+            deployment.item("eventhouse", "Eventhouse", settings["eventhouse_name"], True)
+            deployment.item("lakehouse", "Lakehouse", settings["lakehouse_name"], True)
+            database = deployment.database(True)
+            deployment.configure_kql(database)
+            deployment.verify_target_ownership()
+            return "pass", False, ["Synthetic target ownership and schema were verified; no data was submitted."]
+        if args.mode == "prepare-synthetic-monitor":
+            if (deployment.resources.get("workspace", {}).get("id") == settings["shared_workspace_id"]
+                    or (ledger.directory / MONITOR_FILE).exists()):
+                raise Blocked("Synthetic preparation requires a distinct target and no prior monitor job.")
+            if deployment.resources.get("synthetic_preparation") is not None:
+                _verify_synthetic_preparation(deployment, monitor_config)
+            else:
+                database = deployment.verify_target_ownership()
+                deployment.item("lakehouse", "Lakehouse", settings["lakehouse_name"], False)
+                deployment.notebook(True)
+                deployment.shortcut(deployment.mirror(database), True)
+                deployment.monitor_notebook(True)
+                preparation = {
+                    "run_id": monitor_config["run_id"], "generator_sha256": monitor_config["generator_sha256"],
+                    "workspace_id": deployment.resources["workspace"]["id"],
+                    "lakehouse_id": deployment.resources["lakehouse"]["id"],
+                    "notebook_id": deployment.resources["notebook"]["id"],
+                }
+                deployment.run_notebook("preload", synthetic_preparation=preparation)
+                _verify_synthetic_preparation(deployment, monitor_config)
+            return "pass", False, ["Synthetic dimensions, shortcut and notebook definitions were prepared; "
+                                   "producer runtime admission and monitor start are not established."]
         if monitor_config is not None:
             monitor = Monitor(deployment, monitor_config)
-            if args.mode != "stop-monitor":
-                verify_monitor_readiness(deployment)
+            admission_expires_at = None
+            if monitor_mode != "stop-monitor":
+                if synthetic:
+                    if deployment.resources.get("workspace", {}).get("id") == settings["shared_workspace_id"]:
+                        raise Blocked("Synthetic staging and Eventhouse workspaces must be distinct.")
+                    if monitor_mode == "start-monitor":
+                        _verify_synthetic_preparation(deployment, monitor_config, verify_definitions=False)
+                        admission_expires_at = verify_synthetic_runtime_access(deployment, monitor_config)
+                        _require_synthetic_fresh(admission_expires_at)
+                    else:
+                        deployment.verify_target_ownership()
+                else:
+                    verify_monitor_readiness(deployment)
             with _spark_client(client):
-                if args.mode == "start-monitor":
-                    monitor.start()
-                    return "pass", True, ["The exact monitor job is running with fresh identity and sentinel evidence."]
-                if args.mode == "monitor-status":
+                batch_label = "synthetic bootstrap" if synthetic else "measured"
+                if monitor_mode == "start-monitor":
+                    if synthetic:
+                        monitor.start(admission_expires_at=admission_expires_at)
+                    else:
+                        monitor.start()
+                    return "pass", not synthetic, ["The exact monitor job is running with fresh identity and sentinel evidence."]
+                if monitor_mode == "monitor-status":
                     status = monitor.status()
                     if status == "completed":
-                        return "pass", True, ["The exact monitor completed and verified every measured batch and the run."]
-                    return "pass", True, ["The exact monitor is running with fresh identity and sentinel evidence; "
-                                          "measured-batch verification is not yet complete."]
-                if args.mode == "wait-monitor":
+                        return "pass", not synthetic, [f"The exact monitor completed and verified every {batch_label} batch and the run."]
+                    return "pass", not synthetic, ["The exact monitor is running with fresh identity and sentinel evidence; "
+                                                  "batch verification is not yet complete."]
+                if monitor_mode == "wait-monitor":
                     monitor.wait()
-                    return "pass", True, ["The exact monitor completed and verified every measured batch and the run."]
+                    return "pass", not synthetic, [f"The exact monitor completed and verified every {batch_label} batch and the run."]
                 sidecar_updated = monitor.stop()
                 message = "The recorded monitor and verification jobs are terminal; its writer lock is released."
                 if not sidecar_updated:
@@ -2486,9 +2797,11 @@ def _run(args, settings):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", required=True, choices=("dry-run", "resolve-target-candidate", "validate-only", "deploy", "cleanup",
+    parser.add_argument("--mode", required=True, choices=("dry-run", "resolve-target-candidate",
+                                                          "verify-target-ownership", "validate-only", "deploy", "cleanup",
                                                           "start-monitor", "monitor-status", "wait-monitor",
-                                                          "stop-monitor"))
+                                                          "stop-monitor", "provision-synthetic", "prepare-synthetic-monitor", "start-synthetic-monitor",
+                                                          "synthetic-monitor-status", "wait-synthetic-monitor"))
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True, type=Path)

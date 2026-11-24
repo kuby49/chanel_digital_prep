@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import unittest
 import uuid
@@ -15,10 +16,12 @@ LAKEHOUSE = "04113b0b-8698-4a61-a69d-ad862e96b6e6"
 PRODUCER_WORKSPACE = "48593f2f-d3ac-474b-ba96-08282d6f69df"
 PRODUCER_LAKEHOUSE = "fca649c9-0297-4997-8e2d-8ac5338aaa1a"
 NOTEBOOK = "1ce63551-cd56-4cf6-91ea-bc854aec7198"
+DATABASE = "9b3fd360-a689-4163-91d6-3981882cd6c8"
 IDENTITY = "c2934d7c-4724-4cef-a50e-2a5d89afb4a4"
 TENANT = "4526cee1-4399-4e4b-9134-46fabd583527"
 BASE = "https://onelake.blob.fabric.microsoft.com"
 RUN = "test_run"
+GENERATOR_SHA256 = "a" * 64
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
@@ -28,6 +31,12 @@ def stamp(value):
 
 def parameters(count=1, concurrency=2):
     producer = f"{BASE}/{PRODUCER_WORKSPACE}/{PRODUCER_LAKEHOUSE}"
+    config = {"run_id": RUN, "file_count": count}
+    targets = {"demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "FactSales"}}
+    binding = hashlib.sha256(json.dumps(
+        {"targets": targets, "generator_sha256": GENERATOR_SHA256, "config": config},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
     return {
         "RUN_ID": RUN,
         "MANIFEST_URL": f"{producer}/Files/producer/runs/{RUN}/manifest.json",
@@ -39,6 +48,10 @@ def parameters(count=1, concurrency=2):
         "VERIFIER_NOTEBOOK_ID": NOTEBOOK,
         "EXPECTED_IDENTITY_ID": IDENTITY,
         "EXPECTED_TENANT_ID": TENANT,
+        "EXPECTED_GENERATOR_SHA256": GENERATOR_SHA256,
+        "EXPECTED_PRODUCER_CONFIG_JSON": json.dumps(config, sort_keys=True),
+        "EXPECTED_TARGET_BINDINGS_JSON": json.dumps(targets, sort_keys=True),
+        "EXPECTED_MONITOR_BINDING_SHA256": binding,
         "EXPECTED_BATCH_COUNT": count,
         "VERIFICATION_TIMEOUT_SECONDS": 30,
         "POLL_INTERVAL_SECONDS": 1,
@@ -73,8 +86,10 @@ def manifest(*batches, count=None):
     return {
         "contract_version": 1,
         "run_id": RUN,
+        "generator_sha256": GENERATOR_SHA256,
         "config": {"run_id": RUN, "file_count": count or len(batches)},
         "destinations": ["demo-2"],
+        "target_bindings": {"demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "FactSales"}},
         "batches": {str(item["batch_number"]): item for item in batches},
         "scheduler": {"status": "running"},
     }
@@ -180,6 +195,51 @@ class MonitorControllerTests(unittest.TestCase):
         self.client = FakeClient(self.cfg)
         self.controller = Controller(self.cfg, self.client, clock=self.clock, sleep=self.clock.advance)
 
+    def test_synthetic_monitor_reconciles_bootstrap_without_accepting_measured_data(self):
+        run = "demo2synthetic_123456abcdef"
+        target = {"demo-2": {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"}}
+        config = {"run_id": run, "batch_class": "bootstrap", "file_count": 1}
+        binding = hashlib.sha256(json.dumps(
+            {"targets": target, "generator_sha256": GENERATOR_SHA256, "config": config},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        params = {
+            **self.params, "RUN_ID": run,
+            "MANIFEST_URL": self.params["MANIFEST_URL"].replace(RUN, run),
+            "STATE_URL": self.params["STATE_URL"].replace(RUN, run),
+            "EXPECTED_PRODUCER_CONFIG_JSON": json.dumps(config),
+            "EXPECTED_TARGET_BINDINGS_JSON": json.dumps(target),
+            "EXPECTED_MONITOR_BINDING_SHA256": binding,
+        }
+        cfg = settings(params, lakehouse_id=LAKEHOUSE)
+        client = FakeClient(cfg)
+        controller = Controller(cfg, client, clock=self.clock, sleep=self.clock.advance)
+        item = {**batch(1), "batch_id": f"{run}_0001"}
+        client.manifest = {
+            **manifest(item), "run_id": run, "config": config, "target_bindings": target,
+        }
+        controller._begin()
+        with self.assertRaisesRegex(MonitorError, "bootstrap batches only"):
+            controller._tick()
+        self.assertEqual(client.started, [])
+        item["batch_class"] = "bootstrap"
+        controller._tick()
+        job_id = client.started[0][3]
+        self.clock.advance(1)
+        verified_delivery(item, self.clock())
+        client.results[job_id] = {"status": "Completed", "properties": {"exitValue": {
+            "mode": "verify_batch", "status": "verified",
+            "batch": {key: item[key] for key in ("batch_id", "row_count", "sales_amount_minor_units")},
+        }}}
+        controller._tick()
+        record = controller.state["batches"][item["batch_id"]]
+        self.assertEqual(record["status"], "verified")
+        self.assertEqual(record["verified_at_utc"], stamp(self.clock()))
+        with self.assertRaisesRegex(MonitorError, "isolated bootstrap target"):
+            settings({**params, "VERIFIER_WORKSPACE_ID": PRODUCER_WORKSPACE,
+                      "STATE_URL": params["STATE_URL"].replace(WORKSPACE, PRODUCER_WORKSPACE)},
+                     lakehouse_id=LAKEHOUSE)
+
     def test_notebook_packages_sources_and_binds_expected_lakehouse(self):
         notebook = build_monitor_notebook(
             workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse"
@@ -195,11 +255,57 @@ class MonitorControllerTests(unittest.TestCase):
             ("MANIFEST_URL", self.params["MANIFEST_URL"].replace(".com/", ".com.evil/")),
             ("SENTINEL_URL", self.params["SENTINEL_URL"] + "?token=bad"),
             ("STATE_URL", self.params["STATE_URL"].replace(LAKEHOUSE, PRODUCER_LAKEHOUSE)),
+            ("EXPECTED_GENERATOR_SHA256", "invalid"),
+            ("EXPECTED_PRODUCER_CONFIG_JSON", "invalid"),
+            ("EXPECTED_TARGET_BINDINGS_JSON", "{}"),
+            ("EXPECTED_MONITOR_BINDING_SHA256", "b" * 64),
             ("VERIFICATION_TIMEOUT_SECONDS", True),
             ("MAX_CONCURRENT_BATCHES", 0),
         ):
             with self.subTest(field=field), self.assertRaises(MonitorError):
                 settings({**self.params, field: value}, lakehouse_id=LAKEHOUSE)
+
+    def test_manifest_must_match_bound_generator_before_launch(self):
+        for digest in (None, "b" * 64):
+            with self.subTest(digest=digest):
+                client = FakeClient(self.cfg)
+                client.manifest = manifest(batch(1))
+                client.manifest["generator_sha256"] = digest
+                controller = Controller(self.cfg, client, clock=self.clock, sleep=self.clock.advance)
+                controller._begin()
+                with self.assertRaisesRegex(MonitorError, "does not match"):
+                    controller._tick()
+                self.assertEqual(client.started, [])
+
+    def test_manifest_configuration_destinations_and_targets_cannot_drift(self):
+        for field in ("config", "destinations", "target_bindings"):
+            for after_observation in (False, True):
+                with self.subTest(field=field, after_observation=after_observation):
+                    client = FakeClient(self.cfg)
+                    client.manifest = manifest(batch(1))
+                    controller = Controller(self.cfg, client, clock=self.clock, sleep=self.clock.advance)
+                    controller._begin()
+                    if after_observation:
+                        controller._tick()
+                    if field == "config":
+                        client.manifest[field]["seed"] = 99
+                    elif field == "destinations":
+                        client.manifest[field] = ["demo-1", "demo-2"]
+                    else:
+                        client.manifest[field]["demo-2"]["item_id"] = str(uuid.UUID(int=999))
+                    with self.assertRaisesRegex(MonitorError, "does not match"):
+                        controller._tick()
+                    self.assertEqual(len(client.started), int(after_observation))
+
+    def test_oversized_manifest_batch_key_fails_cleanly(self):
+        client = FakeClient(self.cfg)
+        client.manifest = manifest(batch(1))
+        client.manifest["batches"]["9" * 5000] = client.manifest["batches"].pop("1")
+        controller = Controller(self.cfg, client, clock=self.clock, sleep=self.clock.advance)
+        with self.assertRaisesRegex(MonitorError, "batch identity"):
+            controller.run()
+        self.assertEqual(controller.state["state"], "failed")
+        self.assertEqual(client.started, [])
 
     def test_missing_manifest_is_waiting_not_storage_proof(self):
         self.controller._begin()
@@ -240,6 +346,12 @@ class MonitorControllerTests(unittest.TestCase):
                                        "deadline_utc": stamp(NOW + timedelta(minutes=5))}}
         self.controller._tick()
         self.assertEqual(self.client.started[1][0], "verify_run_keys")
+        record = self.controller.state["batches"][f"{RUN}_0001"]
+        self.assertEqual(record["verified_at_utc"], stamp(self.clock()))
+        self.assertTrue(any(
+            snapshot["batches"].get(f"{RUN}_0001", {}).get("verified_at_utc") == stamp(self.clock())
+            for snapshot in self.client.snapshots
+        ))
         run_job = self.client.started[1][3]
         self.clock.advance(1)
         self.client.results[run_job] = {
@@ -254,6 +366,47 @@ class MonitorControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.state["state"], "completed")
         self.assertEqual(self.controller.state["batches"][f"{RUN}_0001"]["status"], "verified")
         self.assertNotIn("bootstrap_0001", self.controller.state["batches"])
+
+    def test_multiple_batches_reconcile_without_a_global_id_reservation(self):
+        cfg = settings(parameters(count=2), lakehouse_id=LAKEHOUSE)
+        client = FakeClient(cfg)
+        controller = Controller(cfg, client, clock=self.clock, sleep=self.clock.advance)
+        entries = [batch(1), batch(2)]
+        client.manifest = manifest(*entries, count=2)
+        controller._begin()
+        controller._tick()
+        self.assertEqual(len(client.started), 2)
+        self.clock.advance(1)
+        for entry, (_, _, _, job_id) in zip(entries, client.started):
+            verified_delivery(entry, self.clock())
+            client.results[job_id] = {
+                "status": "Completed",
+                "properties": {"exitValue": json.dumps({
+                    "mode": "verify_batch", "status": "verified",
+                    "batch": {key: entry[key] for key in ("batch_id", "row_count", "sales_amount_minor_units")},
+                })},
+            }
+        client.manifest["scheduler"] = {
+            "status": "completed", "finished_at_utc": stamp(self.clock()),
+            "result": {"verified": True, "errors": [], "deadline_utc": stamp(NOW + timedelta(minutes=5))},
+        }
+        controller._tick()
+        self.assertEqual([record["status"] for record in controller.state["batches"].values()],
+                         ["verified", "verified"])
+        mode, final_manifest, _, run_job = client.started[-1]
+        self.assertEqual(mode, "verify_run_keys")
+        self.assertNotIn("sales_line_id_reservation", final_manifest)
+        self.clock.advance(1)
+        client.results[run_job] = {
+            "status": "Completed",
+            "properties": {"exitValue": json.dumps({
+                "mode": "verify_run_keys", "status": "verified",
+                "batch_ids": [entry["batch_id"] for entry in entries],
+                "row_count": 4, "sales_amount_minor_units": 600,
+            })},
+        }
+        controller._tick()
+        self.assertEqual(controller.state["state"], "completed")
 
     def test_ambiguous_submission_uses_original_deadline_after_resolution(self):
         entry = batch(1)
@@ -288,6 +441,23 @@ class MonitorControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(MonitorError, "exceeded its verification deadline"):
             self.controller._tick()
         self.assertEqual(len(self.client.started), 1)
+
+    def test_restart_rejects_verified_batch_without_deadline_evidence(self):
+        entry = batch(1)
+        self.client.manifest = manifest(entry)
+        self.controller._begin()
+        self.controller._tick()
+        payload, etag = self.client.objects[self.cfg["state_url"]]
+        state = json.loads(payload)
+        state["batches"][entry["batch_id"]]["status"] = "verified"
+        self.client.objects[self.cfg["state_url"]] = (json.dumps(state).encode(), etag)
+        del self.client.objects[self.cfg["lock_url"]]
+        resumed = Controller(
+            {**self.cfg, "controller_id": str(uuid.UUID(int=2))},
+            self.client, clock=self.clock, sleep=self.clock.advance,
+        )
+        with self.assertRaisesRegex(MonitorError, "lacks valid deadline evidence"):
+            resumed._begin()
 
     def test_disappearing_manifest_is_a_failure_not_an_unbounded_wait(self):
         self.client.manifest = manifest(batch(1))
@@ -366,6 +536,26 @@ class MonitorControllerTests(unittest.TestCase):
         self.assertEqual(record["job_id"], original_job)
         self.assertEqual(record["deadline_utc"], old_deadline)
         self.assertEqual(len(self.client.started), 1)
+
+    def test_restart_rejects_changed_or_legacy_generator_binding(self):
+        for field in ("generator_sha256", "monitor_binding_sha256"):
+            for value in (None, "b" * 64):
+                with self.subTest(field=field, value=value):
+                    client = FakeClient(self.cfg)
+                    client.manifest = manifest(batch(1))
+                    controller = Controller(self.cfg, client, clock=self.clock, sleep=self.clock.advance)
+                    controller._begin()
+                    controller._tick()
+                    state = json.loads(client.objects[self.cfg["state_url"]][0])
+                    state[field] = value
+                    client.objects[self.cfg["state_url"]] = (json.dumps(state).encode("utf-8"), "prior")
+                    del client.objects[self.cfg["lock_url"]]
+                    resumed = Controller(self.cfg, client, clock=self.clock, sleep=self.clock.advance)
+                    with self.assertRaisesRegex(MonitorError, "explicit reconciliation"):
+                        resumed.run()
+                    self.assertNotIn(self.cfg["lock_url"], client.objects)
+                    self.assertEqual(json.loads(client.objects[self.cfg["state_url"]][0]), state)
+                    self.assertEqual(len(client.started), 1)
 
     def test_completed_run_is_not_restarted_and_temporary_lock_is_released(self):
         previous = {
@@ -499,14 +689,18 @@ class MonitorControllerTests(unittest.TestCase):
     def test_terminal_success_requires_exact_kql_reconciliation_evidence(self):
         entry = batch(1)
         delivery = verified_delivery(entry)
-        record = {"operation_id": delivery["operation_id"]}
+        record = {"operation_id": delivery["operation_id"],
+                  "deadline_utc": stamp(self.clock() + timedelta(seconds=30))}
         verify_delivery_evidence(entry, record)
         changes = (
             ("verified_row_count", 1),
             ("verified_total_minor_units", 299),
             ("verified_distinct_sales_line_ids", 1),
             ("verified_row_count", True),
+            ("submission_started_at_utc", stamp(NOW + timedelta(seconds=1))),
+            ("submission_result_at_utc", stamp(NOW + timedelta(seconds=1))),
             ("verified_at_utc", "invalid"),
+            ("verified_at_utc", record["deadline_utc"]),
         )
         for field, value in changes:
             with self.subTest(field=field, value=value):
@@ -514,7 +708,8 @@ class MonitorControllerTests(unittest.TestCase):
                 modified["deliveries"]["demo-2"][field] = value
                 with self.assertRaises(MonitorError):
                     verify_delivery_evidence(modified, record)
-        for field, value in (("error_code", "Forbidden"), ("timestamp_utc", "invalid")):
+        for field, value in (("error_code", "Forbidden"), ("timestamp_utc", "invalid"),
+                             ("timestamp_utc", record["deadline_utc"])):
             with self.subTest(field=field, value=value):
                 modified = copy.deepcopy(entry)
                 modified["deliveries"]["demo-2"]["ingestion_outcome"][field] = value

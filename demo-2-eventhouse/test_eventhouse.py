@@ -19,9 +19,9 @@ from eventhouse_core import (
 )
 from ingestion import EventhouseAdapter
 from lakehouse_validation import (
-    NotVisible, VerificationError, measured_batches, measured_reservation, reservation_bounds,
-    verify_batch_with_timeout, verify_run_keys,
+    NotVisible, VerificationError, measured_batches, verify_batch_with_timeout, verify_run_keys,
 )
+from monitor_controller import _measured
 
 
 WORKSPACE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -109,6 +109,17 @@ class IngestionTests(unittest.TestCase):
                          ValidationImplications.Fail)
         self.assertEqual(properties.ingest_if_not_exists, properties.ingest_by_tags)
         self.assertEqual(properties.ingest_by_tags, self.client.calls[1][1].ingest_by_tags)
+
+    def test_repeated_sales_id_in_a_different_batch_uses_a_different_replay_tag(self):
+        first = csv_bytes([sample_row()])
+        self.assertEqual(self.submit(first).status, "submitted")
+        second = csv_bytes([sample_row(batch_id="run_0002")])
+        self.path.write_bytes(second)
+        result = self.adapter.submit(
+            str(self.path), "run_0002", hashlib.sha256(second).hexdigest(), 1, 246
+        )
+        self.assertEqual(result.status, "submitted")
+        self.assertNotEqual(self.client.calls[0][1].ingest_by_tags, self.client.calls[1][1].ingest_by_tags)
 
     def test_invalid_csv_is_rejected_before_submission(self):
         invalid_rows = [
@@ -264,6 +275,7 @@ class ManifestTests(unittest.TestCase):
     def batch(self, batch_id="run_0001", batch_class="measured"):
         return {
             "batch_id": batch_id,
+            "batch_number": 1,
             "batch_class": batch_class,
             "sha256": "a" * 64,
             "row_count": 1,
@@ -275,7 +287,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_excludes_bootstrap_and_negative_batches(self):
         measured = self.batch()
-        manifest = {"contract_version": 1, "batches": {
+        manifest = {"contract_version": 1, "run_id": "run", "batches": {
             "1": measured,
             "2": self.batch("bootstrap_0001", "bootstrap"),
             "3": self.batch("negative_0001", "negative-test"),
@@ -292,51 +304,39 @@ class ManifestTests(unittest.TestCase):
         ):
             with self.subTest(batches=batches):
                 with self.assertRaises(VerificationError):
-                    measured_batches({"contract_version": 1, "batches": batches})
+                    measured_batches({"contract_version": 1, "run_id": "run", "batches": batches})
         with self.assertRaises(VerificationError):
-            measured_batches({"contract_version": True, "batches": {"1": self.batch()}})
+            measured_batches({"contract_version": True, "run_id": "run", "batches": {"1": self.batch()}})
 
     def test_run_key_verification_rejects_non_measured_batches(self):
         with self.assertRaises(VerificationError):
-            verify_run_keys(
-                None, [self.batch(batch_class="bootstrap")], "Lakehouse", "Facts", reservation={}
-            )
+            verify_run_keys(None, [self.batch(batch_class="bootstrap")], "Lakehouse", "Facts")
 
-    def test_reservation_requires_canonical_inclusive_bigint_range(self):
-        self.assertEqual(reservation_bounds({"start": "-1", "end": "1", "count": "3"}), (-1, 1, 3))
-        invalid = (
-            {"start": "01", "end": "1", "count": "1"},
-            {"start": "-0", "end": "1", "count": "2"},
-            {"start": 1, "end": "1", "count": "1"},
-            {"start": "1", "end": "1", "count": "01"},
-            {"start": "1", "end": "2", "count": "1"},
-            {"start": "2", "end": "1", "count": "1"},
-            {"start": "1", "end": str(2**63), "count": str(2**63)},
-            {"start": "9" * 5000, "end": "9" * 5000, "count": "1"},
-        )
-        for reservation in invalid:
-            with self.subTest(reservation=reservation), self.assertRaises(VerificationError):
-                reservation_bounds(reservation)
-
-    def test_measured_reservation_binds_run_generator_and_count(self):
-        batch = {**self.batch(), "batch_number": 1}
-        reservation = {
-            "version": 1, "allocator_id": "a" * 64, "run_id": "run",
-            "batch_class": "measured", "start": "10", "end": "10", "count": "1",
-            "generator_sha256": "b" * 64, "fingerprint": "c" * 64,
-        }
-        manifest = {"run_id": "run", "sales_line_id_reservation": reservation}
-        self.assertEqual(measured_reservation(manifest, [batch], "b" * 64), reservation)
-        for changes in (
-            {"run_id": "another_run"}, {"batch_class": "bootstrap"},
-            {"generator_sha256": "d" * 64}, {"fingerprint": "invalid"},
-            {"start": "10", "end": "11", "count": "2"},
+    def test_measured_batch_identity_is_bound_to_the_run_without_a_reservation(self):
+        batch = self.batch()
+        manifest = {"contract_version": 1, "run_id": "run", "batches": {"1": batch}}
+        self.assertEqual(measured_batches(manifest), [batch])
+        for changed in (
+            {**manifest, "run_id": "other"},
+            {**manifest, "batches": {"2": batch}},
+            {**manifest, "batches": {"1": {**batch, "batch_number": 2}}},
+            {**manifest, "batches": {"1": {**batch, "batch_number": True}}},
         ):
-            with self.subTest(changes=changes), self.assertRaises(VerificationError):
-                measured_reservation(
-                    {**manifest, "sales_line_id_reservation": {**reservation, **changes}},
-                    [batch], "b" * 64,
-                )
+            with self.subTest(changed=changed), self.assertRaises(VerificationError):
+                measured_batches(changed)
+
+    def test_synthetic_fixture_cannot_be_used_by_production_verifier(self):
+        run = "demo2synthetic_123456abcdef"
+        fixture = self.batch(batch_id=f"{run}_0001", batch_class="bootstrap")
+        document = {"contract_version": 1, "run_id": run, "batches": {"1": fixture}}
+        self.assertEqual(measured_batches(document, synthetic_run_id=run), [fixture])
+        with self.assertRaisesRegex(VerificationError, "Production verification"):
+            measured_batches(document)
+        with self.assertRaisesRegex(VerificationError, "reserved run"):
+            measured_batches(document, synthetic_run_id="demo2synthetic_000000000000")
+        fixture["batch_class"] = "measured"
+        with self.assertRaisesRegex(VerificationError, "bootstrap batches"):
+            measured_batches(document, synthetic_run_id=run)
 
     def test_shared_generator_csv_and_manifest_contract(self):
         default = Path(__file__).resolve().parent.parent / "demo-data-generator" / "generator.py"
@@ -349,22 +349,37 @@ class ManifestTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(generator)
         config = generator.RunConfig(
-            run_id="contract", start_date="2026-01-01", file_count=1, rows_per_file=20
+            run_id="contract", start_date="2026-01-01", file_count=2, rows_per_file=20
         )
-        payload, batch = generator.batch_bytes(config, 1)
+        manifest = generator.new_manifest(config, ["demo-2"])
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / batch["filename"]
-            path.write_bytes(payload)
             client = FakeIngestClient()
             adapter = EventhouseAdapter(database="SalesDB", table="FactSales",
                                         mapping="SalesCsvV1", ingest_client=client,
                                         query_client=FakeQueryClient([]))
-            submitted = adapter.submit(str(path), batch["batch_id"], batch["sha256"],
-                                       batch["row_count"], batch["sales_amount_minor_units"])
-        self.assertEqual(submitted.status, "submitted")
-        self.assertEqual(client.calls[0][0], payload)
-        self.assertEqual(measured_batches({"contract_version": 1, "batches": {"1": batch}}),
-                         [batch])
+            for number in (1, 2):
+                payload, batch = generator.batch_bytes(config, number)
+                path = Path(directory) / batch["filename"]
+                path.write_bytes(payload)
+                submitted = adapter.submit(str(path), batch["batch_id"], batch["sha256"],
+                                           batch["row_count"], batch["sales_amount_minor_units"])
+                self.assertEqual(submitted.status, "submitted")
+                self.assertEqual(client.calls[-1][0], payload)
+                self.assertEqual(
+                    [int(row["SalesLineID"]) for row in csv.DictReader(io.StringIO(payload.decode("utf-8")))],
+                    list(range(1, config.rows_per_file + 1)),
+                )
+                manifest["batches"][str(number)] = batch
+        self.assertNotEqual(client.calls[0][1].ingest_by_tags, client.calls[1][1].ingest_by_tags)
+        self.assertEqual(measured_batches(manifest), list(manifest["batches"].values()))
+        targets = {"demo-2": {"workspace_id": WORKSPACE_ID, "item_id": ITEM_ID, "fact": "FactSales"}}
+        manifest["target_bindings"] = targets
+        monitored = {
+            "run_id": config.run_id, "count": config.file_count,
+            "generator_sha256": manifest["generator_sha256"], "producer_config": manifest["config"],
+            "destinations": ["demo-2"], "target_bindings": targets,
+        }
+        self.assertEqual(_measured(manifest, monitored), list(manifest["batches"].values()))
 
 
 class VerificationTimeoutTests(unittest.TestCase):

@@ -96,19 +96,62 @@ def verify_dimensions(spark, data, generator, lakehouse, schema=None):
         _verify_dimension(spark, _table_name(lakehouse, name, schema), expected)
 
 
-def measured_batches(manifest):
+def validate_batch_evidence(batch):
+    if not isinstance(batch, dict):
+        raise VerificationError("Manifest batch identity is invalid")
+    try:
+        batch_identifier(batch["batch_id"])
+        checksum = batch["sha256"]
+        count = batch["row_count"]
+        total = batch["sales_amount_minor_units"]
+    except (KeyError, ValueError) as exc:
+        raise VerificationError("Manifest batch identity is invalid") from exc
+    if (
+        not isinstance(checksum, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", checksum)
+        or type(count) is not int
+        or count < 1
+        or type(total) is not int
+        or total < 0
+    ):
+        raise VerificationError("Manifest batch identity, checksum, count or total is invalid")
+    for field in (
+        "amount_by_date",
+        "amount_by_product_category",
+        "amount_by_customer_region",
+    ):
+        groups = batch.get(field)
+        if not isinstance(groups, dict) or any(
+            not isinstance(key, str) or type(value) is not int or value < 0
+            for key, value in groups.items()
+        ):
+            raise VerificationError(f"Manifest {field} is invalid")
+        if sum(groups.values()) != total:
+            raise VerificationError(f"Manifest {field} does not reconcile to the batch total")
+
+
+def measured_batches(manifest, *, synthetic_run_id=None):
     if (
         not isinstance(manifest, dict)
         or type(manifest.get("contract_version")) is not int
         or manifest["contract_version"] != 1
     ):
         raise VerificationError("Manifest contract version must be 1")
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", run_id):
+        raise VerificationError("Manifest run identity is invalid")
+    if synthetic_run_id is not None:
+        if run_id != synthetic_run_id or not re.fullmatch(r"demo2synthetic_[0-9a-f]{12}", run_id):
+            raise VerificationError("Synthetic manifest is outside the reserved run")
+    elif run_id.casefold().startswith("demo2synthetic_"):
+        raise VerificationError("Production verification cannot consume a synthetic run")
+    expected_class = "bootstrap" if synthetic_run_id is not None else "measured"
     batches = manifest.get("batches")
     if not isinstance(batches, dict):
         raise VerificationError("Manifest batches must be keyed by batch number")
     measured = []
     seen = set()
-    for batch in batches.values():
+    for key, batch in batches.items():
         if not isinstance(batch, dict) or batch.get("batch_class") not in (
             "measured",
             "bootstrap",
@@ -122,102 +165,23 @@ def measured_batches(manifest):
         if batch_id in seen:
             raise VerificationError("Manifest batch IDs must be unique across all classes")
         seen.add(batch_id)
-        if batch["batch_class"] != "measured":
+        if batch["batch_class"] != expected_class:
+            if synthetic_run_id is not None:
+                raise VerificationError("Synthetic manifest may contain only bootstrap batches")
             continue
-        try:
-            checksum = batch["sha256"]
-            count = batch["row_count"]
-            total = batch["sales_amount_minor_units"]
-        except (KeyError, ValueError) as exc:
-            raise VerificationError("Manifest batch identity is invalid") from exc
-        if (
-            not isinstance(checksum, str)
-            or not re.fullmatch(r"[a-f0-9]{64}", checksum)
-            or type(count) is not int
-            or count < 1
-            or type(total) is not int
-            or total < 0
-        ):
-            raise VerificationError("Manifest batch identity, checksum, count or total is invalid")
-        for field in (
-            "amount_by_date",
-            "amount_by_product_category",
-            "amount_by_customer_region",
-        ):
-            groups = batch.get(field)
-            if not isinstance(groups, dict) or any(
-                not isinstance(key, str) or type(value) is not int or value < 0
-                for key, value in groups.items()
-            ):
-                raise VerificationError(f"Manifest {field} is invalid")
-            if sum(groups.values()) != total:
-                raise VerificationError(f"Manifest {field} does not reconcile to the batch total")
-        measured.append(batch)
-    if not measured:
-        raise VerificationError("Manifest contains no measured batches")
-    return measured
-
-
-def reservation_bounds(reservation):
-    if not isinstance(reservation, dict):
-        raise VerificationError("A sales-line reservation is required")
-    values = []
-    for field in ("start", "end", "count"):
-        value = reservation.get(field)
-        pattern = r"[1-9][0-9]*" if field == "count" else r"(?:0|-?[1-9][0-9]*)"
-        if (
-            not isinstance(value, str)
-            or len(value.lstrip("-")) > 20
-            or not re.fullmatch(pattern, value)
-        ):
-            raise VerificationError(f"Reservation {field} must be a canonical decimal string")
-        values.append(int(value))
-    start, end, count = values
-    if not -(2**63) <= start <= end < 2**63 or end - start + 1 != count:
-        raise VerificationError("Reservation range is not a valid inclusive BIGINT range")
-    return start, end, count
-
-
-def _validate_reservation_batches(reservation, batches):
-    if (
-        not isinstance(reservation, dict)
-        or type(reservation.get("version")) is not int
-        or reservation["version"] != 1
-        or reservation.get("batch_class") != "measured"
-        or not isinstance(reservation.get("run_id"), str)
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", reservation["run_id"])
-    ):
-        raise VerificationError("Measured reservation identity is invalid")
-    for batch in batches:
-        number = batch.get("batch_number") if isinstance(batch, dict) else None
+        number = batch.get("batch_number")
         if (
             type(number) is not int
             or number < 1
-            or batch.get("batch_id") != f"{reservation['run_id']}_{number:04d}"
+            or key != str(number)
+            or batch_id != f"{run_id}_{number:04d}"
         ):
-            raise VerificationError("Measured batch identity does not match the reserved run")
-
-
-def measured_reservation(manifest, batches, generator_sha256):
-    reservation = manifest.get("sales_line_id_reservation") if isinstance(manifest, dict) else None
-    _validate_reservation_batches(reservation, batches)
-    if (
-        not isinstance(manifest.get("run_id"), str)
-        or reservation["run_id"] != manifest["run_id"]
-        or not isinstance(generator_sha256, str)
-        or not re.fullmatch(r"[a-f0-9]{64}", generator_sha256)
-        or reservation.get("generator_sha256") != generator_sha256
-        or any(
-            not isinstance(reservation.get(field), str)
-            or not re.fullmatch(r"[a-f0-9]{64}", reservation[field])
-            for field in ("allocator_id", "fingerprint")
-        )
-    ):
-        raise VerificationError("Measured reservation does not match the run and packaged generator")
-    _, _, count = reservation_bounds(reservation)
-    if count != sum(batch["row_count"] for batch in batches):
-        raise VerificationError("Reservation count does not match the measured run")
-    return reservation
+            raise VerificationError("Measured batch identity does not match the run")
+        validate_batch_evidence(batch)
+        measured.append(batch)
+    if not measured:
+        raise VerificationError("Manifest contains no expected batches")
+    return measured
 
 
 def _grouped_amounts(frame, column):
@@ -328,35 +292,45 @@ def verify_batch_with_timeout(
             sleep(min(poll_interval_seconds, remaining))
 
 
-def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None, *, reservation):
-    if not batches or any(
-        not isinstance(batch, dict) or batch.get("batch_class") != "measured"
-        for batch in batches
-    ):
+def verify_run_keys(spark, batches, lakehouse, shortcut, schema=None, *, synthetic_run_id=None):
+    if not isinstance(batches, list) or not batches:
         raise VerificationError("Run key verification accepts measured batches only")
-    _validate_reservation_batches(reservation, batches)
+    expected = {}
+    for batch in batches:
+        if synthetic_run_id is None:
+            if not isinstance(batch, dict) or batch.get("batch_class") != "measured":
+                raise VerificationError("Run key verification accepts measured batches only")
+        else:
+            validate_synthetic_batch(batch, synthetic_run_id)
+        try:
+            batch_id = batch_identifier(batch["batch_id"])
+            count = batch["row_count"]
+        except (KeyError, ValueError) as exc:
+            raise VerificationError("Measured batch identity or row count is invalid") from exc
+        if batch_id in expected or type(count) is not int or count < 1:
+            raise VerificationError("Measured batch identity or row count is invalid")
+        expected[batch_id] = count
     from pyspark.sql import functions as F
 
-    all_facts = spark.table(_table_name(lakehouse, shortcut, schema))
-    batch_ids = [batch["batch_id"] for batch in batches]
-    facts = all_facts.where(F.col("BatchID").isin(batch_ids))
-    expected = sum(batch["row_count"] for batch in batches)
-    start, end, count = reservation_bounds(reservation)
-    if count != expected:
-        raise VerificationError("Reservation count does not match the measured run")
-    keys = facts.select("SalesLineID")
-    if (
-        facts.count() != expected
-        or facts.where(F.col("SalesLineID").isNull()).limit(1).count()
-        or keys.distinct().count() != expected
+    facts = spark.table(_table_name(lakehouse, shortcut, schema)).where(
+        F.col("BatchID").isin(list(expected))
+    )
+    rows = facts.groupBy("BatchID").agg(
+        F.count("*").alias("row_count"),
+        F.countDistinct("SalesLineID").alias("distinct_keys"),
+    ).collect()
+    observed = {row["BatchID"]: (row["row_count"], row["distinct_keys"]) for row in rows}
+    if set(observed) != set(expected) or any(
+        observed[batch_id] != (count, count) for batch_id, count in expected.items()
     ):
-        raise VerificationError("Measured run has missing or duplicate sales-line keys")
-    if facts.where(
-        (F.col("SalesLineID") < F.lit(start)) | (F.col("SalesLineID") > F.lit(end))
-    ).limit(1).count():
-        raise VerificationError("Measured run has sales-line keys outside its reserved range")
-    other_keys = all_facts.where(
-        F.col("BatchID").isNull() | ~F.col("BatchID").isin(batch_ids)
-    ).select("SalesLineID")
-    if keys.join(other_keys, "SalesLineID", "left_semi").limit(1).count():
-        raise VerificationError("Measured run has sales-line keys already used by another batch or run")
+        raise VerificationError("Measured batch has missing or duplicate sales-line keys")
+
+
+def validate_synthetic_batch(batch, run_id):
+    validate_batch_evidence(batch)
+    if (not re.fullmatch(r"demo2synthetic_[0-9a-f]{12}", run_id)
+            or batch.get("batch_class") != "bootstrap"
+            or type(batch.get("batch_number")) is not int
+            or batch["batch_number"] < 1
+            or batch["batch_id"] != f"{run_id}_{batch['batch_number']:04d}"):
+        raise VerificationError("Batch is outside the reserved synthetic bootstrap run")

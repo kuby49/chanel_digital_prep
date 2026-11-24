@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+from dimension_expansion import dimension_gaps
 from lakehouse_validation import (
     NotVisible,
     VerificationError,
@@ -53,9 +54,10 @@ class SparkVerificationTests(unittest.TestCase):
         cls.spark.sparkContext.setLogLevel("ERROR")
         config = cls.generator.RunConfig(
             run_id="spark_contract", start_date="2026-01-01", date_count=4,
-            products=3, customers=3, file_count=1, rows_per_file=12,
+            products=3, customers=3, file_count=2, rows_per_file=12,
         )
         payload, cls.batch = cls.generator.batch_bytes(config, 1)
+        second_payload, cls.second_batch = cls.generator.batch_bytes(config, 2)
         cls.data = {
             "run_id": config.run_id, "start_date": config.start_date,
             "date_count": config.date_count, "product_count": config.products,
@@ -72,22 +74,25 @@ class SparkVerificationTests(unittest.TestCase):
             StructField("UnitPriceMinorUnits", LongType(), False),
             StructField("SalesAmountMinorUnits", LongType(), False),
         ])
-        rows = []
-        for row in csv.DictReader(io.StringIO(payload.decode("utf-8"))):
-            rows.append((
-                int(row["SalesLineID"]), row["BatchID"],
-                datetime.fromisoformat(row["SaleTimestamp"].replace("Z", "+00:00")),
-                int(row["CustomerID"]), int(row["ProductID"]), row["Date"],
-                int(row["Quantity"]), int(row["UnitPriceMinorUnits"]),
-                int(row["SalesAmountMinorUnits"]),
-            ))
+        def fact_rows(data):
+            return [
+                (
+                    int(row["SalesLineID"]), row["BatchID"],
+                    datetime.fromisoformat(row["SaleTimestamp"].replace("Z", "+00:00")),
+                    int(row["CustomerID"]), int(row["ProductID"]), row["Date"],
+                    int(row["Quantity"]), int(row["UnitPriceMinorUnits"]),
+                    int(row["SalesAmountMinorUnits"]),
+                )
+                for row in csv.DictReader(io.StringIO(data.decode("utf-8")))
+            ]
+
+        rows, second_rows = fact_rows(payload), fact_rows(second_payload)
         cls.facts = cls.spark.createDataFrame(rows, schema).cache()
+        cls.second_facts = cls.spark.createDataFrame(second_rows, schema).cache()
         cls.facts.count()
-        cls.reservation = {
-            "version": 1, "run_id": config.run_id, "batch_class": "measured",
-            "start": str(min(row[0] for row in rows)), "end": str(max(row[0] for row in rows)),
-            "count": str(len(rows)),
-        }
+        cls.second_facts.count()
+        cls.sales_ids = sorted(row[0] for row in rows)
+        cls.second_sales_ids = sorted(row[0] for row in second_rows)
         cls.dimensions = {
             name: frame.cache()
             for name, frame in _dimension_frames(cls.spark, cls.data, cls.generator).items()
@@ -106,6 +111,21 @@ class SparkVerificationTests(unittest.TestCase):
         for name, frame in self.dimensions.items():
             frame.hint("broadcast").createOrReplaceGlobalTempView(name)
 
+    def test_dimension_expansion_preflight_counts_only_missing_compatible_rows(self):
+        larger = {**self.data, "date_count": 365, "product_count": 20, "customer_count": 100}
+        self.assertEqual(dimension_gaps(self.spark, larger, self.generator, "global_temp"), {
+            "global_temp.DimDate": 361,
+            "global_temp.DimProduct": 17,
+            "global_temp.DimCustomer": 97,
+        })
+
+    def test_dimension_expansion_preflight_rejects_duplicate_existing_key(self):
+        actual = self.dimensions["DimCustomer"]
+        actual.unionByName(actual.limit(1)).createOrReplaceGlobalTempView("DimCustomer")
+        larger = {**self.data, "customer_count": 100}
+        with self.assertRaisesRegex(VerificationError, "DimCustomer.*duplicate"):
+            dimension_gaps(self.spark, larger, self.generator, "global_temp")
+
     def test_exact_facts_and_three_dimension_joins(self):
         verify_dimensions(self.spark, self.data, self.generator, "global_temp")
         result = verify_lakehouse_batch(
@@ -113,10 +133,7 @@ class SparkVerificationTests(unittest.TestCase):
         )
         self.assertEqual(result["row_count"], self.batch["row_count"])
         self.assertEqual(result["sales_amount_minor_units"], self.batch["sales_amount_minor_units"])
-        verify_run_keys(
-            self.spark, [self.batch], "global_temp", "EventhouseFactSales",
-            reservation=self.reservation,
-        )
+        verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
 
     def test_incomplete_or_duplicate_facts_do_not_pass(self):
         self.facts.limit(1).createOrReplaceGlobalTempView("EventhouseFactSales")
@@ -126,58 +143,55 @@ class SparkVerificationTests(unittest.TestCase):
         with self.assertRaises(VerificationError):
             verify_lakehouse_batch(self.spark, self.batch, "global_temp", "EventhouseFactSales")
 
-    def test_run_keys_exclude_other_batches_but_reject_global_duplicates(self):
+    def test_run_keys_allow_reused_ids_in_other_batches_and_runs(self):
         from pyspark.sql import functions as F
 
-        bootstrap = self.facts.withColumn("BatchID", F.lit("bootstrap_0001")).withColumn(
-            "SalesLineID", F.col("SalesLineID") + 1000000
-        )
-        other_run = self.facts.withColumn("BatchID", F.lit("other_run_0001")).withColumn(
-            "SalesLineID", F.col("SalesLineID") + 2000000
-        )
-        self.facts.union(bootstrap).union(other_run).createOrReplaceGlobalTempView("EventhouseFactSales")
-        verify_run_keys(
-            self.spark, [self.batch], "global_temp", "EventhouseFactSales",
-            reservation=self.reservation,
-        )
-
-        collision = self.facts.withColumn("BatchID", F.lit("other_run_0002"))
-        self.facts.union(bootstrap).union(collision).createOrReplaceGlobalTempView("EventhouseFactSales")
-        with self.assertRaisesRegex(VerificationError, "another batch or run"):
-            verify_run_keys(
-                self.spark, [self.batch], "global_temp", "EventhouseFactSales",
-                reservation=self.reservation,
-            )
-
-        second = dict(self.batch, batch_id="spark_contract_0002", batch_number=2)
-        duplicate = self.facts.withColumn("BatchID", F.lit(second["batch_id"]))
-        self.facts.union(bootstrap).union(other_run).union(duplicate).createOrReplaceGlobalTempView(
+        bootstrap = self.facts.withColumn("BatchID", F.lit("bootstrap_0001"))
+        other_run = self.facts.withColumn("BatchID", F.lit("other_run_0001"))
+        self.assertEqual(self.sales_ids, list(range(1, self.batch["row_count"] + 1)))
+        self.assertEqual(self.second_sales_ids, self.sales_ids)
+        self.facts.union(bootstrap).union(other_run).union(self.second_facts).createOrReplaceGlobalTempView(
             "EventhouseFactSales"
         )
-        with self.assertRaises(VerificationError):
-            verify_run_keys(
-                self.spark, [self.batch, second], "global_temp", "EventhouseFactSales",
-                reservation={
-                    "version": 1, "run_id": self.reservation["run_id"], "batch_class": "measured",
-                    "start": self.reservation["start"],
-                    "end": str(int(self.reservation["start"]) + 2 * self.batch["row_count"] - 1),
-                    "count": str(2 * self.batch["row_count"]),
-                },
-            )
+        verify_lakehouse_batch(self.spark, self.batch, "global_temp", "EventhouseFactSales")
+        verify_lakehouse_batch(self.spark, self.second_batch, "global_temp", "EventhouseFactSales")
+        verify_run_keys(self.spark, [self.batch, self.second_batch], "global_temp", "EventhouseFactSales")
 
-    def test_run_keys_reject_distinct_facts_outside_the_reserved_range(self):
+    def test_run_keys_reject_duplicate_ids_within_a_batch(self):
         from pyspark.sql import functions as F
 
         self.facts.withColumn(
             "SalesLineID",
-            F.when(F.col("SalesLineID") == int(self.reservation["start"]),
-                   F.lit(int(self.reservation["end"]) + 1)).otherwise(F.col("SalesLineID")),
+            F.when(F.col("SalesLineID") == self.sales_ids[1],
+                   F.lit(self.sales_ids[0])).otherwise(F.col("SalesLineID")),
         ).createOrReplaceGlobalTempView("EventhouseFactSales")
-        with self.assertRaisesRegex(VerificationError, "outside its reserved range"):
-            verify_run_keys(
-                self.spark, [self.batch], "global_temp", "EventhouseFactSales",
-                reservation=self.reservation,
-            )
+        with self.assertRaisesRegex(VerificationError, "duplicate"):
+            verify_run_keys(self.spark, [self.batch], "global_temp", "EventhouseFactSales")
+        with self.assertRaisesRegex(VerificationError, "duplicate"):
+            verify_lakehouse_batch(self.spark, self.batch, "global_temp", "EventhouseFactSales")
+
+    def test_synthetic_run_keys_reconcile_only_reserved_bootstrap_batches(self):
+        from pyspark.sql import functions as F
+
+        run = "demo2synthetic_123456abcdef"
+        fixture = {**self.batch, "batch_id": f"{run}_0001", "batch_class": "bootstrap"}
+        self.facts.withColumn("BatchID", F.lit(fixture["batch_id"])).createOrReplaceGlobalTempView(
+            "EventhouseFactSales"
+        )
+        verify_run_keys(self.spark, [fixture], "global_temp", "EventhouseFactSales", synthetic_run_id=run)
+        with self.assertRaisesRegex(VerificationError, "measured batches only"):
+            verify_run_keys(self.spark, [fixture], "global_temp", "EventhouseFactSales")
+
+    def test_run_keys_reject_rows_shifted_between_batches(self):
+        from pyspark.sql import functions as F
+
+        first = self.facts.where(F.col("SalesLineID") != self.sales_ids[0])
+        shifted = self.facts.where(F.col("SalesLineID") == self.sales_ids[0]).withColumn(
+            "BatchID", F.lit(self.second_batch["batch_id"])
+        ).withColumn("SalesLineID", F.lit(self.sales_ids[-1] + 1))
+        first.union(self.second_facts).union(shifted).createOrReplaceGlobalTempView("EventhouseFactSales")
+        with self.assertRaisesRegex(VerificationError, "missing or duplicate"):
+            verify_run_keys(self.spark, [self.batch, self.second_batch], "global_temp", "EventhouseFactSales")
 
     def test_orphaned_dimension_is_rejected(self):
         from pyspark.sql import functions as F

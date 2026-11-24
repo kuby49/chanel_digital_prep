@@ -222,10 +222,12 @@ class FakeFabric:
 
     def kusto(self, endpoint, database, command, query=False):
         self.calls.append(("KQL", command, query))
+        table = getattr(self, "table_name", "FactSales")
         if command == ".show tables":
-            return [{"TableName": "FactSales"}] if self.table_exists else []
+            return [{"TableName": table}] if self.table_exists else []
         if command.startswith(".create table ") and " ingestion csv mapping " not in command:
             self.table_exists = True
+            self.table_name = command.split()[2]
             self.table_owner = "other-owner" if "racing_table" in self.flags else self.workspace["description"]
             return []
         if command.startswith(".create table ") and " ingestion csv mapping " in command:
@@ -236,13 +238,13 @@ class FakeFabric:
         if command.startswith(".alter-merge table "):
             self.policy_exists = True
             return []
-        if command == ".show table FactSales schema as json":
+        if command == f".show table {table} schema as json":
             columns = [{"Name": name, "CslType": kind} for name, kind in CSV_COLUMNS]
             if "schema_drift" in self.flags:
                 columns[-1]["CslType"] = "real"
-            return [{"TableName": "FactSales", "Schema": json.dumps({"OrderedColumns": columns}),
+            return [{"TableName": table, "Schema": json.dumps({"OrderedColumns": columns}),
                      "DocString": self.table_owner}]
-        if command == ".show table FactSales ingestion csv mappings":
+        if command == f".show table {table} ingestion csv mappings":
             if not self.mapping_exists:
                 return []
             entries = [{"Name": name, "DataType": kind, "Ordinal": index, "ConstValue": None}
@@ -250,13 +252,13 @@ class FakeFabric:
             if "mapping_drift" in self.flags:
                 entries[0]["Ordinal"] = 1
             return [{"Name": "SalesCsvV1", "Kind": "CSV", "Mapping": json.dumps(entries)}]
-        if command == ".show table FactSales policy mirroring":
+        if command == f".show table {table} policy mirroring":
             policy = {
                 "IsEnabled": self.policy_exists, "Format": "parquet",
                 "TargetLatencyInMinutes": 3 if "policy_drift" in self.flags else 5,
                 "ConnectionStrings": [
                     f"https://westus3-api.onelake.fabric.microsoft.com/{WORKSPACE}/"
-                    f"{EVENTHOUSE if 'wrong_source' in self.flags else DATABASE}/Tables/FactSales;"
+                    f"{EVENTHOUSE if 'wrong_source' in self.flags else DATABASE}/Tables/{table};"
                     "credential-secret-must-not-leak"
                 ],
             }
@@ -284,7 +286,16 @@ class FakeMonitorFabric(FakeFabric):
         self.monitor_jobs = {}
         self.child_jobs = {}
         self.blobs = {}
+        self.kql_batches = {}
         self.skills = []
+
+    def kusto(self, endpoint, database, command, query=False):
+        if query:
+            for batch_id, rows in self.kql_batches.items():
+                if f"BatchID == '{batch_id}'" in command:
+                    self.calls.append(("KQL", command, query))
+                    return copy.deepcopy(rows)
+        return super().kusto(endpoint, database, command, query=query)
 
     def fabric(self, method, path, body=None, allow_missing=False):
         self.skills.append(getattr(self, "fabric_skill", "eventhouse-cli"))
@@ -321,6 +332,8 @@ class FakeMonitorFabric(FakeFabric):
                 "controller_id": params["CONTROLLER_ID"], "manifest_uri": params["MANIFEST_URL"],
                 "deadline_utc": params["DEADLINE_UTC"], "identity_id": params["EXPECTED_IDENTITY_ID"],
                 "tenant_id": params["EXPECTED_TENANT_ID"], "sentinel_verified": True,
+                "generator_sha256": params["EXPECTED_GENERATOR_SHA256"],
+                "monitor_binding_sha256": params["EXPECTED_MONITOR_BINDING_SHA256"],
                 "job_access_verified": True, "state": "running", "batches": {},
                 "run_verification": None, "heartbeat_at_utc": deploy._stamp(deploy._now()),
                 "manifest_observed": False,
@@ -385,6 +398,148 @@ class FakeMonitorFabric(FakeFabric):
 
 
 class DeployTests(unittest.TestCase):
+    def test_synthetic_scope_rejects_production_modes_and_cross_use_without_writes(self):
+        token = "123456abcdef"
+        prefix = f"demo2synthetic-{token}"
+        self.config["data"]["run_id"] = f"demo2synthetic_{token}"
+        self.config["demo-2"]["sales_table"] = "SyntheticFactSales"
+        for mode, requested_prefix in (
+                ("deploy", prefix), ("start-monitor", prefix), ("validate-only", prefix),
+                ("provision-synthetic", "chanel"), ("prepare-synthetic-monitor", "chanel"),
+                ("start-synthetic-monitor", "chanel")):
+            with self.subTest(mode=mode, prefix=requested_prefix):
+                _, result = self.cli(mode, prefix=requested_prefix)
+                self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+        self.assertFalse(self.backend.calls)
+
+    def test_owned_synthetic_target_can_be_discovered_with_a_normal_run_id(self):
+        prefix = "demo2synthetic-123456abcdef"
+        self.config["data"]["run_id"] = "demo2synthetic_123456abcdef"
+        self.config["demo-2"]["sales_table"] = "SyntheticFactSales"
+        _, provisioned = self.cli("provision-synthetic", prefix=prefix)
+        self.assertEqual((provisioned["status"], provisioned["ready"]), ("pass", False), provisioned)
+        self.config["data"]["run_id"] = "measured_demo2"
+        self.backend.calls.clear()
+        _, candidate = self.cli("resolve-target-candidate", prefix=prefix)
+        self.assertEqual((candidate["status"], candidate["ready"]), ("pass", False), candidate)
+        self.assertFalse(self.backend.calls)
+        target = json.loads((self.result.parent / "demo-2-target-candidate.json").read_text())["target"]
+        self.assertEqual(target, {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"})
+        self.config["shared"]["target_bindings"] = {"demo-2": target}
+        _, verified = self.cli("verify-target-ownership", prefix=prefix)
+        self.assertEqual((verified["status"], verified["ready"]), ("pass", False), verified)
+        self.assertEqual([method for method, *_ in self.backend.calls], ["GET", "GET", "GET", "KQL"])
+        self.backend.calls.clear()
+        self.config["shared"]["target_bindings"]["demo-2"]["item_id"] = LAKEHOUSE
+        _, mismatch = self.cli("verify-target-ownership", prefix=prefix)
+        self.assertEqual((mismatch["status"], mismatch["ready"]), ("blocked", False), mismatch)
+        self.assertFalse(self.backend.calls)
+
+    def test_synthetic_status_and_wait_do_not_require_a_fresh_pending_manifest(self):
+        prefix = "demo2synthetic-123456abcdef"
+        self.config["data"]["run_id"] = "demo2synthetic_123456abcdef"
+        self.config["demo-2"]["sales_table"] = "SyntheticFactSales"
+        self.config["shared"]["workspace_id"] = SHARED_WORKSPACE
+        settings = deploy.validate_config(self.config, prefix)
+        deployment = mock.MagicMock()
+        deployment.resources = {"workspace": {"id": WORKSPACE}}
+        monitor = mock.MagicMock()
+        monitor.status.return_value = "running"
+        with mock.patch.object(deploy, "_monitor_config", return_value={"run_id": settings["data"]["run_id"]}), \
+                mock.patch.object(deploy, "_load_builder"), mock.patch.object(deploy, "_load_monitor_builder"), \
+                mock.patch.object(deploy, "Ledger"), mock.patch.object(deploy, "FabricClient"), \
+                mock.patch.object(deploy, "Deployment", return_value=deployment), \
+                mock.patch.object(deploy, "_recover_pending"), mock.patch.object(deploy, "Monitor", return_value=monitor), \
+                mock.patch.object(deploy, "verify_synthetic_runtime_access") as admission:
+            for mode in ("synthetic-monitor-status", "wait-synthetic-monitor"):
+                with self.subTest(mode=mode):
+                    args = types.SimpleNamespace(mode=mode, selected_demos={"demo-2"}, state_dir=self.state)
+                    status, ready, _ = deploy._run(args, settings)
+                    self.assertEqual((status, ready), ("pass", False))
+            admission.assert_not_called()
+            self.assertEqual(deployment.verify_target_ownership.call_count, 2)
+            monitor.status.assert_called_once()
+            monitor.wait.assert_called_once()
+
+    def test_synthetic_start_fails_closed_before_launch_when_admission_fails(self):
+        prefix = "demo2synthetic-123456abcdef"
+        self.config["data"]["run_id"] = "demo2synthetic_123456abcdef"
+        self.config["demo-2"]["sales_table"] = "SyntheticFactSales"
+        self.config["shared"]["workspace_id"] = SHARED_WORKSPACE
+        settings = deploy.validate_config(self.config, prefix)
+        deployment = mock.MagicMock()
+        deployment.resources = {"workspace": {"id": WORKSPACE}}
+        monitor = mock.MagicMock()
+        with mock.patch.object(deploy, "_monitor_config", return_value={"run_id": settings["data"]["run_id"]}), \
+                mock.patch.object(deploy, "_load_builder"), mock.patch.object(deploy, "_load_monitor_builder"), \
+                mock.patch.object(deploy, "Ledger"), mock.patch.object(deploy, "FabricClient"), \
+                mock.patch.object(deploy, "Deployment", return_value=deployment), \
+                mock.patch.object(deploy, "_recover_pending"), mock.patch.object(deploy, "Monitor", return_value=monitor), \
+                mock.patch.object(deploy, "_verify_synthetic_preparation"), \
+                mock.patch.object(deploy, "verify_synthetic_runtime_access", side_effect=deploy.Blocked("unverified")):
+            args = types.SimpleNamespace(mode="start-synthetic-monitor", selected_demos={"demo-2"},
+                                         state_dir=self.state)
+            with self.assertRaises(deploy.Blocked):
+                deploy._run(args, settings)
+            monitor.start.assert_not_called()
+            deployment.notebook.assert_not_called()
+
+    def test_synthetic_preparation_requires_exact_completed_preload_job(self):
+        run = "demo2synthetic_123456abcdef"
+        preparation = {"run_id": run, "generator_sha256": "a" * 64, "workspace_id": WORKSPACE,
+                       "lakehouse_id": LAKEHOUSE, "notebook_id": NOTEBOOK, "job_id": CHILD_JOB}
+        deployment = mock.MagicMock()
+        deployment.resources = {"synthetic_preparation": preparation, "workspace": {"id": WORKSPACE},
+                                "lakehouse": {"id": LAKEHOUSE}, "notebook": {"id": NOTEBOOK}}
+        job = {"id": CHILD_JOB, "itemId": NOTEBOOK, "status": "Completed",
+               "properties": {"exitValue": json.dumps({"mode": "preload", "status": "pass"})}}
+        deployment.client.fabric.return_value = (200, {}, job)
+        config = {"run_id": run, "generator_sha256": "a" * 64}
+        deploy._verify_synthetic_preparation(deployment, config)
+        for field, value in (("id", MONITOR_JOB), ("itemId", MONITOR_NOTEBOOK), ("status", "InProgress")):
+            with self.subTest(field=field):
+                deployment.client.fabric.return_value = (200, {}, {**job, field: value})
+                with self.assertRaises(deploy.Blocked):
+                    deploy._verify_synthetic_preparation(deployment, config)
+        deployment.client.fabric.return_value = (200, {}, job)
+        with self.assertRaises(deploy.Blocked):
+            deploy._verify_synthetic_preparation(deployment, {**config, "generator_sha256": "b" * 64})
+        deployment.notebook.reset_mock()
+        deployment.monitor_notebook.reset_mock()
+        deploy._verify_synthetic_preparation(deployment, config, verify_definitions=False)
+        deployment.notebook.assert_not_called()
+        deployment.monitor_notebook.assert_not_called()
+
+    def test_synthetic_preload_completion_preserves_exact_job_in_ledger(self):
+        run = "demo2synthetic_123456abcdef"
+        preparation = {"run_id": run, "generator_sha256": "a" * 64, "workspace_id": WORKSPACE,
+                       "lakehouse_id": LAKEHOUSE, "notebook_id": NOTEBOOK}
+        pending = {"kind": "notebook-job", "mode": "preload", "notebook_id": NOTEBOOK,
+                   "batch": None, "job_id": CHILD_JOB, "synthetic_preparation": preparation}
+        ledger = mock.MagicMock()
+        ledger.data = {"pending": pending, "owner_marker": "test", "resources": {
+            "workspace": {"id": WORKSPACE}, "lakehouse": {"id": LAKEHOUSE}, "notebook": {"id": NOTEBOOK}}}
+        client = mock.MagicMock()
+        client.fabric.return_value = (200, {}, {"id": CHILD_JOB, "itemId": NOTEBOOK, "status": "Completed",
+                                              "properties": {"exitValue": json.dumps(
+                                                  {"status": "verified", "mode": "preload"})}})
+        settings = {"prefix": "demo2synthetic-123456abcdef"}
+        deployment = deploy.Deployment(settings, client, mock.MagicMock(), ledger)
+        with mock.patch.object(deploy, "_monitor_config", return_value={
+                "run_id": run, "generator_sha256": "a" * 64}):
+            deployment._poll_notebook_job(CHILD_JOB, "preload", None)
+        self.assertEqual(ledger.data["resources"]["synthetic_preparation"], {**preparation, "job_id": CHILD_JOB})
+        ledger.finish.assert_called_once()
+
+        ledger.finish.reset_mock()
+        del ledger.data["resources"]["synthetic_preparation"]
+        pending["synthetic_preparation"] = {**preparation, "run_id": "wrong"}
+        with mock.patch.object(deploy, "_monitor_config", return_value={
+                "run_id": run, "generator_sha256": "a" * 64}), self.assertRaises(deploy.Blocked):
+            deployment._poll_notebook_job(CHILD_JOB, "preload", None)
+        ledger.finish.assert_not_called()
+        self.assertNotIn("synthetic_preparation", ledger.data["resources"])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix=".deploy-test-", dir=Path(__file__).resolve().parent)
         self.addCleanup(self.temp.cleanup)
@@ -450,9 +605,6 @@ class DeployTests(unittest.TestCase):
         patcher = mock.patch.object(deploy, "_load_monitor_builder", return_value=FakeMonitorBuilder())
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.reservation_patcher = mock.patch.object(deploy, "verify_global_reservation", return_value=None)
-        self.reservation_patcher.start()
-        self.addCleanup(self.reservation_patcher.stop)
         self.readiness_patcher = mock.patch.object(deploy, "verify_monitor_readiness", return_value=None)
         self.readiness_patcher.start()
         self.addCleanup(self.readiness_patcher.stop)
@@ -476,7 +628,9 @@ class DeployTests(unittest.TestCase):
         timestamp = deploy._stamp(started)
         manifest = {
             "contract_version": 1, "run_id": evidence["run_id"],
+            "generator_sha256": evidence["generator_sha256"],
             "config": copy.deepcopy(evidence["producer_config"]),
+            "target_bindings": copy.deepcopy(evidence["target_bindings"]),
             "destinations": ["demo-1", "demo-2"], "batches": {},
             "scheduler": {
                 "status": "completed", "started_at_utc": timestamp, "finished_at_utc": timestamp,
@@ -514,9 +668,16 @@ class DeployTests(unittest.TestCase):
                 },
             }
             manifest["batches"][str(number)] = batch
+            self.backend.kql_batches[batch_id] = [{
+                "RowCount": row_count, "DistinctSalesLineIDs": row_count,
+                "AmountMinorUnits": total, "InvalidRows": 0,
+            }]
             state["batches"][batch_id] = {
                 "status": "verified", "fingerprint": monitor_controller.batch_fingerprint(batch),
-                "deadline_utc": evidence["deadline_utc"],
+                "deadline_utc": deploy._stamp(
+                    started + timedelta(seconds=evidence["verification_timeout_seconds"])
+                ),
+                "verified_at_utc": timestamp,
                 "operation_id": operation_id, "job_id": job_id,
             }
             exit_value = {"mode": "verify_batch", "status": "verified", "batch": {
@@ -928,6 +1089,32 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "POST" and isinstance(call[2], dict)
                              and call[2].get("type") == "Eventhouse" for call in self.backend.calls))
 
+    def test_synthetic_notebook_without_lro_is_recovered_only_after_definition_check(self):
+        for key in ("notebook", "monitor_notebook"):
+            for matches in (True, False):
+                with self.subTest(key=key, matches=matches):
+                    pending = {"kind": "create-item", "key": key, "item_type": "Notebook",
+                               "name": "Demo2Validation" if key == "notebook" else "Demo2Monitor"}
+                    deployment = mock.MagicMock()
+                    deployment.s = {"prefix": "demo2synthetic-123456abcdef",
+                                    "notebook_name": "Demo2Validation", "monitor_notebook_name": "Demo2Monitor"}
+                    deployment.ledger.data = {"pending": pending}
+                    deployment.resources = {}
+                    deployment._listed_notebook.return_value = {"id": NOTEBOOK}
+                    check = deployment.notebook if key == "notebook" else deployment.monitor_notebook
+                    if not matches:
+                        check.side_effect = deploy.Blocked("Definition mismatch")
+                        with self.assertRaises(deploy.Blocked):
+                            deploy._recover_pending(deployment)
+                        self.assertNotIn(key, deployment.resources)
+                        deployment.ledger.finish.assert_not_called()
+                    else:
+                        deploy._recover_pending(deployment)
+                        self.assertEqual(deployment.resources[key]["id"], NOTEBOOK)
+                        deployment.verify_target_ownership.assert_called_once_with(expected_pending=pending)
+                        check.assert_called_once_with(False)
+                        deployment.ledger.finish.assert_called_once()
+
     def test_failed_lro_is_reported_without_recreating(self):
         original = self.backend.fabric
 
@@ -1094,7 +1281,7 @@ class DeployTests(unittest.TestCase):
         self.config["data"].update({"file_count": 3, "max_duration_seconds": 120,
                                     "rows_per_file": 2, "interval_seconds": 30})
         original = copy.deepcopy(self.config["data"])
-        for field, value in (("rows_per_file", True), ("rows_per_file", 0), ("rows_per_file", 2**62),
+        for field, value in (("rows_per_file", True), ("rows_per_file", 0), ("rows_per_file", 2**63),
                              ("interval_seconds", True), ("interval_seconds", -1),
                              ("interval_seconds", 60)):
             with self.subTest(field=field, value=value):
@@ -1109,6 +1296,10 @@ class DeployTests(unittest.TestCase):
         settings = deploy.validate_config(self.config, "chanel")
         with mock.patch.object(deploy, "_generator_digest", return_value="a" * 64):
             self.assertEqual(deploy._monitor_config(settings, {"demo-2"})["producer_config"]["interval_seconds"], 0)
+            self.config["data"]["rows_per_file"] = 2**62
+            settings = deploy.validate_config(self.config, "chanel")
+            self.assertEqual(deploy._monitor_config(settings, {"demo-2"})["producer_config"]["rows_per_file"],
+                             2**62)
 
     def test_monitor_binds_all_targets_and_generator_and_rejects_changes(self):
         self.monitor_setup()
@@ -1136,6 +1327,19 @@ class DeployTests(unittest.TestCase):
         self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
         _, stopped = self.cli("stop-monitor")
         self.assertEqual((stopped["status"], stopped["ready"]), ("pass", False), stopped)
+
+    def test_target_binding_rejects_noncanonical_or_ambiguous_identity(self):
+        target = {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "FactSales"}
+        self.assertEqual(deploy._targets({"demo-2": target}), {"demo-2": target})
+        for changed in (
+            {**target, "workspace_id": WORKSPACE.upper()},
+            {**target, "item_id": str(uuid.UUID(int=0))},
+            {**target, "item_id": "{" + DATABASE + "}"},
+            {**target, "fact": "bad fact"},
+            {**target, "extra": "value"},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(deploy.TargetBindingError):
+                deploy._targets({"demo-2": changed})
 
     def test_generator_binding_hashes_strict_utf8_with_normalized_newlines(self):
         source = self.root / "demo-data-generator" / "generator.py"
@@ -1171,6 +1375,44 @@ class DeployTests(unittest.TestCase):
         self.assertEqual((conflict["status"], conflict["ready"]), ("blocked", False))
         self.assertFalse(path.exists())
 
+    def test_target_ownership_probe_uses_fresh_readbacks_and_never_marks_ready(self):
+        _, missing = self.cli("verify-target-ownership")
+        self.assertEqual((missing["status"], missing["ready"]), ("blocked", False))
+        self.assertFalse(self.state.exists())
+        self.deploy_success()
+        journal = self.state / deploy.STATE_FILE
+        original = journal.read_bytes()
+        marker = self.backend.table_owner
+        self.backend.calls.clear()
+        _, result = self.cli("verify-target-ownership")
+        self.assertEqual((result["status"], result["ready"]), ("pass", False), result)
+        self.assertEqual([method for method, *_ in self.backend.calls], ["GET", "GET", "GET", "KQL"])
+        self.assertEqual(journal.read_bytes(), original)
+        self.backend.table_owner = None
+        _, wrong_table = self.cli("verify-target-ownership")
+        self.assertEqual((wrong_table["status"], wrong_table["ready"]), ("blocked", False))
+        self.assertIn("table ownership marker", wrong_table["diagnostics"][0])
+        self.backend.table_owner = marker
+        self.backend.items[DATABASE]["properties"]["parentEventhouseItemId"] = LAKEHOUSE
+        _, wrong_parent = self.cli("verify-target-ownership")
+        self.assertEqual((wrong_parent["status"], wrong_parent["ready"]), ("blocked", False))
+        self.assertIn("Eventhouse parent", wrong_parent["diagnostics"][0])
+        self.assertEqual(journal.read_bytes(), original)
+
+    def test_target_journal_accepts_only_the_exact_expected_recovery_intent(self):
+        self.deploy_success()
+        data = json.loads((self.state / deploy.STATE_FILE).read_text())
+        pending = {"kind": "create-item", "key": "notebook", "item_type": "Notebook",
+                   "name": "Demo2Validation"}
+        data["pending"] = pending
+        ledger = types.SimpleNamespace(data=data)
+        settings = deploy.validate_config(self.config, "chanel")
+        with self.assertRaises(deploy.Blocked):
+            deploy._journal_target(settings, ledger)
+        with self.assertRaises(deploy.Blocked):
+            deploy._journal_target(settings, ledger, expected_pending={**pending, "name": "Other"})
+        self.assertEqual(deploy._journal_target(settings, ledger, expected_pending=pending)["item_id"], DATABASE)
+
     def test_legacy_monitor_can_be_stopped_but_not_reused(self):
         self.monitor_setup()
         evidence = self.start_monitor()
@@ -1198,6 +1440,27 @@ class DeployTests(unittest.TestCase):
         _, result = self.cli("wait-monitor")
         self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
 
+    def test_completion_rejects_manifest_target_identity_changes(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        self.complete_monitor(evidence)
+        uri = evidence["manifest_uri"]
+        original, etag = copy.deepcopy(self.backend.blobs[uri])
+        sidecar_path = self.state / deploy.MONITOR_FILE
+        for case in ("missing", "different-item", "missing-target"):
+            with self.subTest(case=case):
+                sidecar_path.write_text(json.dumps(evidence), encoding="utf-8")
+                manifest = copy.deepcopy(original)
+                if case == "missing":
+                    del manifest["target_bindings"]
+                elif case == "different-item":
+                    manifest["target_bindings"]["demo-2"]["item_id"] = str(uuid.UUID(int=999))
+                else:
+                    del manifest["target_bindings"]["demo-1"]
+                self.backend.blobs[uri] = (manifest, etag)
+                _, result = self.cli("wait-monitor")
+                self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+
     def test_monitor_start_records_exact_bounded_parameters_and_fresh_proof(self):
         self.monitor_setup()
         self.config["demo-2"]["verification_timeout_seconds"] = None
@@ -1217,7 +1480,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(evidence["manifest_uri"], manifest)
         self.assertEqual(evidence["state_uri"], state_uri)
         self.assertEqual((deploy._utc(evidence["deadline_utc"], "deadline")
-                          - deploy._utc(evidence["submitted_at_utc"], "submitted")).total_seconds(), 170)
+                          - deploy._utc(evidence["submitted_at_utc"], "submitted")).total_seconds(), 1240)
         submissions = [call for call in self.backend.calls
                        if call[0] == "POST" and f"/notebooks/{MONITOR_NOTEBOOK}/jobs/execute/" in call[1]]
         self.assertEqual(len(submissions), 1)
@@ -1228,6 +1491,10 @@ class DeployTests(unittest.TestCase):
             "STATE_URL": (state_uri, "Text"), "DEADLINE_UTC": (evidence["deadline_utc"], "Text"),
             "VERIFIER_WORKSPACE_ID": (WORKSPACE, "Text"), "VERIFIER_NOTEBOOK_ID": (NOTEBOOK, "Text"),
             "EXPECTED_IDENTITY_ID": (PRODUCER_IDENTITY, "Text"), "EXPECTED_TENANT_ID": (TENANT, "Text"),
+            "EXPECTED_GENERATOR_SHA256": (evidence["generator_sha256"], "Text"),
+            "EXPECTED_PRODUCER_CONFIG_JSON": (json.dumps(evidence["producer_config"], sort_keys=True), "Text"),
+            "EXPECTED_TARGET_BINDINGS_JSON": (json.dumps(evidence["target_bindings"], sort_keys=True), "Text"),
+            "EXPECTED_MONITOR_BINDING_SHA256": (evidence["monitor_binding_sha256"], "Text"),
             "EXPECTED_BATCH_COUNT": (3, "Integer"), "VERIFICATION_TIMEOUT_SECONDS": (30, "Integer"),
             "POLL_INTERVAL_SECONDS": (1, "Integer"), "MAX_CONCURRENT_BATCHES": (2, "Integer"),
         })
@@ -1237,6 +1504,51 @@ class DeployTests(unittest.TestCase):
         self.assertIn(("STORAGE-GET", deploy._lock_uri(state_uri)), reads)
         self.assertNotIn(("STORAGE-GET", manifest), reads)
         self.assertFalse(any(path.name.endswith(".pending") for path in self.state.iterdir()))
+
+    def test_expired_synthetic_preflight_never_submits_monitor(self):
+        deployment = mock.MagicMock()
+        deployment.ledger.directory = self.state
+        deployment.ledger.data = {}
+        deployment.s = {"lakehouse_name": "SalesLakehouse"}
+        deployment.resources = {"workspace": {"id": WORKSPACE}, "lakehouse": {"id": LAKEHOUSE},
+                                "notebook": {"id": NOTEBOOK}, "monitor_notebook": {"id": MONITOR_NOTEBOOK}}
+        deployment.client.onelake.return_value = (404, {}, None)
+        monitor = deploy.Monitor(deployment, {"run_id": "sample"})
+        with mock.patch.object(monitor, "_check_target"):
+            with self.assertRaises(deploy.Blocked):
+                monitor.start(admission_expires_at=deploy._now() - timedelta(seconds=1))
+        deployment.notebook.assert_called_once_with(False)
+        deployment.monitor_notebook.assert_called_once_with(True)
+        deployment.client.fabric.assert_not_called()
+        self.assertFalse(monitor.path.exists())
+        for invalid in (None, datetime.now(), deploy._now() - timedelta(seconds=1)):
+            with self.subTest(expiry=invalid), self.assertRaises(deploy.Blocked):
+                deploy._require_synthetic_fresh(invalid)
+
+    def test_synthetic_preflight_expiring_after_intent_still_blocks_post(self):
+        deployment = mock.MagicMock()
+        deployment.ledger.directory = self.state
+        deployment.ledger.data = {}
+        deployment.s = {"lakehouse_name": "SalesLakehouse", "prefix": "demo2synthetic-123456abcdef",
+                        "tenant_id": TENANT, "producer_identity": PRODUCER_IDENTITY, "expected_batch_count": 2,
+                        "timeout": 30, "poll": 1, "max_concurrency": 2, "track_timeout": 60,
+                        "max_duration": 300}
+        deployment.marker = "test-marker"
+        deployment.resources = {"workspace": {"id": WORKSPACE}, "lakehouse": {"id": LAKEHOUSE},
+                                "notebook": {"id": NOTEBOOK}, "monitor_notebook": {"id": MONITOR_NOTEBOOK}}
+        deployment.client.onelake.return_value = (404, {}, None)
+        config = {"run_id": "sample", "duration": 120, "manifest_uri": "manifest",
+                  "sentinel_uri": "sentinel", "producer_config": {}, "target_bindings": {},
+                  "generator_sha256": "a" * 64, "monitor_binding_sha256": "b" * 64}
+        monitor = deploy.Monitor(deployment, config)
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(monitor, "_check_target"), \
+             mock.patch.object(deploy, "_now", side_effect=[now, now, now + timedelta(seconds=2)]), \
+             self.assertRaises(deploy.Blocked):
+            monitor.start(admission_expires_at=now + timedelta(seconds=1))
+        deployment.client.fabric.assert_not_called()
+        self.assertEqual(json.loads(monitor.path.read_text())["state"], "submitting")
+        self.assertIsNone(deployment.ledger.data["monitor_job"]["job_id"])
 
     def test_monitor_parameters_match_actual_runtime_and_packaged_notebook(self):
         import monitor_controller
@@ -1273,6 +1585,8 @@ class DeployTests(unittest.TestCase):
             ("manifest_uri", evidence["manifest_uri"] + ".other"),
             ("deadline_utc", deploy._stamp(deploy._now() + timedelta(seconds=2))),
             ("identity_id", TENANT), ("tenant_id", PRODUCER_IDENTITY),
+            ("generator_sha256", "b" * 64),
+            ("monitor_binding_sha256", "b" * 64),
             ("sentinel_verified", False), ("job_access_verified", False),
             ("heartbeat_at_utc", deploy._stamp(deploy._now() - timedelta(minutes=10))),
             ("heartbeat_at_utc", deploy._stamp(deploy._now() + timedelta(minutes=2))),
@@ -1371,7 +1685,7 @@ class DeployTests(unittest.TestCase):
         baseline_sidecar = copy.deepcopy(evidence)
         cases = ("missing-exit", "wrong-run", "top-level-exit", "missing-batch", "extra-batch", "failed-batch",
                  "uncertain-batch", "missing-operation", "missing-final", "unverified-final",
-                 "missing-manifest", "writer-lock")
+                 "missing-manifest", "wrong-generator", "writer-lock")
         for case in cases:
             with self.subTest(case=case):
                 (self.state / deploy.MONITOR_FILE).write_text(json.dumps(baseline_sidecar), encoding="utf-8")
@@ -1404,6 +1718,8 @@ class DeployTests(unittest.TestCase):
                     state["run_verification"]["status"] = "running"
                 elif case == "missing-manifest":
                     state["manifest_observed"] = False
+                elif case == "wrong-generator":
+                    state["generator_sha256"] = "b" * 64
                 else:
                     self.backend.blobs[deploy._lock_uri(state_uri)] = (
                         {"contract_version": 1, "run_id": evidence["run_id"],
@@ -1422,7 +1738,7 @@ class DeployTests(unittest.TestCase):
         good_state = copy.deepcopy(self.backend.blobs[state_uri])
         sidecar_path = self.state / deploy.MONITOR_FILE
         cases = (
-            "missing-manifest", "missing-etag", "wrong-run", "wrong-config", "wrong-destinations",
+            "missing-manifest", "missing-etag", "wrong-run", "wrong-config", "wrong-generator", "wrong-destinations",
             "duplicate-destination", "missing-measured", "wrong-rows", "scheduler-running",
             "scheduler-unverified", "scheduler-errors", "scheduler-duration", "scheduler-deadline",
             "scheduler-late", "fingerprint", "operation", "source", "outcome-failed",
@@ -1447,6 +1763,8 @@ class DeployTests(unittest.TestCase):
                     manifest["run_id"] = "other"
                 elif case == "wrong-config":
                     manifest["config"]["seed"] += 1
+                elif case == "wrong-generator":
+                    manifest["generator_sha256"] = "b" * 64
                 elif case == "wrong-destinations":
                     manifest["destinations"] = ["demo-1"]
                 elif case == "duplicate-destination":
@@ -1493,15 +1811,67 @@ class DeployTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
                 self.assertNotEqual(json.loads(sidecar_path.read_text())["state"], "completed")
 
-    def test_completion_is_blocked_without_independent_global_reservation_proof(self):
+    def test_completion_does_not_require_a_global_sales_line_reservation(self):
         self.monitor_setup()
         evidence = self.start_monitor()
         self.complete_monitor(evidence)
-        self.reservation_patcher.stop()
+        manifest = self.backend.blobs[evidence["manifest_uri"]][0]
+        self.assertNotIn("sales_line_id_reservation", manifest)
         _, result = self.cli("wait-monitor")
-        self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
-        self.assertIn("SalesLineID allocation is provisional", result["diagnostics"][0])
-        self.assertNotEqual(json.loads((self.state / deploy.MONITOR_FILE).read_text())["state"], "completed")
+        self.assertEqual((result["status"], result["ready"]), ("pass", True), result)
+        self.assertEqual(json.loads((self.state / deploy.MONITOR_FILE).read_text())["state"], "completed")
+        queries = [
+            call for call in self.backend.calls
+            if call[0] == "KQL" and call[2] is True and "BatchID ==" in call[1]
+        ]
+        self.assertEqual(len(queries), evidence["expected_batch_count"])
+
+    def test_completion_rejects_live_kql_mismatch(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        self.complete_monitor(evidence)
+        batch_id = next(iter(self.backend.kql_batches))
+        original = copy.deepcopy(self.backend.kql_batches[batch_id])
+        sidecar_path = self.state / deploy.MONITOR_FILE
+        for field, value in (
+                ("RowCount", 1), ("DistinctSalesLineIDs", 1),
+                ("AmountMinorUnits", 999), ("InvalidRows", 1)):
+            with self.subTest(field=field):
+                sidecar_path.write_text(json.dumps(evidence), encoding="utf-8")
+                self.backend.kql_batches[batch_id] = copy.deepcopy(original)
+                self.backend.kql_batches[batch_id][0][field] = value
+                _, result = self.cli("wait-monitor")
+                self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+                self.assertNotEqual(json.loads(sidecar_path.read_text())["state"], "completed")
+
+    def test_completion_requires_durable_per_batch_deadline_evidence(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        self.complete_monitor(evidence)
+        uri = evidence["state_uri"]
+        original, etag = copy.deepcopy(self.backend.blobs[uri])
+        sidecar_path = self.state / deploy.MONITOR_FILE
+        for case in ("missing", "invalid", "at-deadline", "extended-deadline", "before-delivery"):
+            with self.subTest(case=case):
+                sidecar_path.write_text(json.dumps(evidence), encoding="utf-8")
+                state = copy.deepcopy(original)
+                record = state["batches"]["sample_0001"]
+                if case == "missing":
+                    del record["verified_at_utc"]
+                elif case == "invalid":
+                    record["verified_at_utc"] = "invalid"
+                elif case == "at-deadline":
+                    record["verified_at_utc"] = record["deadline_utc"]
+                elif case == "extended-deadline":
+                    deadline = deploy._utc(record["deadline_utc"], "deadline") + timedelta(seconds=1)
+                    record["deadline_utc"] = deploy._stamp(deadline)
+                else:
+                    verified = deploy._utc(record["verified_at_utc"], "verified") - timedelta(seconds=1)
+                    record["verified_at_utc"] = deploy._stamp(verified)
+                self.backend.blobs[uri] = (state, etag)
+                _, result = self.cli("wait-monitor")
+                self.assertEqual((result["status"], result["ready"]), ("blocked", False), result)
+                self.assertNotEqual(json.loads(sidecar_path.read_text())["state"], "completed")
 
     def test_completion_rechecks_each_exact_child_job_and_exit(self):
         self.monitor_setup()
@@ -1985,6 +2355,40 @@ class DeployTests(unittest.TestCase):
         current = json.loads((self.state / deploy.MONITOR_START_FILE).read_text())
         self.assertEqual((current["run_id"], current["job_id"]), ("next_run", NEXT_MONITOR_JOB))
 
+    def test_legacy_deadline_can_be_reconciled_but_unrecognized_deadline_is_blocked(self):
+        self.monitor_setup()
+        evidence = self.start_monitor()
+        paths = (self.state / deploy.MONITOR_START_FILE, self.state / deploy.MONITOR_FILE,
+                 self.state / deploy.STATE_FILE)
+
+        def set_duration(seconds):
+            deadline = deploy._stamp(
+                deploy._utc(evidence["submitted_at_utc"], "submitted") + timedelta(seconds=seconds)
+            )
+            for path in paths:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                record = document["monitor_job"] if path.name == deploy.STATE_FILE else document
+                record.update(duration_seconds=seconds, deadline_utc=deadline)
+                path.write_text(json.dumps(document), encoding="utf-8")
+            state, etag = self.backend.blobs[evidence["state_uri"]]
+            state["deadline_utc"] = deadline
+            self.backend.blobs[evidence["state_uri"]] = (state, etag)
+
+        set_duration(171)
+        _, invalid = self.cli("monitor-status")
+        self.assertEqual((invalid["status"], invalid["ready"]), ("blocked", False), invalid)
+
+        set_duration(170)
+        _, legacy = self.cli("monitor-status")
+        self.assertEqual((legacy["status"], legacy["ready"]), ("pass", True), legacy)
+        _, stopped = self.cli("stop-monitor")
+        self.assertEqual((stopped["status"], stopped["ready"]), ("pass", False), stopped)
+        self.config["data"]["run_id"] = "next_run"
+        _, next_run = self.cli("start-monitor")
+        self.assertEqual((next_run["status"], next_run["ready"]), ("pass", True), next_run)
+        archived = self.state / f"demo-2-monitor-start.sample.{MONITOR_JOB}.json"
+        self.assertEqual(json.loads(archived.read_text(encoding="utf-8"))["duration_seconds"], 170)
+
     def test_os_ledger_lock_excludes_other_processes_and_remains_reusable(self):
         settings = deploy.validate_config(self.config, "chanel")
         probe = """
@@ -2122,6 +2526,29 @@ with deploy.Ledger(Path(sys.argv[1]), settings):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_cli_and_admission_share_blocked_exception(self):
+        probe = """
+import contextlib, io, runpy, sys
+sys.argv = [sys.argv[1], "--help"]
+with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    except SystemExit as exc:
+        assert exc.code == 0
+import deploy, synthetic_admission
+try:
+    synthetic_admission._block("expected")
+except deploy.Blocked as exc:
+    assert str(exc) == "expected"
+else:
+    raise AssertionError("admission did not block")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(Path(__file__).parent / "deploy.py")],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_deadline_never_extends_retry_after(self):
         clock = [0.0]
         deadline = deploy.Deadline(5, clock=lambda: clock[0],
@@ -2216,6 +2643,32 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(deploy.Failure):
             deploy._service_uri("https://cluster.kusto.fabric.microsoft.com.evil.example", "endpoint")
 
+    def test_regional_operation_location_requires_matching_trusted_header(self):
+        location = f"https://wabi-west-us3-a-primary-redirect.analysis.windows.net/v1/operations/{OPERATION}"
+        self.assertEqual(deploy._operation_id({"location": location, "x-ms-operation-id": OPERATION}), OPERATION)
+        for headers in (
+                {"location": location},
+                {"location": location, "x-ms-operation-id": DATABASE},
+                {"location": location + "?secret=value", "x-ms-operation-id": OPERATION},
+                {"location": location.replace("https://", "https://user@"), "x-ms-operation-id": OPERATION},
+                {"location": location.replace(".net/", ".net:notaport/"), "x-ms-operation-id": OPERATION},
+                {"location": location.replace(".net/", ".net:444/"), "x-ms-operation-id": OPERATION},
+                {"location": location.replace("analysis.windows.net", "attacker.example"),
+                 "x-ms-operation-id": OPERATION}):
+            with self.subTest(headers=headers), self.assertRaises(deploy.Failure):
+                deploy._operation_id(headers)
+
+    def test_regional_operation_polls_only_canonical_fabric_paths(self):
+        location = f"https://wabi-west-us3-a-primary-redirect.analysis.windows.net/v1/operations/{OPERATION}"
+        operation = deploy._operation_id({"location": location, "x-ms-operation-id": OPERATION})
+        client = mock.MagicMock()
+        client.fabric.side_effect = [(200, {}, {"status": "Succeeded"}), (200, {}, {"value": "ok"})]
+        ledger = types.SimpleNamespace(data={"resources": {}, "owner_marker": "test"})
+        deployment = deploy.Deployment({}, client, mock.MagicMock(), ledger)
+        self.assertEqual(deployment._poll_operation(operation), {"value": "ok"})
+        self.assertEqual([call.args for call in client.fabric.call_args_list], [
+            ("GET", f"/v1/operations/{OPERATION}"), ("GET", f"/v1/operations/{OPERATION}/result")])
+
     def test_azure_cli_respects_existing_config_directory(self):
         env_value = str(ROOT / "isolated-azure-config")
         response = types.SimpleNamespace(returncode=0, stdout=json.dumps({
@@ -2243,6 +2696,32 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(deploy.Blocked) as error:
                 client._token(deploy.FABRIC)
         self.assertNotIn("sensitive-token", str(error.exception))
+
+    def test_tokens_are_cached_briefly_per_audience_and_config_only_with_expiry(self):
+        response = types.SimpleNamespace(returncode=0, stdout=json.dumps({
+            "tenant": TENANT, "accessToken": "token-for-test-only", "expires_on": 2000,
+        }))
+        with mock.patch.object(deploy.shutil, "which", return_value="az"), \
+             mock.patch.object(deploy.subprocess, "run", return_value=response) as run, \
+             mock.patch.object(deploy.time, "time", return_value=1000) as clock, \
+             mock.patch.dict(os.environ, {"AZURE_CONFIG_DIR": "one"}):
+            client = deploy.FabricClient(TENANT, deploy.Deadline(30))
+            client._token(deploy.FABRIC)
+            client._token(deploy.FABRIC)
+            self.assertEqual(run.call_count, 1)
+            client._token(deploy.STORAGE_AUDIENCE)
+            self.assertEqual(run.call_count, 2)
+            os.environ["AZURE_CONFIG_DIR"] = "two"
+            client._token(deploy.FABRIC)
+            self.assertEqual(run.call_count, 3)
+            clock.return_value = 1060
+            client._token(deploy.FABRIC)
+            self.assertEqual(run.call_count, 4)
+            response.stdout = json.dumps({"tenant": TENANT, "accessToken": "new-token"})
+            clock.return_value = 1120
+            client._token(deploy.FABRIC)
+            client._token(deploy.FABRIC)
+            self.assertEqual(run.call_count, 6)
 
     def test_monitor_storage_uses_storage_audience_and_spark_telemetry(self):
         class Response:

@@ -135,10 +135,8 @@ class NotebookBuilderTests(unittest.TestCase):
         notebook = build_notebook(
             self.generator, **{**self.options, "data": {"run_id": "candidate_run", "date_count": 365}}
         )
-        generator_digest = hashlib.sha256(
-            self.generator.read_text(encoding="utf-8").encode("utf-8")
-        ).hexdigest()
-        for index, run_id in enumerate(("candidate_run", "fresh_run")):
+        generator_digest = hashlib.sha256(self.generator.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+        for run_id in ("candidate_run", "fresh_run"):
             batch_id = f"{run_id}_0001"
             batch = {
                 "batch_id": batch_id, "batch_number": 1, "batch_class": "measured", "sha256": "a" * 64,
@@ -147,7 +145,7 @@ class NotebookBuilderTests(unittest.TestCase):
                 "amount_by_product_category": {"Beauty": 5},
                 "amount_by_customer_region": {"Europe": 5},
             }
-            results, verified, reservations = [], [], []
+            results, verified = [], []
             scope = {
                 "spark": types.SimpleNamespace(conf=types.SimpleNamespace(set=lambda *_: None)),
                 "notebookutils": types.SimpleNamespace(
@@ -156,9 +154,8 @@ class NotebookBuilderTests(unittest.TestCase):
             }
             real_exec = builtins.exec
 
-            def verify_keys(_spark, batches, *_args, reservation):
+            def verify_keys(_spark, batches, *_args):
                 verified.extend(batches)
-                reservations.append(reservation)
 
             def packaged_exec(code, namespace, *args):
                 real_exec(code, namespace, *args)
@@ -174,20 +171,19 @@ class NotebookBuilderTests(unittest.TestCase):
                 scope["MODE"] = "verify_run_keys"
                 scope["MANIFEST_JSON"] = json.dumps({
                     "contract_version": 1, "run_id": run_id,
-                    "sales_line_id_reservation": {
-                        "version": 1, "allocator_id": "a" * 64, "run_id": run_id,
-                        "batch_class": "measured", "start": str(100 + index),
-                        "end": str(100 + index), "count": "1",
-                        "generator_sha256": generator_digest, "fingerprint": str(index + 1) * 64,
-                    },
+                    "generator_sha256": generator_digest,
                     "batches": {"1": batch, "bootstrap": {
                         "batch_id": "bootstrap_0001", "batch_class": "bootstrap",
                     }},
                 })
                 real_exec("".join(notebook["cells"][1]["source"]), scope)
+                scope["MANIFEST_JSON"] = json.dumps({
+                    "contract_version": 1, "run_id": run_id,
+                    "generator_sha256": "b" * 64, "batches": {"1": batch},
+                })
+                with self.assertRaisesRegex(ValueError, "packaged generator"):
+                    real_exec("".join(notebook["cells"][1]["source"]), scope)
             self.assertEqual([item["batch_id"] for item in verified], [batch_id])
-            self.assertEqual(reservations[0]["run_id"], run_id)
-            self.assertEqual(reservations[0]["start"], str(100 + index))
             self.assertEqual(results, [{
                 "mode": "verify_run_keys", "status": "verified", "batch_ids": [batch_id],
                 "row_count": 1, "sales_amount_minor_units": 5,

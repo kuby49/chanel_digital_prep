@@ -275,13 +275,37 @@ class CustomerValidationTest(unittest.TestCase):
         start = managed_refresh._time(settings["startDateTime"])
         end = managed_refresh._time(settings["endDateTime"])
         self.assertEqual((end - start).total_seconds(), 19 * 60)
-        for duration in (18, 61):
+        long_payload = managed_refresh.plan(self.config, duration_minutes=115)
+        settings = long_payload["configuration"]
+        self.assertEqual((managed_refresh._time(settings["endDateTime"])
+                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 115 * 60)
+        self.assertEqual(settings["interval"], 5)
+        long_payload = managed_refresh.plan(self.config, duration_minutes=180)
+        settings = long_payload["configuration"]
+        self.assertEqual((managed_refresh._time(settings["endDateTime"])
+                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 180 * 60)
+        self.assertEqual(settings["interval"], 5)
+        for duration in (18, 181):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 managed_refresh.plan(self.config, duration_minutes=duration)
         self.config["data"]["rows_per_file"] = 999
         with self.assertRaises(CandidateBlocked):
             managed_refresh.plan(self.config)
         self.client.assert_not_called()
+
+    def test_long_setup_can_be_exported_and_stopped_without_changing_cadence(self):
+        self.recurring()
+        client, _ = self.schedule_transport()
+        started = managed_refresh.manage(self.config, "chanel", self.root, "start", yes=True,
+                                         duration_minutes=180)
+        receipt = managed_refresh.manage(self.config, "chanel", self.root, "export-native")["native_schedule"]
+        self.assertEqual(receipt["request"], started["request"])
+        settings = receipt["request"]["configuration"]
+        self.assertEqual((managed_refresh._time(settings["endDateTime"])
+                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 180 * 60)
+        self.assertEqual(settings["interval"], 5)
+        self.assertEqual(managed_refresh.manage(self.config, "chanel", self.root, "stop", yes=True)["status"], "pass")
+        self.assertEqual([call.args[0] for call in client.request.call_args_list], ["POST", "PATCH"])
 
     def test_presenter_plan_needs_no_hand_built_schedule_json(self):
         self.recurring()

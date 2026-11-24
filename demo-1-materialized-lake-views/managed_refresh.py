@@ -18,6 +18,7 @@ from provision_synthetic import FabricClient, _object_response, _verify_confirme
 
 TERMINAL = ("Completed", "Failed", "Cancelled", "Deduped")
 MARGIN_MINUTES = 5
+MAX_WINDOW_MINUTES = 180
 
 
 def recurring_run(data):
@@ -102,8 +103,8 @@ def _check_payload(config, request):
         raise CandidateBlocked("Retained schedule request is missing.")
     settings = request["configuration"]
     start, end = _time(settings.get("startDateTime")), _time(settings.get("endDateTime"))
-    if end - start > timedelta(minutes=60):
-        raise CandidateBlocked("Demo schedules must end within 60 minutes of their start.")
+    if end - start > timedelta(minutes=MAX_WINDOW_MINUTES):
+        raise CandidateBlocked(f"Demo schedules must end within {MAX_WINDOW_MINUTES} minutes of their start.")
     expected = build_refresh_schedule_request(
         start.isoformat(), end.isoformat(), file_count=config["data"]["file_count"],
         interval_seconds=config["data"]["interval_seconds"], processing_margin_minutes=MARGIN_MINUTES,
@@ -181,8 +182,8 @@ def plan(config, start_delay_minutes=10, duration_minutes=30):
         raise CandidateBlocked("Managed recurring schedules require the exact 10x1000/60s customer run.")
     if type(start_delay_minutes) is not int or not 1 <= start_delay_minutes <= 30:
         raise ValueError("start-delay-minutes must be between 1 and 30.")
-    if type(duration_minutes) is not int or not 1 <= duration_minutes <= 60:
-        raise ValueError("duration-minutes must be between 1 and 60.")
+    if type(duration_minutes) is not int or not 1 <= duration_minutes <= MAX_WINDOW_MINUTES:
+        raise ValueError(f"duration-minutes must be between 1 and {MAX_WINDOW_MINUTES}.")
     start = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=start_delay_minutes)
     end = start + timedelta(minutes=duration_minutes)
     payload = build_refresh_schedule_request(

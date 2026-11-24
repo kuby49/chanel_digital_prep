@@ -177,7 +177,7 @@ coordinated live verification. They are not measured customer-run acceptance.
 
 One-time setup, after approval, uses the existing controller and the immutable
 setup config with the original local ownership journal. Choose an explicitly
-bounded operating window (19-60 minutes); the native path can reuse that same
+bounded operating window (19-180 minutes); the native path can reuse that same
 schedule for different fresh run IDs while the window has sufficient coverage.
 After `start` confirms its receipt, the following **local-only** command exports
 the sanitized schedule receipt without acquiring tokens or calling Fabric:
@@ -235,9 +235,12 @@ interval and five minutes of processing margin; it is not a freshness SLA.
 The schedule can already be running within its bounded operating window; it
 does not need a new future start for each click. Late clicks fail closed.
 **The producer's default two-hour native window and allocation+6,900-second
-verification deadline cannot fit the controller's maximum one-hour setup
-schedule.** Configure approved native preparation/run/cleanup budgets once in
-the template so the full fixed verification deadline fits. The hook rejects
+verification deadline cannot fit an already-active 115-minute setup
+schedule.** An explicitly selected 180-minute schedule allows the default
+120-minute run plus 60 minutes from schedule start to run allocation. No
+extension is automatic, and later starts still fail if the fixed verification
+deadline does not fit within the remaining schedule window. Configure approved
+native budgets once in the template if needed. The hook rejects
 the incompatible default rather than guessing shorter budgets or widening the
 approved schedule. Each subsequent fresh run must independently satisfy the
 same checks; repeated clicks are not promised beyond the operating window.

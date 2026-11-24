@@ -14,6 +14,7 @@ import uuid
 TERMINAL = {"Completed", "Failed", "Cancelled", "Deduped"}
 STOP_SCOPE = "run-specific; shared bounded setup schedule remains enabled"
 MINIMUM_COVERAGE = timedelta(minutes=19)
+MAX_WINDOW = timedelta(minutes=180)
 
 
 def _uuid(value):
@@ -115,7 +116,7 @@ def _context(context):
         raise ValueError("Demo 1 setup must be a bounded five-minute full-lineage UTC schedule")
     start, end = (_time(settings[key], service=True) for key in ("startDateTime", "endDateTime"))
     owner = receipt.get("create_response", {}).get("owner")
-    if (not MINIMUM_COVERAGE <= end - start <= timedelta(hours=1)
+    if (not MINIMUM_COVERAGE <= end - start <= MAX_WINDOW
             or not isinstance(owner, dict) or owner.get("type") not in ("User", "ServicePrincipal", "ManagedIdentity")):
         raise ValueError("Demo 1 setup receipt has invalid operating bounds or owner type")
     _check_live(receipt["create_response"], receipt)

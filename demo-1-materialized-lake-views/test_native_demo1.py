@@ -218,6 +218,37 @@ class NativeDemo1Test(unittest.TestCase):
             native_demo1.prepare(self.context)
         self.assertEqual(self.store.data, {})
 
+    def test_long_setup_respects_exact_bound_and_runtime_deadline(self):
+        settings = self.receipt["request"]["configuration"]
+        settings["startDateTime"] = (self.now - timedelta(minutes=1)).isoformat()
+        settings["endDateTime"] = (self.now + timedelta(minutes=179)).isoformat()
+        self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
+        self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
+        self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
+        self.context["expires_at_utc"] = (self.now + timedelta(minutes=120)).isoformat()
+        self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
+        prepared = native_demo1.prepare(self.context)
+        self.assertEqual(native_demo1.check_ready(self.context, prepared)["status"], "ready")
+
+        self.setUp()
+        settings = self.receipt["request"]["configuration"]
+        settings["endDateTime"] = (self.now + timedelta(minutes=179, microseconds=1)).isoformat()
+        self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
+        self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
+        with self.assertRaisesRegex(ValueError, "invalid operating bounds"):
+            native_demo1.prepare(self.context)
+
+    def test_default_verification_deadline_does_not_fit_115_minute_setup(self):
+        settings = self.receipt["request"]["configuration"]
+        settings["endDateTime"] = (self.now + timedelta(minutes=114)).isoformat()
+        self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
+        self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
+        self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
+        self.context["expires_at_utc"] = (self.now + timedelta(minutes=120)).isoformat()
+        self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
+        with self.assertRaisesRegex(RuntimeError, "coverage insufficient"):
+            native_demo1.prepare(self.context)
+
     def test_exact_minimum_coverage_passes_but_one_microsecond_less_blocks(self):
         self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=19)).isoformat()
         prepared = native_demo1.prepare(self.context)

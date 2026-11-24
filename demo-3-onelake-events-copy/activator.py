@@ -60,9 +60,18 @@ def _parameter(name, field):
 
 def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample, *, run_id):
     """Return a disabled candidate; a representative event is mandatory."""
-    validate_event(sample)
     if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
         raise ValueError("invalid producer run ID")
+    return _build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample, run_id)
+
+
+def build_native_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample):
+    """Return a stopped reusable source; the native guard must authorize each run."""
+    return _build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample, None)
+
+
+def _build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample, run_id):
+    validate_event(sample)
     tenant_id, workspace_id, lakehouse_id, pipeline_id = map(
         _id, (tenant_id, workspace_id, lakehouse_id, pipeline_id)
     )
@@ -123,7 +132,7 @@ def build_definition(tenant_id, workspace_id, lakehouse_id, pipeline_id, sample,
                            "eventGroupType": "Microsoft.Fabric.OneLakeEvents"},
             "filterSettings": {"eventTypes": [{"name": EVENT_TYPE}], "filters": [
                 {"operatorType": "StringBeginsWith", "key": "subject",
-                 "values": [f"{FOLDER}sales_{run_id}_"]},
+                 "values": [f"{FOLDER}sales_" + (f"{run_id}_" if run_id is not None else "")]},
                 {"operatorType": "StringEndsWith", "key": "subject", "values": [".csv"]},
             ]},
         }},

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 import uuid
 from pathlib import Path
@@ -50,6 +51,18 @@ class EventTests(unittest.TestCase):
                         "/Files/incoming/sales/DimCustomer.csv"):
             with self.subTest(subject=subject), self.assertRaises(ValueError):
                 activator.validate_event({**self.event, "subject": subject})
+
+    def test_native_source_is_reusable_but_stopped_and_keeps_dynamic_exact_file_action(self):
+        ids = [str(uuid.uuid4()) for _ in range(4)]
+        sample = {**self.event, "source": f"/tenants/{ids[0]}/workspaces/{ids[1]}/items/{ids[2]}"}
+        graph = activator.build_native_definition(*ids, sample)
+        source = next(item for item in graph if item["type"] == "realTimeHubSource-v1")
+        self.assertEqual(source["payload"]["filterSettings"]["filters"][0]["values"],
+                         ["/Files/incoming/sales/sales_"])
+        rule = next(item for item in graph if item["payload"].get("definition", {}).get("type") == "Rule")
+        self.assertFalse(rule["payload"]["definition"]["settings"]["shouldRun"])
+        self.assertIn("___subject", rule["payload"]["definition"]["instance"])
+        self.assertIn("___id", rule["payload"]["definition"]["instance"])
 
     def test_definition_has_connected_disabled_rule_and_dynamic_parameters(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
@@ -850,6 +863,244 @@ class ReconciliationTests(unittest.TestCase):
         guarded.reconcile(copy_batch, timeout_seconds=5, poll_seconds=1, event_grace_seconds=0)
         self.assertEqual(len(submissions), 2)
         self.assertEqual(len(target), 6)
+
+
+@unittest.skipUnless(
+    os.environ.get("DEMO3_PRODUCER_PATH") or
+    (ROOT.parent / "demo-data-generator" / "generator.py").is_file(),
+    "producer fixture not supplied",
+)
+class NativeGuardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import native_guard
+
+        cls.native = native_guard
+        cls.producer_path = Path(os.environ.get("DEMO3_PRODUCER_PATH") or
+                                 ROOT.parent / "demo-data-generator" / "generator.py").resolve()
+        module = importlib.util.spec_from_file_location("native_producer_fixture", cls.producer_path)
+        cls.generator = importlib.util.module_from_spec(module)
+        sys.modules[module.name] = cls.generator
+        cls.addClassCleanup(sys.modules.pop, module.name, None)
+        module.loader.exec_module(cls.generator)
+
+    def setUp(self):
+        from dataclasses import asdict
+
+        self.config = self.generator.RunConfig(
+            "native_alpha_20261124", start_date="2026-01-01", file_count=10, rows_per_file=1000)
+        self.policy = {"version": 1, "max_file_count": 10, "max_rows_per_file": 1000,
+                       "max_admission_seconds": 3600, "run_template": {
+                           key: value for key, value in asdict(self.config).items()
+                           if key not in ("run_id", "file_count", "rows_per_file")}}
+        self.settings = {"workspace_id": str(uuid.uuid4()), "item_id": str(uuid.uuid4()),
+                         "native_policy": self.policy}
+        self.now = datetime.now(timezone.utc)
+        self.manifest = self.generator.new_manifest(self.config, ["demo-3"])
+        self.manifest["demo3_admission"] = {
+            "version": 1, "state": "open", "workspace_id": self.settings["workspace_id"],
+            "lakehouse_id": self.settings["item_id"], "stop_config_sha256": "c" * 64,
+            "config_sha256": self.native.config_sha256(asdict(self.config)),
+            "expires_at_utc": (self.now + timedelta(seconds=1800)).isoformat(),
+        }
+        self.subject = f"/Files/incoming/sales/sales_{self.config.run_id}_0001.csv"
+        self.authority = ConditionalStore(str(uuid.uuid4()), str(uuid.uuid4()))
+        self.target = ConditionalStore(self.settings["workspace_id"], self.settings["item_id"])
+
+    def publish(self):
+        path = delivery_runtime.manifest_path(self.config)
+        self.authority.objects[path] = (json.dumps(self.manifest).encode(), "manifest-etag")
+
+    def resolve(self, *, finishing=False):
+        return self.native.resolve_config(
+            self.generator, self.settings, self.subject, self.authority,
+            finishing=finishing, now=self.now)
+
+    def proof(self, entry):
+        return {"row_count": entry["row_count"], "distinct_sales_line_ids": entry["row_count"],
+                "orphan_rows": 0, "row_difference_count": 0,
+                "first_sales_line_id": 1, "last_sales_line_id": entry["row_count"],
+                **{key: entry[key] for key in (*audit.GROUPS, "sales_amount_minor_units")}}
+
+    def test_reuses_one_policy_for_two_fresh_runs_ten_files_each_and_idempotent_replays(self):
+        from dataclasses import replace
+
+        copies = []
+        for run_id in ("native_alpha_20261124", "native_fresh_beta"):
+            self.config = replace(self.config, run_id=run_id)
+            self.manifest["run_id"] = run_id
+            from dataclasses import asdict
+            self.manifest["config"] = asdict(self.config)
+            self.manifest["demo3_admission"]["config_sha256"] = self.native.config_sha256(asdict(self.config))
+            self.manifest["batches"] = {}
+            for number in range(1, 11):
+                source, entry = self.generator.batch_bytes(self.config, number)
+                self.manifest["batches"][str(number)] = {
+                    **entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+                self.target.create("Files/incoming/sales/" + entry["filename"], source)
+            self.publish()
+            for number in range(1, 11):
+                self.subject = f"/Files/incoming/sales/sales_{run_id}_{number:04d}.csv"
+                config = self.resolve()
+                batch_audit = self.native.AdmissionAudit(
+                    self.target, self.settings["workspace_id"], self.settings["item_id"], self.resolve)
+                guard = delivery_runtime.GuardedDelivery(self.generator, config, self.authority, batch_audit)
+                job = str(uuid.uuid4())
+                prepared = guard.prepare(job, self.subject, "event-" + job, "event")
+                entry = self.manifest["batches"][str(number)]
+                copies.append(prepared["batch_id"])
+                guard.finish(job, prepared, {
+                    "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+                    "files_read": 1, "rows_read": 1000, "rows_copied": 1000,
+                }, lambda _: self.proof(entry))
+                replay = guard.prepare(str(uuid.uuid4()), self.subject, "replay-" + job, "event")
+                self.assertEqual(replay["decision"], "already-completed")
+        self.assertEqual(len(set(copies)), 20)
+        self.assertNotIn(audit.LOCK_PATH, self.target.objects)
+        self.assertEqual(sum(json.loads(body)["batch"]["row_count"]
+                             for path, (body, _) in self.target.objects.items()
+                             if path.startswith(audit.RECORD_PREFIX)), 20000)
+
+    def test_absent_stopped_expired_foreign_or_changed_admissions_fail_closed(self):
+        original = copy.deepcopy(self.manifest)
+        mutations = [
+            lambda m: m.pop("demo3_admission"),
+            lambda m: m["demo3_admission"].update(state="stopped"),
+            lambda m: m["demo3_admission"].update(expires_at_utc=self.now.isoformat()),
+            lambda m: m["demo3_admission"].update(expires_at_utc="invalid"),
+            lambda m: m["demo3_admission"].update(workspace_id=str(uuid.uuid4())),
+            lambda m: m["demo3_admission"].update(config_sha256="b" * 64),
+            lambda m: m["demo3_admission"].update(stop_config_sha256="invalid"),
+            lambda m: m["config"].update(file_count=11),
+            lambda m: m["config"].update(rows_per_file=1001),
+            lambda m: m["config"].update(seed=43),
+        ]
+        for mutate in mutations:
+            self.manifest = copy.deepcopy(original)
+            mutate(self.manifest)
+            self.publish()
+            with self.subTest(manifest=self.manifest), self.assertRaises((ValueError, KeyError)):
+                self.resolve()
+        self.assertEqual(self.target.objects, {})
+
+    def test_valid_stop_and_foreign_stop_both_prevent_new_admission(self):
+        self.publish()
+        path = f"Files/producer/runs/{self.config.run_id}/stop.json"
+        marker = {"version": 1, "run_id": self.config.run_id,
+                  "config_sha256": "c" * 64, "nonce": "native-" + "c" * 32}
+        self.authority.create(path, json.dumps(marker).encode())
+        with self.assertRaisesRegex(ValueError, "valid stop request"):
+            self.resolve()
+        marker["config_sha256"] = "d" * 64
+        self.authority.objects[path] = (json.dumps(marker).encode(), "changed")
+        with self.assertRaisesRegex(ValueError, "stop marker identity differs"):
+            self.resolve()
+        self.assertEqual(self.resolve(finishing=True), self.config)
+
+    def test_revocation_before_intent_releases_validated_lock_without_copy(self):
+        payload, entry = self.generator.batch_bytes(self.config, 1)
+        self.manifest["batches"]["1"] = {**entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+        self.target.create(self.subject[1:], payload)
+        self.publish()
+        batch_audit = self.native.AdmissionAudit(
+            self.target, self.settings["workspace_id"], self.settings["item_id"],
+            mock.Mock(side_effect=[None, ValueError("revoked before Copy intent")]))
+        guard = delivery_runtime.GuardedDelivery(self.generator, self.resolve(), self.authority, batch_audit)
+        with self.assertRaisesRegex(ValueError, "revoked"):
+            guard.prepare(str(uuid.uuid4()), self.subject, "event-revoked", "event")
+        self.assertNotIn(audit.LOCK_PATH, self.target.objects)
+        record = json.loads(self.target.read(audit.RECORD_PREFIX + entry["batch_id"] + ".json")[0])
+        self.assertEqual(record["state"], "validated")
+        self.assertIsNone(record["copy_attempt"])
+
+    def test_existing_owned_intent_can_finish_after_stop_but_new_prepare_cannot_start(self):
+        payload, entry = self.generator.batch_bytes(self.config, 1)
+        self.manifest["batches"]["1"] = {**entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+        self.target.create(self.subject[1:], payload)
+        self.publish()
+        batch_audit = self.native.AdmissionAudit(
+            self.target, self.settings["workspace_id"], self.settings["item_id"], self.resolve)
+        guard = delivery_runtime.GuardedDelivery(self.generator, self.resolve(), self.authority, batch_audit)
+        job = str(uuid.uuid4())
+        prepared = guard.prepare(job, self.subject, "event-in-flight", "event")
+        self.manifest["demo3_admission"].update(state="stopped", expires_at_utc=self.now.isoformat())
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stopped, expired"):
+            self.resolve()
+        self.assertEqual(self.resolve(finishing=True), self.config)
+        with self.assertRaises(audit.AuditError):
+            guard.finish(str(uuid.uuid4()), prepared, {}, lambda _: self.proof(entry))
+        guard.finish(job, prepared, {
+            "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+            "files_read": 1, "rows_read": 1000, "rows_copied": 1000,
+        }, lambda _: self.proof(entry))
+        self.assertNotIn(audit.LOCK_PATH, self.target.objects)
+
+    def test_canonical_subject_and_native_packaging_do_not_embed_a_run(self):
+        for subject in ("../sales_run_0001.csv", "/Files/incoming/sales/sales_run_0000.csv",
+                        "/Files/incoming/sales/sales_run_00001.csv",
+                        "/Files/incoming/sales/sales_run_0001.csv.tmp"):
+            with self.subTest(subject=subject), self.assertRaises(ValueError):
+                self.native.source_run(subject)
+        notebook = guarded_notebook.build_native_notebook(
+            self.producer_path.parent, self.policy, self.settings["workspace_id"],
+            self.settings["item_id"], "NativeDemo", str(uuid.uuid4()), str(uuid.uuid4()))
+        for cell in notebook["cells"]:
+            compile("".join(cell["source"]), "native-notebook", "exec")
+        source = "".join(notebook["cells"][1]["source"])
+        self.assertIn("from native_guard import execute", source)
+        self.assertNotIn(self.config.run_id, source)
+
+    def test_contended_event_waits_past_sixty_seconds_without_stealing_writer(self):
+        first = audit.BatchAudit(self.target, self.settings["workspace_id"], self.settings["item_id"])
+        held = first.acquire(str(uuid.uuid4()), "older_run_0001")
+        original = self.target.read(audit.LOCK_PATH)
+        elapsed = [0]
+
+        def sleep(seconds):
+            self.assertEqual(self.target.read(audit.LOCK_PATH), original)
+            elapsed[0] += seconds
+            if elapsed[0] >= 65:
+                self.target.delete(audit.LOCK_PATH, held.lock_etag)
+
+        job = str(uuid.uuid4())
+        waiting = self.native.AdmissionAudit(
+            self.target, self.settings["workspace_id"], self.settings["item_id"], lambda: None,
+            lock_conflict=self.target.Conflict,
+            observation={"event_id": "preserved-event", "origin": "event"},
+            wait_seconds=120, clock=lambda: elapsed[0], sleep=sleep)
+        with mock.patch("builtins.print"):
+            token = waiting.acquire(job, self.config.run_id + "_0001")
+        self.assertEqual(elapsed[0], 65)
+        self.assertEqual(token.pipeline_run_id, job)
+        ticket = json.loads(self.target.read("Files/demo3-audit/waits/" + job + ".json")[0])
+        self.assertEqual(ticket["status"], "acquired")
+        self.assertEqual(ticket["observation"]["event_id"], "preserved-event")
+
+    def test_contention_timeout_preserves_event_and_never_steals_or_retries_uncertain_write(self):
+        first = audit.BatchAudit(self.target, self.settings["workspace_id"], self.settings["item_id"])
+        first.acquire(str(uuid.uuid4()), "older_run_0001")
+        original = self.target.read(audit.LOCK_PATH)
+        elapsed = [0]
+
+        def sleep(seconds):
+            elapsed[0] += seconds
+
+        job = str(uuid.uuid4())
+        waiting = self.native.AdmissionAudit(
+            self.target, self.settings["workspace_id"], self.settings["item_id"], lambda: None,
+            lock_conflict=self.target.Conflict,
+            observation={"event_id": "blocked-event", "origin": "event"},
+            wait_seconds=60, clock=lambda: elapsed[0], sleep=sleep)
+        with mock.patch("builtins.print"), self.assertRaisesRegex(TimeoutError, "durably blocked"):
+            waiting.acquire(job, self.config.run_id + "_0001")
+        self.assertEqual(self.target.read(audit.LOCK_PATH), original)
+        ticket = json.loads(self.target.read("Files/demo3-audit/waits/" + job + ".json")[0])
+        self.assertEqual((ticket["status"], ticket["reason"]), ("blocked", "writer-lock-timeout"))
+        with mock.patch.object(self.target, "create", side_effect=RuntimeError("outcome unknown")) as create:
+            with self.assertRaisesRegex(RuntimeError, "outcome unknown"):
+                waiting.acquire(str(uuid.uuid4()), self.config.run_id + "_0002")
+            create.assert_called_once()
 
 
 if __name__ == "__main__":

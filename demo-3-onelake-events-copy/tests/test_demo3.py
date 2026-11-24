@@ -704,6 +704,7 @@ class ReconciliationTests(unittest.TestCase):
     def test_two_batches_reuse_ids_and_late_event_does_not_copy_again(self):
         import csv
         import io
+        from collections import Counter, defaultdict
         producer_path = Path(os.environ.get("DEMO3_PRODUCER_PATH") or
                              ROOT.parent / "demo-data-generator" / "generator.py").resolve()
         sys.path.insert(0, str(producer_path.parent))
@@ -728,6 +729,10 @@ class ReconciliationTests(unittest.TestCase):
             storage.create(f"Files/incoming/sales/{entry['filename']}", payload)
         authority.create(delivery_runtime.manifest_path(config), json.dumps(manifest).encode())
         target, submissions = {}, []
+        dimensions = producer.dimensions(config)
+        products = {str(item["ProductID"]): item["ProductCategory"] for item in dimensions["DimProduct"]}
+        customers = {str(item["CustomerID"]): item["CustomerRegion"] for item in dimensions["DimCustomer"]}
+        dates = {item["Date"] for item in dimensions["DimDate"]}
 
         def copy_batch(subject, event_id, origin, remaining):
             job = str(uuid.uuid4())
@@ -738,18 +743,36 @@ class ReconciliationTests(unittest.TestCase):
             rows = list(csv.DictReader(io.StringIO(payload.decode())))
             for row in rows:
                 target[(row["BatchID"], int(row["SalesLineID"]))] = row
-            entry = next(item for item in manifest["batches"].values()
-                         if item["batch_id"] == prepared["batch_id"])
+
+            def read_target(batch_id):
+                actual = [row for (batch, _), row in target.items() if batch == batch_id]
+                ids = [int(row["SalesLineID"]) for row in actual]
+                groups = {name: defaultdict(int) for name in audit.GROUPS}
+                orphan_rows = 0
+                for row in actual:
+                    amount = int(row["SalesAmountMinorUnits"])
+                    if row["Date"] not in dates or row["ProductID"] not in products or row["CustomerID"] not in customers:
+                        orphan_rows += 1
+                        continue
+                    groups["amount_by_date"][row["Date"]] += amount
+                    groups["amount_by_product_category"][products[row["ProductID"]]] += amount
+                    groups["amount_by_customer_region"][customers[row["CustomerID"]]] += amount
+                expected_rows = Counter(tuple(row[name] for name in producer.HEADER) for row in rows)
+                actual_rows = Counter(tuple(row[name] for name in producer.HEADER) for row in actual)
+                return {
+                    "row_count": len(actual), "distinct_sales_line_ids": len(set(ids)),
+                    "first_sales_line_id": min(ids), "last_sales_line_id": max(ids),
+                    "sales_amount_minor_units": sum(int(row["SalesAmountMinorUnits"]) for row in actual),
+                    "orphan_rows": orphan_rows,
+                    "row_difference_count": sum((expected_rows - actual_rows).values())
+                                            + sum((actual_rows - expected_rows).values()),
+                    **{name: dict(value) for name, value in groups.items()},
+                }
+
             guarded.finish(job, prepared, {
                 "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
                 "files_read": 1, "rows_read": len(rows), "rows_copied": len(rows),
-            }, lambda _: {
-                "row_count": len(rows), "distinct_sales_line_ids": len(rows),
-                "first_sales_line_id": 1, "last_sales_line_id": len(rows),
-                "sales_amount_minor_units": entry["sales_amount_minor_units"],
-                "orphan_rows": 0, "row_difference_count": 0,
-                **{name: entry[name] for name in audit.GROUPS},
-            })
+            }, read_target)
 
         guarded.reconcile(copy_batch, timeout_seconds=5, poll_seconds=1, event_grace_seconds=0)
         batch_ids = [manifest["batches"][str(n)]["batch_id"] for n in (1, 2)]

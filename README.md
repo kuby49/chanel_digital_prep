@@ -9,6 +9,10 @@ read back in Fabric. The updated producer notebook and reusable pipeline have
 also been read back, but end-to-end execution and repeated-run verification
 remain incomplete. The older prepared profile is single-use and requires a
 separately started monitor. No coordinated 10-file run has been verified.
+The first default-run attempt on 2026-11-24 failed at the pipeline level with
+`BadRequest`; no activity or notebook child was observed. This absence is not
+proof that no child existed. Reconcile the exact attempt and any owned work
+before another measured launch.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer

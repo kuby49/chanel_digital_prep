@@ -6,6 +6,8 @@ import json
 import uuid
 from pathlib import Path
 
+from job_lifecycle import activity_timeout
+
 
 HERE = Path(__file__).parent
 PRODUCER_MODULES = (
@@ -100,21 +102,33 @@ def notebook_definition(workspace_id, lakehouse_id, lakehouse_name, environment_
     return _definition(notebook, "notebook-content.ipynb", "ipynb")
 
 
-def pipeline_definition(workspace_id, notebook_id, *, native_profile=None):
+def pipeline_definition(workspace_id, notebook_id, *, native_profile=None, measured_duration_seconds=None):
     workspace_id, notebook_id = _guid(workspace_id), _guid(notebook_id)
     pipeline = json.loads((HERE / "pipeline-content.json").read_text(encoding="utf-8"))
     activity = pipeline["properties"]["activities"][0]
     activity["typeProperties"]["workspaceId"] = workspace_id
     activity["typeProperties"]["notebookId"] = notebook_id
     if native_profile is not None:
+        if measured_duration_seconds is not None:
+            raise ValueError("A native pipeline cannot have a measured timeout")
+        duration = (native_profile["run_window_seconds"] if native_profile.get("version") == 2
+                    else native_profile["document"]["data"]["max_duration_seconds"])
+        timeout = activity_timeout(duration)
+        if native_profile["activity_timeout"] != timeout:
+            raise ValueError("Native activity timeout differs from the authorized window")
         params = pipeline["properties"]["parameters"]
         params["operation"]["defaultValue"] = "run-native"
-        params["activity_timeout"]["defaultValue"] = native_profile["activity_timeout"]
+        params["activity_timeout"]["defaultValue"] = timeout
         params["run_config_json"]["defaultValue"] = "{}"
         params["selected_demos_json"]["defaultValue"] = "[]"
+        activity["policy"]["timeout"] = timeout
         activity["typeProperties"]["parameters"]["native_profile_json"] = {
             "type": "string", "value": json.dumps(native_profile, separators=(",", ":"), sort_keys=True),
         }
+    elif measured_duration_seconds is not None:
+        timeout = activity_timeout(measured_duration_seconds)
+        pipeline["properties"]["parameters"]["activity_timeout"]["defaultValue"] = timeout
+        activity["policy"]["timeout"] = timeout
     return _definition(pipeline, "pipeline-content.json")
 
 

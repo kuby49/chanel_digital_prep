@@ -156,8 +156,7 @@ class GeneratorTests(unittest.TestCase):
                           "selected_demos_json", "activity_timeout"})
         self.assertEqual(set(pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]),
                          {"operation", "probe_id", "runtime_evidence_json", "run_config_json", "selected_demos_json"})
-        self.assertEqual(pipeline["properties"]["activities"][0]["policy"]["timeout"],
-                         {"value": "@pipeline().parameters.activity_timeout", "type": "Expression"})
+        self.assertEqual(pipeline["properties"]["activities"][0]["policy"]["timeout"], "0.00:15:00")
 
     def test_deployment_assets_bind_actual_workspace_and_lakehouse(self):
         workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

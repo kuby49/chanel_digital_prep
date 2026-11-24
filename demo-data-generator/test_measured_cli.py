@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import deploy
+import fabric_assets
 import fabric_runtime
 from fabric_runner import run_fabric_batches
 from generator import RunConfig, canonical_bytes
@@ -253,6 +254,25 @@ class MeasuredSubmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pipeline timeout"):
             fabric_runtime.run_config(self.document)
 
+    def test_measured_wrapper_pins_timeout_to_the_validated_duration(self):
+        self.document["data"]["max_duration_seconds"] = 1800
+        rendered = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        properties = rendered["properties"]
+        self.assertEqual(properties["activities"][0]["policy"]["timeout"], "0.00:45:00")
+        self.assertEqual(properties["parameters"]["activity_timeout"]["defaultValue"], "0.00:45:00")
+        self.document["data"]["max_duration_seconds"] = 3600
+        changed = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        self.assertEqual(changed["properties"]["activities"][0]["policy"]["timeout"], "0.01:15:00")
+        self.assertNotEqual(rendered, changed)
+        with mock.patch.object(deploy, "_read_definition", return_value=(None, {"pipeline-content.json": rendered})):
+            with self.assertRaisesRegex(deploy.Blocked, "Live item definition differs"):
+                deploy._verify_definition(None, self.state, "pipeline", self.document)
+        for invalid in (None, 0, True, 7 * 86400):
+            with self.subTest(invalid=invalid):
+                self.document["data"]["max_duration_seconds"] = invalid
+                with self.assertRaises(deploy.Blocked):
+                    deploy._definition(self.state, "pipeline", self.document)
+
     def test_native_wrapper_defaults_pin_one_run_without_publishing_desktop_config(self):
         target = TEST_TARGETS["demo-1"]
         self.document["demo-1"] = {
@@ -269,6 +289,7 @@ class MeasuredSubmissionTests(unittest.TestCase):
         activity = properties["activities"][0]["typeProperties"]
         self.assertNotIn("do-not-publish", json.dumps(rendered))
         profile = json.loads(activity["parameters"]["native_profile_json"]["value"])
+        self.assertEqual(properties["activities"][0]["policy"]["timeout"], profile["activity_timeout"])
         document, selected, binding, _, _ = fabric_runtime.native_parameters(
             profile, now=expiry - timedelta(hours=1))
         self.assertEqual(selected, ["demo-1"])
@@ -308,6 +329,11 @@ class MeasuredSubmissionTests(unittest.TestCase):
         profile = json.loads(first["properties"]["activities"][0]["typeProperties"]["parameters"][
             "native_profile_json"]["value"])
         self.assertEqual(profile["version"], 2)
+        self.assertEqual(first["properties"]["activities"][0]["policy"]["timeout"], "0.02:15:00")
+        self.assertEqual(profile["activity_timeout"], "0.02:15:00")
+        wrong_timeout = dict(profile, activity_timeout="0.00:15:00")
+        with self.assertRaisesRegex(ValueError, "authorized window"):
+            fabric_assets.pipeline_definition(WORKSPACE, NOTEBOOK, native_profile=wrong_timeout)
         self.assertNotIn("binding", profile)
         self.assertNotIn("expires_at_utc", profile)
         self.assertEqual(profile["document"]["data"]["run_id"], "native_template")

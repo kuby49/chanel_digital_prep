@@ -174,6 +174,13 @@ when allocation occurs within its first 60 minutes. Startup and actual run
 times reduce the opportunity for additional serialized runs. The read-only
 hook must reject insufficient remaining coverage rather than silently shorten
 verification or widen the schedule.
+The pipeline activity timeout is a literal derived at publication: the
+configured measured duration or native run window plus 900 seconds of startup
+headroom. Although the service accepts timeout expressions in definitions, an
+observed Fabric run failed before dispatch with an expression and completed
+after changing only that field to a literal. Changing a measured duration or
+native window therefore requires a safely updated and verified pipeline
+definition; the per-run `activity_timeout` parameter cannot override its bound.
 Native cleanup first persists and reads back the exact immutable stop marker,
 then closes Demo 3 admission only while holding its per-run ledger.
 Track cleanup must prove its owned schedules/jobs stopped or its precisely

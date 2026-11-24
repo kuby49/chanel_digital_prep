@@ -13,7 +13,7 @@
         "name": "RunProducer",
         "type": "TridentNotebook",
         "policy": {
-          "timeout": {"value": "@pipeline().parameters.activity_timeout", "type": "Expression"},
+          "timeout": "0.00:15:00",
           "retry": 0,
           "retryIntervalInSeconds": 30
         },

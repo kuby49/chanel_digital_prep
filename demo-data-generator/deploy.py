@@ -1252,8 +1252,17 @@ def _definition(state, kind, config=None):
                                                      resources["staging_lakehouse"]["name"],
                                                      resources["environment_item"]["id"])
         profile = _native_profile(config or {}, resources)
-        return fabric_assets.pipeline_definition(workspace_id, resources["notebook"]["id"], native_profile=profile)
-    except (ImportError, OSError, ValueError, TypeError, KeyError, IndexError, ContractError):
+        duration = None
+        if profile is None:
+            data = (config or {}).get("data", {})
+            if not isinstance(data, dict):
+                raise ValueError("Data configuration must be an object")
+            duration = data.get("max_duration_seconds")
+            if "max_duration_seconds" in data and duration is None:
+                raise ValueError("Measured duration is required")
+        return fabric_assets.pipeline_definition(workspace_id, resources["notebook"]["id"], native_profile=profile,
+                                                 measured_duration_seconds=duration)
+    except (ImportError, OSError, ValueError, TypeError, KeyError, IndexError, ContractError, LifecycleBlocked):
         raise Blocked("Local notebook or pipeline definition is unavailable or invalid.") from None
 
 

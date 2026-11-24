@@ -75,6 +75,47 @@ class ContractTest(unittest.TestCase):
                 self.assertFalse(any("empty-folder Bronze MLV creation failed" in item
                                      for item in result["diagnostics"]))
 
+    def test_target_candidate_fails_closed_without_ownership_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.json"
+            config.write_text(json.dumps({"contract_version": 1}), encoding="utf-8")
+            result = root / "result.json"
+            process = subprocess.run(
+                [sys.executable, str(SCRIPT), "--mode", "resolve-target-candidate",
+                 "--config", str(config), "--prefix", "chanel",
+                 "--state-dir", str(root / "state"), "--result", str(result)],
+                capture_output=True, text=True, check=False,
+            )
+            envelope = json.loads(result.read_text(encoding="utf-8"))
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(envelope["status"], "blocked")
+            self.assertFalse(envelope["ready"])
+            self.assertTrue(any("ownership journal" in item for item in envelope["diagnostics"]))
+            self.assertFalse((root / "demo-1-target-candidate.json").exists())
+
+    def test_target_candidate_preserves_unresolved_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.json"
+            config.write_text(json.dumps({"contract_version": 1}), encoding="utf-8")
+            state = root / "state"
+            state.mkdir()
+            journal = state / "demo-1-state.json"
+            journal.write_text('{"status":"pending"}', encoding="utf-8")
+            result = root / "result.json"
+            process = subprocess.run(
+                [sys.executable, str(SCRIPT), "--mode", "resolve-target-candidate",
+                 "--config", str(config), "--prefix", "chanel",
+                 "--state-dir", str(state), "--result", str(result)],
+                capture_output=True, text=True, check=False,
+            )
+            envelope = json.loads(result.read_text(encoding="utf-8"))
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(envelope["status"], "blocked")
+            self.assertEqual(journal.read_text(encoding="utf-8"), '{"status":"pending"}')
+            self.assertFalse((root / "demo-1-target-candidate.json").exists())
+
     def test_cleanup_requires_confirmation_and_contract_must_match(self):
         for mode, config in (("cleanup", {"contract_version": 1, "prefix": "chanel"}),
                              ("dry-run", {"contract_version": 2, "prefix": "chanel"})):

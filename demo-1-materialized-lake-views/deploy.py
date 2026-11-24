@@ -10,7 +10,10 @@ from definition_plan import effective_verification_timeout_seconds
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=("dry-run", "validate-only", "deploy", "cleanup"))
+    parser.add_argument(
+        "--mode", required=True,
+        choices=("dry-run", "validate-only", "deploy", "cleanup", "resolve-target-candidate"),
+    )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True, type=Path)
@@ -46,6 +49,11 @@ def main():
             result["status"] = "pass"
             result["diagnostics"].append(
                 "Local contract check only; deployment and readiness are not verified."
+            )
+        elif args.mode == "resolve-target-candidate":
+            result["diagnostics"].append(
+                "Target candidate unavailable: durable tenant/prefix-scoped ownership "
+                "journal validation is not implemented; no candidate was emitted."
             )
         else:
             result["diagnostics"].append(

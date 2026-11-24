@@ -123,7 +123,8 @@ idempotency without destructive replacement.
 
 Invoke `python deploy.py --mode MODE --config ABSOLUTE_JSON --prefix PREFIX
 --state-dir ABSOLUTE_DIR --result ABSOLUTE_JSON`, where `MODE` is `dry-run`,
-`validate-only`, `deploy`, or `cleanup`; cleanup also requires `--yes`. The
+`validate-only`, `deploy`, `cleanup`, or `resolve-target-candidate`; cleanup
+also requires `--yes`. The
 result uses shared contract version 1. Dry-run only checks the local contract
 and never reports readiness. Other modes are blocked and perform no cloud
 operations. Cleanup is unavailable because resource-scoped cleanup is not
@@ -146,9 +147,19 @@ The orchestrator supplies a stable prefix/tenant-scoped `--state-dir`, a
 distinct per-invocation `--result` path, and an outer lock. Future deploy,
 validate, and cleanup implementations must retain ownership and recovery state
 in that stable directory across invocations and must not automatically discard
-unresolved stale state. The current entry point does not create, read, or
-remove state files; no Demo 1 state filename or legacy state format has been
-defined yet.
+unresolved stale state. The reserved journal filename is `demo-1-state.json`;
+future validation must reject pending or mismatched tenant, prefix, owner,
+parent and configuration fields. The current entry point does not create,
+read, or remove state files; no legacy state format has been defined.
+
+The proposed local `resolve-target-candidate` mode is fail-closed: it returns
+`blocked`, never emits `demo-1-target-candidate.json`, and performs no cloud
+writes. Implementing it requires a validated durable ownership journal; the
+manually provisioned workspace and matching live names alone are not proof.
+Before readiness or registry initialization, independently verify live target
+identity, definition and access, inventory all retained keys with writers
+quiesced, and prove no writer can bypass the shared allocator. A candidate
+sidecar alone is not authenticated evidence.
 
 No presenter walkthrough can be executed until the blocker is resolved and
 artifacts are deployed. Once available, use Lakehouse lineage and refresh

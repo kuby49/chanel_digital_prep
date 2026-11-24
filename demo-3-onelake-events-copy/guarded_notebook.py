@@ -56,7 +56,8 @@ def build_notebook(producer_dir, run_config, workspace_id, item_id, lakehouse_na
 
         if run_config:
             raise ValueError("native policy and fixed run configuration are mutually exclusive")
-        settings["native_policy"] = validate_policy(native_policy)
+        settings["native_policy"] = json.loads(json.dumps(
+            validate_policy(native_policy), sort_keys=True, allow_nan=False))
         files["native_guard.py"] = (local / "native_guard.py").read_bytes()
         entry_point = "native_guard"
 

@@ -1,5 +1,6 @@
 import ast
 import base64
+import builtins
 import hashlib
 import json
 import sys
@@ -17,7 +18,13 @@ class NotebookBuilderTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.generator = Path(self.directory.name) / "generator.py"
-        self.generator.write_text("GENERATOR_MARKER = 123\n", encoding="utf-8")
+        self.generator.write_text(
+            "import hashlib\nfrom pathlib import Path\n"
+            "GENERATOR_MARKER = 123\n"
+            "def generator_source_sha256():\n"
+            "    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()\n",
+            encoding="utf-8",
+        )
         self.options = {
             "workspace_id": "aab2ed7b-fd2f-4696-84b3-b34ef931681f",
             "lakehouse_id": "04113b0b-8698-4a61-a69d-ad862e96b6e6",
@@ -46,6 +53,48 @@ class NotebookBuilderTests(unittest.TestCase):
         self.assertEqual(definition["format"], "ipynb")
         payload = base64.b64decode(definition["parts"][0]["payload"])
         self.assertEqual(json.loads(payload), notebook)
+
+    def test_packaged_generator_has_a_readable_source_file(self):
+        notebook = build_notebook(self.generator, **self.options)
+        observed = {}
+        real_exec = builtins.exec
+
+        def packaged_exec(code, namespace, *args):
+            real_exec(code, namespace, *args)
+            if Path(getattr(code, "co_filename", "")).name == "generator.py":
+                observed["path"] = Path(namespace["__file__"])
+                observed["source"] = observed["path"].read_bytes()
+            elif getattr(code, "co_filename", "") == "<packaged lakehouse_validation>":
+                namespace["preload_dimensions"] = lambda *_: None
+
+        scope = {
+            "spark": types.SimpleNamespace(conf=types.SimpleNamespace(set=lambda *_: None)),
+            "notebookutils": types.SimpleNamespace(notebook=types.SimpleNamespace(exit=lambda *_: None)),
+        }
+        with mock.patch.dict(sys.modules), mock.patch.object(builtins, "exec", side_effect=packaged_exec):
+            real_exec("".join(notebook["cells"][0]["source"]), scope)
+            real_exec("".join(notebook["cells"][1]["source"]), scope)
+        self.assertEqual(observed["source"], self.generator.read_text(encoding="utf-8").encode("utf-8"))
+        self.assertEqual(hashlib.sha256(observed["source"]).hexdigest(), scope["GENERATOR_SHA256"])
+        self.assertFalse(observed["path"].exists())
+
+    def test_temporary_generator_is_removed_when_validation_fails(self):
+        self.generator.write_text("def generator_source_sha256():\n    return 'wrong'\n", encoding="utf-8")
+        notebook = build_notebook(self.generator, **self.options)
+        observed = {}
+        real_exec = builtins.exec
+
+        def packaged_exec(code, namespace, *args):
+            real_exec(code, namespace, *args)
+            if Path(getattr(code, "co_filename", "")).name == "generator.py":
+                observed["path"] = Path(namespace["__file__"])
+
+        scope = {"spark": types.SimpleNamespace(conf=types.SimpleNamespace(set=lambda *_: None))}
+        with mock.patch.dict(sys.modules), mock.patch.object(builtins, "exec", side_effect=packaged_exec):
+            real_exec("".join(notebook["cells"][0]["source"]), scope)
+            with self.assertRaisesRegex(ValueError, "generator source"):
+                real_exec("".join(notebook["cells"][1]["source"]), scope)
+        self.assertFalse(observed["path"].exists())
 
     def test_invalid_identity_and_timeouts_are_rejected(self):
         for key, value in (
@@ -86,8 +135,6 @@ class NotebookBuilderTests(unittest.TestCase):
         notebook = build_notebook(
             self.generator, **{**self.options, "data": {"run_id": "candidate_run", "date_count": 365}}
         )
-        runtime = "".join(notebook["cells"][1]["source"])
-        setup, execution = runtime.split('if MODE == "preload":\n', 1)
         generator_digest = hashlib.sha256(
             self.generator.read_text(encoding="utf-8").encode("utf-8")
         ).hexdigest()
@@ -107,8 +154,23 @@ class NotebookBuilderTests(unittest.TestCase):
                     notebook=types.SimpleNamespace(exit=lambda value: results.append(json.loads(value)))
                 ),
             }
-            with self.subTest(run_id=run_id), mock.patch.dict(sys.modules):
-                exec("".join(notebook["cells"][0]["source"]), scope)
+            real_exec = builtins.exec
+
+            def verify_keys(_spark, batches, *_args, reservation):
+                verified.extend(batches)
+                reservations.append(reservation)
+
+            def packaged_exec(code, namespace, *args):
+                real_exec(code, namespace, *args)
+                if getattr(code, "co_filename", "") == "<packaged lakehouse_validation>":
+                    namespace["verify_dimensions"] = (
+                        lambda _spark, data, *_args: self.assertIsNone(data["run_id"])
+                    )
+                    namespace["verify_run_keys"] = verify_keys
+
+            with self.subTest(run_id=run_id), mock.patch.dict(sys.modules), \
+                    mock.patch.object(builtins, "exec", side_effect=packaged_exec):
+                real_exec("".join(notebook["cells"][0]["source"]), scope)
                 scope["MODE"] = "verify_run_keys"
                 scope["MANIFEST_JSON"] = json.dumps({
                     "contract_version": 1, "run_id": run_id,
@@ -122,14 +184,7 @@ class NotebookBuilderTests(unittest.TestCase):
                         "batch_id": "bootstrap_0001", "batch_class": "bootstrap",
                     }},
                 })
-                exec(setup, scope)
-                scope["verify_dimensions"] = lambda _spark, data, *_args: self.assertIsNone(data["run_id"])
-                def verify_keys(_spark, batches, *_args, reservation):
-                    verified.extend(batches)
-                    reservations.append(reservation)
-
-                scope["verify_run_keys"] = verify_keys
-                exec('if MODE == "preload":\n' + execution, scope)
+                real_exec("".join(notebook["cells"][1]["source"]), scope)
             self.assertEqual([item["batch_id"] for item in verified], [batch_id])
             self.assertEqual(reservations[0]["run_id"], run_id)
             self.assertEqual(reservations[0]["start"], str(100 + index))

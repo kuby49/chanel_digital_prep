@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import textwrap
 import uuid
 from pathlib import Path
 
@@ -89,17 +90,23 @@ def build_notebook(
             "",
         )
     )
-    runtime = f"""\
+    body = f"""\
 import base64
 import json
 import sys
 import types
+from pathlib import Path
 
 for name, payload in {encoded!r}.items():
     module = types.ModuleType(name)
-    module.__file__ = "<packaged " + name + ">"
+    source = base64.b64decode(payload)
+    if name == "chanel_generator":
+        module.__file__ = str(Path(source_dir) / "generator.py")
+        Path(module.__file__).write_bytes(source)
+    else:
+        module.__file__ = "<packaged " + name + ">"
     sys.modules[name] = module
-    exec(compile(base64.b64decode(payload), module.__file__, "exec"), module.__dict__)
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
 
 import chanel_generator as generator
 from lakehouse_validation import (
@@ -109,6 +116,11 @@ from lakehouse_validation import (
 
 spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")
 GENERATOR_SHA256 = {generator_sha256!r}
+if (
+    not callable(getattr(generator, "generator_source_sha256", None))
+    or generator.generator_source_sha256() != GENERATOR_SHA256
+):
+    raise ValueError("Packaged generator source does not match the verifier binding")
 if type(VERIFICATION_TIMEOUT_SECONDS) is not int or VERIFICATION_TIMEOUT_SECONDS <= 0:
     raise ValueError("VERIFICATION_TIMEOUT_SECONDS must be a positive integer")
 if type(POLL_INTERVAL_SECONDS) is not int or POLL_INTERVAL_SECONDS <= 0:
@@ -150,8 +162,12 @@ elif MODE == "verify_run":
     result = {{"mode": MODE, "status": "verified", "batches": results}}
 else:
     raise ValueError("Unsupported Demo 2 notebook mode")
-notebookutils.notebook.exit(json.dumps(result, sort_keys=True))
 """
+    runtime = (
+        'import tempfile\nwith tempfile.TemporaryDirectory(prefix="chanel-verifier-") as source_dir:\n'
+        + textwrap.indent(body, "    ")
+        + "notebookutils.notebook.exit(json.dumps(result, sort_keys=True))\n"
+    )
     return {
         "nbformat": 4,
         "nbformat_minor": 5,

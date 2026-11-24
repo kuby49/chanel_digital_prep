@@ -145,7 +145,7 @@
     "Producer OneLake-to-local staging and packaged queued submission have not been verified in a measured run.",
     "Fresh producer-runtime identity and effective ingestion permissions are not established by historical probes.",
     "The manually provisioned workspace has no matching Demo 2 CLI ownership ledger or markers.",
-    "The global sales-line reservation contract is not finalized; the retained-key inventory does not prove writer quiescence.",
+    "No live global sales-line reservation or quiesced retained-key inventory is established.",
     "The independent per-batch monitor has not been verified against a measured run.",
     "Two concurrent verifier jobs succeeded, but Fabric reported high-concurrency mode disabled.",
     "Serialized replay was verified; concurrent duplicate submission safety was not established.",

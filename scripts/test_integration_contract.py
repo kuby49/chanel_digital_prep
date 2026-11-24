@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 
@@ -26,6 +28,46 @@ def load_script(name, path):
 
 
 class SharedManifestIntegrationTest(unittest.TestCase):
+    def test_native_copy_guard_accepts_producer_admission_and_stop_binding(self):
+        import generator
+        from fabric_ledger import FabricLedger
+        from fabric_runtime import stop_requested
+        from test_fabric_ledger import MemoryStore
+
+        sys.path.insert(0, str(ROOT / "demo-3-onelake-events-copy"))
+        try:
+            guard = load_script("native_guard_integration", ROOT / "demo-3-onelake-events-copy" / "native_guard.py")
+        finally:
+            sys.path.pop(0)
+        config = RunConfig(run_id="integration_native", start_date="2026-01-01",
+                           file_count=10, rows_per_file=1000, interval_seconds=60)
+        target = {"workspace_id": "11111111-1111-4111-8111-111111111111",
+                  "item_id": "22222222-2222-4222-8222-222222222222", "fact": "dbo.factsales"}
+        policy = {"version": 1, "max_file_count": 10, "max_rows_per_file": 1000,
+                  "max_admission_seconds": 3600, "writer_wait_seconds": 300,
+                  "run_template": {key: value for key, value in asdict(config).items()
+                                   if key not in ("run_id", "file_count", "rows_per_file")}}
+        settings = {"workspace_id": target["workspace_id"], "item_id": target["item_id"],
+                    "native_policy": policy}
+        now = datetime.now(timezone.utc)
+        expiry = (now + timedelta(minutes=45)).isoformat()
+        digest = "a" * 64
+        store = MemoryStore()
+        subject = f"/Files/incoming/sales/sales_{config.run_id}_0001.csv"
+        with FabricLedger(store, config, ["demo-3"], selected_targets={"demo-3": target},
+                          fresh_only=True) as ledger:
+            ledger.open_demo3_admission(expiry, digest)
+            ledger.stage_batch(1)
+            self.assertEqual(guard.resolve_config(generator, settings, subject, store, now=now), config)
+            marker = {"version": 1, "run_id": config.run_id, "nonce": "native-" + digest[:32],
+                      "config_sha256": digest}
+            store.create(f"Files/producer/runs/{config.run_id}/stop.json", generator.canonical_bytes(marker))
+            self.assertTrue(stop_requested(store, config.run_id, marker["nonce"], digest))
+            with self.assertRaisesRegex(ValueError, "valid stop request"):
+                guard.resolve_config(generator, settings, subject, store, now=now)
+            self.assertEqual(guard.resolve_config(generator, settings, subject, store,
+                                                  finishing=True, now=now), config)
+
     def test_demo1_accepts_staged_manifest_and_selects_measured_batch(self):
         with tempfile.TemporaryDirectory() as root:
             config = RunConfig(run_id="integration", file_count=1, rows_per_file=2)

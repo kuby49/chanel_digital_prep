@@ -29,7 +29,7 @@ def run_config_from_shared(generator, config):
 
 
 def build_notebook(producer_dir, run_config, workspace_id, item_id, lakehouse_name,
-                   producer_workspace_id, producer_item_id):
+                   producer_workspace_id, producer_item_id, *, native_policy=None):
     workspace_id, item_id = _guid(workspace_id), _guid(item_id)
     if not isinstance(lakehouse_name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", lakehouse_name):
         raise ValueError("invalid Lakehouse name")
@@ -50,6 +50,15 @@ def build_notebook(producer_dir, run_config, workspace_id, item_id, lakehouse_na
         "producer_workspace_id": _guid(producer_workspace_id),
         "producer_item_id": _guid(producer_item_id), "approved_config": approved,
     }
+    entry_point = "guard_spark"
+    if native_policy is not None:
+        from native_guard import validate_policy
+
+        if run_config:
+            raise ValueError("native policy and fixed run configuration are mutually exclusive")
+        settings["native_policy"] = validate_policy(native_policy)
+        files["native_guard.py"] = (local / "native_guard.py").read_bytes()
+        entry_point = "native_guard"
 
     def cell(source, tags=()):
         return {"cell_type": "code", "execution_count": None,
@@ -74,7 +83,7 @@ with _GuardTemp(prefix="demo3-guard-") as _guard_dir:
         (_GuardPath(_guard_dir) / _guard_name).write_bytes(_guard_content)
     _guard_sys.path.insert(0, _guard_dir)
     try:
-        from guard_spark import execute
+        from {entry_point} import execute
         _guard_result = execute(spark, notebookutils, {settings!r}, _guard_inputs)
     finally:
         _guard_sys.path.remove(_guard_dir)
@@ -89,3 +98,10 @@ notebookutils.notebook.exit(_guard_result)
         "language_info": {"name": "python"},
         "trident": {"lakehouse": binding}, "dependencies": {"lakehouse": binding},
     }, "cells": [cell(parameters, ("parameters",)), cell(loader)]}
+
+
+def build_native_notebook(producer_dir, policy, workspace_id, item_id, lakehouse_name,
+                          producer_workspace_id, producer_item_id):
+    return build_notebook(
+        producer_dir, {}, workspace_id, item_id, lakehouse_name,
+        producer_workspace_id, producer_item_id, native_policy=policy)

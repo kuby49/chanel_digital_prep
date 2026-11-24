@@ -36,6 +36,7 @@ RUN = {
     "customers": 100, "file_count": 1, "rows_per_file": 10, "interval_seconds": 60,
 }
 FRESH_RUN_ID = "customer_demo_20261124_dc2792654b5b"
+NATIVE_JOURNAL = "demo3-native-binding-state.json"
 TERMINAL = {"Completed", "Failed", "Cancelled", "Canceled", "Deduped"}
 LANDING = f"abfss://{WORKSPACE}@onelake.dfs.fabric.microsoft.com/{LAKEHOUSE}/Files/incoming/sales"
 
@@ -103,7 +104,7 @@ def _canonical(graph):
     return sorted(graph, key=lambda entity: entity["uniqueIdentifier"])
 
 
-def _rule_state(graph, state):
+def _rule_state(graph, state, *, reusable=False):
     rules = [item for item in graph if item.get("type") == "timeSeriesView-v1"
              and item["payload"].get("definition", {}).get("type") == "Rule"]
     _require(len(rules) == 1, "Expected exactly one customer rule.")
@@ -115,6 +116,8 @@ def _rule_state(graph, state):
     _require(len(expected_rules) == 1, "Journal rule definition is invalid.")
     expected_rules[0]["payload"]["definition"]["settings"]["shouldRun"] = running
     _require(_canonical(graph) == _canonical(expected), "Customer event/action binding changed.")
+    if reusable:
+        return running
     actions = state["actions"]
     _require("disable" not in actions and not any(
         key in state for key in ("runtime_failure", "runtime_stop", "runtime_stop_failure")
@@ -159,7 +162,8 @@ def _absent(store, path):
 
 def _validate(config, prefix, state_dir, *, api=None):
     demo = config["demo-3"]
-    _require(demo.get("customer_preflight") is True and prefix == "chanel"
+    native = demo.get("native_preflight") is True
+    _require((native != (demo.get("customer_preflight") is True)) and prefix == "chanel"
              and config.get("tenant_id") == TENANT,
              "Only the explicitly selected MCAP customer preflight is supported.")
     for field, value in (("workspace_id", WORKSPACE), ("lakehouse_id", LAKEHOUSE),
@@ -177,20 +181,49 @@ def _validate(config, prefix, state_dir, *, api=None):
     _require(type(data.get("max_duration_seconds")) is int
              and 0 < data["max_duration_seconds"] <= 1800 and data.get("currency") == "USD",
              "Customer run needs a bounded duration of at most 1800 seconds and USD.")
-    run = customer_run(config)
-    journal_path = state_dir / binding_journal(config)
+    if native:
+        import native_guard
+
+        _require(demo.get("native_binding_journal") == NATIVE_JOURNAL,
+                 "Native binding journal must use its exact separate basename.")
+        policy = native_guard.validate_policy(demo["native_policy"])
+        _require(policy["run_template"] == {key: RUN[key] for key in native_guard._TEMPLATE}
+                 and policy["max_file_count"] <= 10 and policy["max_rows_per_file"] <= 1000,
+                 "Native generation policy exceeds prepared dimensions or ten-file/1000-row bounds.")
+        journal_path = state_dir / NATIVE_JOURNAL
+        run = None
+    else:
+        run = customer_run(config)
+        journal_path = state_dir / binding_journal(config)
     state = _load_json(journal_path)
     expected = {
         "workspace_id": WORKSPACE, "lakehouse_id": LAKEHOUSE, "guard_notebook_id": NOTEBOOK,
         "pipeline_id": PIPELINE, "reflex_id": REFLEX, "producer_workspace_id": STAGING_WORKSPACE,
         "producer_lakehouse_id": STAGING_LAKEHOUSE, "generator_sha256": GENERATOR_SHA,
-        "run_config": run,
     }
+    if native:
+        expected.update(native_policy=policy, native_policy_sha256=config_sha256(policy))
+    else:
+        expected["run_config"] = run
     _require(all(state.get(key) == value for key, value in expected.items()),
              "Original customer binding journal differs.")
     _require(all(state.get("actions", {}).get(key, {}).get("status") == "confirmed-readback"
                  for key in ("guard_update", "activator_update")), "Customer binding is unconfirmed.")
-    if run["run_id"] == FRESH_RUN_ID:
+    if native:
+        previous_name = "demo3-customer-" + FRESH_RUN_ID + "-binding-state.json"
+        previous = _load_json(state_dir / previous_name)
+        original = _load_json(state_dir / JOURNAL)
+        _require(state.get("previous_journal") == previous_name
+                 and state.get("previous_journal_sha256") == config_sha256(previous)
+                 and set(previous.get("actions", {})) == {"guard_update", "activator_update"}
+                 and all(item.get("status") == "confirmed-readback"
+                         for item in previous["actions"].values())
+                 and previous.get("previous_journal") == JOURNAL
+                 and previous.get("previous_journal_sha256") == config_sha256(original)
+                 and original.get("runtime_stop") == "rule-disabled-jobs-terminal-lock-absent"
+                 and original.get("actions", {}).get("disable", {}).get("status") == "confirmed-readback",
+                 "Native binding must preserve the previously stopped, never-enabled fresh attempt.")
+    elif run["run_id"] == FRESH_RUN_ID:
         _require(state.get("config_sha256") == config_sha256(config),
                  "Fresh customer binding does not match the final agreed config hash.")
         previous = _load_json(state_dir / JOURNAL)
@@ -200,8 +233,13 @@ def _validate(config, prefix, state_dir, *, api=None):
                  and previous.get("actions", {}).get("disable", {}).get("status") == "confirmed-readback",
                  "Previous customer attempt is not preserved and safely stopped.")
     producer, generator, storage = _producer(state_dir)
-    _require(guarded_notebook.run_config_from_shared(generator, config) == run,
-             "Only the bound one-file ten-row customer run is supported.")
+    if native:
+        projected = {**config, "data": {**data, "run_id": "native-validation"}}
+        candidate = guarded_notebook.run_config_from_shared(generator, projected)
+        native_guard.validate_run_policy(generator.RunConfig(**candidate), policy)
+    else:
+        _require(guarded_notebook.run_config_from_shared(generator, config) == run,
+                 "Only the bound one-file ten-row customer run is supported.")
     api = api or FabricControl.from_cli(TENANT, timeout=120)
     base = "/v1/workspaces/" + WORKSPACE
     workspace = _owned(api, "/v1/workspaces", "chanel-demo3-copy-events", WORKSPACE)
@@ -213,8 +251,12 @@ def _validate(config, prefix, state_dir, *, api=None):
     _owned(api, base + "/reflexes", "Demo3EventE2eActivatorA9bbae81", REFLEX, "activator-cli")
     notebook = _definition(api, base, "/items/" + NOTEBOOK,
                            "notebook-content.ipynb", suffix="?format=ipynb")
-    expected_notebook = guarded_notebook.build_notebook(
-        producer, run, WORKSPACE, LAKEHOUSE, HOUSE_NAME, STAGING_WORKSPACE, STAGING_LAKEHOUSE)
+    if native:
+        expected_notebook = guarded_notebook.build_native_notebook(
+            producer, policy, WORKSPACE, LAKEHOUSE, HOUSE_NAME, STAGING_WORKSPACE, STAGING_LAKEHOUSE)
+    else:
+        expected_notebook = guarded_notebook.build_notebook(
+            producer, run, WORKSPACE, LAKEHOUSE, HOUSE_NAME, STAGING_WORKSPACE, STAGING_LAKEHOUSE)
     _require([cell["source"] for cell in notebook["cells"]]
              == [cell["source"] for cell in expected_notebook["cells"]]
              and notebook["metadata"]["trident"]["lakehouse"]
@@ -233,7 +275,16 @@ def _validate(config, prefix, state_dir, *, api=None):
              and connection.get("connectionDetails", {}).get("type") == "Lakehouse",
              "Existing Lakehouse connection is unavailable.")
     graph = _definition(api, base, "/reflexes/" + REFLEX, "ReflexEntities.json", "activator-cli")
-    running = _rule_state(graph, state)
+    running = _rule_state(graph, state, reusable=native)
+    if native:
+        sources = [item for item in graph if item.get("type") == "realTimeHubSource-v1"]
+        _require(len(sources) == 1 and sources[0]["payload"]["filterSettings"] == {
+            "eventTypes": [{"name": "Microsoft.Fabric.OneLake.FileCreated"}],
+            "filters": [
+                {"operatorType": "StringBeginsWith", "key": "subject",
+                 "values": ["/Files/incoming/sales/sales_"]},
+                {"operatorType": "StringEndsWith", "key": "subject", "values": [".csv"]},
+            ]}, "Native event source is not the exact reusable sales-file filter.")
     for item in _inventory(api, base + "/items"):
         if item.get("type") not in ("Notebook", "DataPipeline") or MARKER not in item.get("description", ""):
             continue
@@ -243,8 +294,10 @@ def _validate(config, prefix, state_dir, *, api=None):
             "An owned notebook or pipeline job is not terminal.")
     token = _storage_token()
     store = storage.OneLakeStore(WORKSPACE, LAKEHOUSE, lambda: token)
-    for path in (LOCK_PATH, RECORD_PREFIX + run["run_id"] + "_0001.json",
-                 "Files/incoming/sales/sales_" + run["run_id"] + "_0001.csv"):
+    paths = (LOCK_PATH,) if native else (
+        LOCK_PATH, RECORD_PREFIX + run["run_id"] + "_0001.json",
+        "Files/incoming/sales/sales_" + run["run_id"] + "_0001.csv")
+    for path in paths:
         _absent(store, path)
     proof = json.loads(store.read("Files/demo3-audit/setup/common-dimensions-a9bbae81.json")[0])
     _require(proof.get("workspace_id") == WORKSPACE and proof.get("lakehouse_id") == LAKEHOUSE
@@ -259,11 +312,15 @@ def _validate(config, prefix, state_dir, *, api=None):
              "Original pipeline-context staging access proof is missing.")
     _require(_load_json(journal_path) == state, "Customer journal changed during admission.")
     return [
-        "Bound customer-run preflight passed; rule is " + ("enabled." if running else "stopped."),
+        ("Bound reusable native preflight passed; rule is " if native else
+         "Bound customer-run preflight passed; rule is ") + ("enabled." if running else "stopped."),
         "Existing guard, exact-file Copy, target, connection, dimensions, terminal jobs and absent "
         "writer lock verified. No data/job/rule mutation or SQL sync required.",
-        "Ready means admission for this one-file ten-row demonstration only, not delivered data, "
-        "future object access, general deployment readiness or the ten-file acceptance run.",
+        ("Ready means reusable native binding within the pinned policy only. Each run still needs "
+         "an open, unexpired destination-bound manifest admission and no valid stop marker; "
+         "no delivery, recurring arrivals or ten-file runtime acceptance is claimed." if native else
+         "Ready means admission for this one-file ten-row demonstration only, not delivered data, "
+         "future object access, general deployment readiness or the ten-file acceptance run."),
     ]
 
 

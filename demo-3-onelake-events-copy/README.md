@@ -4,6 +4,8 @@
 With `demo-3.customer_preflight: true`, read-only `validate-only` checks the
 original customer binding and the existing run-specific resources. It does not
 claim the new file was delivered or that the ten-file acceptance run passed.
+Reusable native binding support is locally tested but has not been installed
+or exercised against the live items.
 An isolated MCAP preflight
 workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
 stopped probe Activator exist. They do not constitute a deployable production
@@ -21,14 +23,14 @@ duplicate-retry safety, target-row validation and safe stopping.
 
 ## Contract
 
-`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup requires `--yes`. The explicit customer preflight can report `ready: true` for its bound run after live checks. Other deployment, validation and cleanup paths remain blocked; cleanup never deletes anything.
+`python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate,provision-owned,verify-owned} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup and `provision-owned` require `--yes`. A v1 result reports `track: demo-3`. Deploy, general validation and cleanup return `blocked`; cleanup never deletes anything. Only an explicit customer or native binding preflight can return `ready:true`.
 
 The separately approved fresh run `customer_demo_20261124_dc2792654b5b` uses
 the original ownership directory and the exclusive
 `demo3-customer-customer_demo_20261124_dc2792654b5b-binding-state.json` journal,
 configured by `demo-3.customer_binding_journal`. It preserves the stopped
-predecessor journal and pins the complete canonical configuration hash. Other
-run IDs and journal paths are not admitted. Rebinding the guard and disabled
+predecessor journal and pins the complete canonical configuration hash. The fixed-run preflight does not admit other run IDs or
+journal paths. Rebinding the guard and disabled
 rule requires coordinated journaled updates and readback before admission;
 historical proofs do not establish new delivery.
 
@@ -137,6 +139,197 @@ and 429 retries, and read back the definitions. Do not enable the rule until
 the readiness and safe-write gates pass. Obtain approval before cross-workspace
 permissions or chargeable resources. The user approved the UI connection
 creation as a course correction; do not silently substitute another connection.
+
+## Binding a bounded shared run
+
+### Reusable native event path (local candidate, not deployed)
+
+Use `activator.build_native_definition(...)` and
+`guarded_notebook.build_native_notebook(producer_dir, policy, workspace_id,
+lakehouse_id, lakehouse_name, producer_workspace_id, producer_lakehouse_id)`
+for a one-time, stopped binding on the existing owned items. The unchanged Copy
+pipeline stays at concurrency one, with a single admitted filename and
+`(BatchID, SalesLineID)` Upsert. The native source filters FileCreated events
+under `/Files/incoming/sales/sales_` ending in `.csv`; the guard, not that broad
+filter, authorizes the exact run and file. No definition edit is needed for each
+subsequent native run or file.
+
+The version-one policy pins `run_template` (batch class `measured`, start date
+`2026-01-01`, seed 42, 365 dates, 20 products, 100 customers and 60-second
+interval), `max_file_count:10`, `max_rows_per_file:1000`, a positive
+`max_admission_seconds` covering publication plus queued Copy/drain, and
+`writer_wait_seconds` between 1 and 300 (default 300). The admission lifetime
+bound is distinct from the producer's run duration. Dimension/template changes
+still need deliberate preparation and a new deployment-bound policy.
+
+For each fresh native ID the producer must publish the authoritative
+`Files/producer/runs/<run_id>/manifest.json` before the file PUT. In addition
+to the existing v1 configuration, generator fingerprint, destinations and
+batches, it contains:
+
+```json
+{
+  "demo3_admission": {
+    "version": 1,
+    "state": "open",
+    "workspace_id": "<owned Demo 3 workspace>",
+    "lakehouse_id": "<owned Demo 3 Lakehouse>",
+    "config_sha256": "<canonical complete RunConfig SHA-256>",
+    "stop_config_sha256": "<canonical native projected-runtime document SHA-256>",
+    "expires_at_utc": "<fixed timezone-aware UTC deadline>"
+  }
+}
+```
+
+Both hashes use sorted-key UTF-8 JSON with separators `(",", ":")`,
+`ensure_ascii=False`, `allow_nan=False`, and no newline. They hash different
+objects: admission `config_sha256` covers `dataclasses.asdict(RunConfig)`,
+including the fresh run ID; `stop_config_sha256` covers the producer's native
+runtime document. A stop object at `Files/producer/runs/<run_id>/stop.json`
+must exactly contain `{version:1, run_id, config_sha256, nonce}`, with that
+runtime-document hash and nonce `native-<first 32 hash characters>`. A valid
+stop prevents new admission; a malformed or foreign object also fails closed,
+rather than being silently ignored.
+
+Only the producer may change its manifest under `FabricLedger` writer-lock
+and ETag ownership. Successful publication leaves admission open through its
+original expiry for queued delivery. Cooperative stop/failure closes it.
+Force cancellation does not guarantee notebook `finally` executes. Existing
+durable Copy intents can finish verification and release their owned lock
+after stop/expiry; no new Copy intent is authorized. Legacy manifests without
+the native admission remain blocked, including the old stopped attempts.
+
+The native audit independently handles overlapping arrivals: only a definitive
+conditional-create conflict is polled, with admission rechecks and observable
+writer-wait messages. It never steals or deletes another owner's lock and never
+retries an uncertain create. A contended event is persisted under
+`Files/demo3-audit/waits/<pipeline_run_id>.json`. At the bounded timeout its job
+fails with a durable blocked-event ticket; reconcile the writer and use the same
+guarded recovery path. This is not an unlimited queue or a guarantee that every
+Copy finishes inside 60 seconds. Keep the 60-second producer cadence; do not
+silently stretch it to hide lock contention.
+
+After coordinated stopped-state verification, exclusively create
+`demo3-native-binding-state.json` with the existing resource IDs, generator
+fingerprint, `native_policy`, `native_policy_sha256`, the disabled graph and
+confirmed `guard_update`/`activator_update` readbacks. Preserve the fresh customer
+journal as `previous_journal` with its canonical `previous_journal_sha256`,
+and preserve its predecessor chain. Do not copy candidate actions into a
+success-shaped live journal. Set `demo-3.native_preflight:true`,
+`native_binding_journal:"demo3-native-binding-state.json"` and `native_policy`
+in the common configuration; remove `customer_preflight`. Standard
+`deploy.py --mode validate-only ...` then verifies the native notebook, broad
+event binding, unchanged exact-file Copy, ownership, dimensions and writer/job
+quiescence without pinning a specific `data.run_id`. It cannot pass against
+the currently deployed fixed-run notebook.
+
+**Native operation after that deployment:** open the existing
+[Demo 3 workspace](https://app.fabric.microsoft.com/groups/744223de-ceab-4c4f-82ba-f811bcb5c7d7/list?experience=real-time-intelligence).
+Start only `Copy sales file` inside `Demo3EventE2eActivatorA9bbae81`, then launch
+the separately prepared native recurring producer once. Do not manually Run
+`Demo3EventE2ePipelineA9bbae81` or `Demo3EventE2eGuardA9bbae81`; their parameters
+come from events. Observe Activator history, pipeline monitoring, exact
+manifest batch IDs, batch audits and any writer-wait tickets, then inspect
+`Demo3EventE2eA9bbae81` / `dbo.factsales` by those batch IDs. Stop the rule first,
+request the producer's cooperative stop, and drain already-admitted owned jobs;
+do not clear an ambiguous writer lock. SQL metadata can lag Delta, so lack of
+immediate SQL visibility is not proof of missing Copy. These are operator
+steps, not an instruction to enable or run anything during preparation.
+
+### Existing one-file binding
+
+Choose the run ID once in the shared configuration. Use
+`guarded_notebook.run_config_from_shared(generator, config)` with the actual
+producer module, then pass that result to `guarded_notebook.build_notebook`
+with both the target Lakehouse IDs and the **separate producer staging**
+workspace and Lakehouse IDs. The packaged generator fingerprint must match the
+authoritative manifest at `Files/producer/runs/<run_id>/manifest.json`.
+`activator.build_definition(..., sample, run_id=run["run_id"])` produces a
+disabled, run-filtered rule from a representative event in the target
+Lakehouse. The pipeline must use the matching target, connection and guard.
+These builders do not deploy or enable the assets.
+
+An isolated pipeline notebook using the guard's storage-token mechanism read
+an existing manifest from the separate producer staging Lakehouse and an
+existing landing file from the target, verifying both hashes and the runtime
+principal. This establishes access to those existing objects, not the
+existence or permissions of a future run's manifest.
+
+The owned guard and disabled Activator have been bound and read back for the
+one-file, ten-row customer run `customer_demo_20261124_e0c409cc05ef`. This is a
+small demonstration, not the separate ten-file acceptance run. The existing
+guarded Copy pipeline is reused; enable the rule only after the producer and
+other destinations are ready, then monitor and stop it after the run.
+
+For this exact run only, `validate-only` accepts `demo-3.customer_preflight:true`,
+prefix `chanel`, the original `demo3-customer-binding-state.json` directory,
+and the pinned producer snapshot under `demo3-current-producer/demo-data-generator`
+there. The `demo-3` object must identify the exact workspace, Lakehouse ID/name,
+`destination_table:"dbo.factsales"` and `landing_path:"Files/incoming/sales"`.
+The shared staging and target binding must match the notebook, with USD and a
+positive `data.max_duration_seconds` no greater than 1800.
+
+The read-only preflight checks live owned identities, exact packaged notebook
+and pipeline definitions, connection, original dimension/access proofs, terminal
+owned jobs and absent source/audit/writer lock. It accepts a stopped rule before
+enable or the exact enabled rule after a confirmed journaled enable; stopped,
+failed or uncertain runtime attempts cannot be silently relaunched. It does not
+enable anything or require a future manifest/file, SQL synchronization or live
+delivery. `ready:true` means admission to this bounded customer demonstration
+only, not general deployment or completion of the acceptance run.
+
+Customer preflight and its session controller bound each CLI credential request
+to 120 seconds without automatic retry. On Windows they invoke the Azure CLI
+MSI's sibling `python.exe -IBm azure.cli` directly, preserving `AZ_INSTALLER=MSI`
+and the inherited `AZURE_CONFIG_DIR`; missing MSI Python blocks rather than
+falling back to `az.cmd`. Other platforms keep the native `az` entry point.
+Temporary output handles, rather than captured pipes, prevent inherited child
+handles from delaying timeout cleanup. Fabric credential and JWT tenant/principal
+checks and the storage credential tenant check remain required.
+
+The first attempt was enabled and safely stopped after the common producer
+blocked before submission; its journal must not be reset or reused. The only
+additional approved attempt is `customer_demo_20261124_dc2792654b5b`, with the
+same generation parameters and resources. Keep the original state directory,
+ownership and proof files; set `data.run_id` to that value and
+`demo-3.customer_binding_journal` to
+`demo3-customer-customer_demo_20261124_dc2792654b5b-binding-state.json`.
+No arbitrary run or journal path is admitted.
+
+Create that fresh journal exclusively only when performing the coordinated
+rebind, preserving the old definitions and predecessor journal. It must include
+`config_sha256` for the final complete common config, `previous_journal` naming
+`demo3-customer-binding-state.json`, and `previous_journal_sha256`. Both hashes
+use UTF-8 JSON with sorted keys, separators `(",", ":")`, `ensure_ascii=False`,
+and `allow_nan=False`, without a trailing newline. The predecessor must retain
+its confirmed disabled/terminal/lock-absent result. The validator checks the
+new run, full config hash, preserved predecessor and current definitions.
+Changing any common config field after binding requires explicit reconciliation,
+not overwriting the journal. Historical dimension/access proofs are not new
+delivery evidence.
+
+Before that rebind, a stopped read-only preparation check can verify the exact
+old notebook/rule, terminal owned jobs, absent writer lock, and absent new
+source/audit/staging-manifest paths, but it cannot report `ready:true` for the
+new run. The guard must subsequently be rebound and read back for the new run,
+and the Activator must get a new source/filter graph that remains disabled.
+Enable only after the new run's stopped admission passes and the coordinator
+provides a fresh deadline and all-paths signal.
+
+The owned SQL endpoint's `dbo.factsales` visibility was restored with one
+targeted `refreshMetadata` call using `recreateTables:false`: SQL subsequently
+returned the three bootstrap facts totaling 116125 minor units. No tables or
+data were recreated. This is a verified point-in-time recovery, not proof that
+automatic SQL synchronization will stay current for the customer batch.
+
+`setup_notebook.py --allow-dimension-expansion` is an explicit insert-only
+option for a quiescent, owned existing target. It validates existing and
+generated keys and all overlapping rows before writing, appends only missing
+rows, and checks old rows and facts remain unchanged. It does not exclude
+outside writers. If interrupted, inspect the Delta versions and partial results
+before retrying. In the isolated target, the 2026 configuration added 365
+dates, 17 products and 95 customers while retaining four earlier dates and
+three bootstrap facts; exclude those facts from measured totals.
 
 ## Local checks
 

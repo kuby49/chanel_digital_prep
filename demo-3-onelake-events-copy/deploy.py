@@ -188,6 +188,7 @@ def main(argv=None):
     protected = (args.config, args.state_dir / STATE_FILE, args.state_dir / LOCK_FILE,
                  args.result.parent / CANDIDATE_FILE,
                  args.state_dir / "demo3-customer-binding-state.json",
+                 args.state_dir / "demo3-native-binding-state.json",
                  args.state_dir / "demo3-staging-access-state.json")
     if args.result.resolve() in {path.resolve() for path in protected}:
         print("Result path conflicts with input, state, or candidate", file=sys.stderr)
@@ -203,11 +204,12 @@ def main(argv=None):
             raise ValueError("configuration contract_version must be 1")
         if not isinstance(config.get("demo-3"), dict):
             raise ValueError("configuration must contain a demo-3 object")
-        selected_journal = config["demo-3"].get("customer_binding_journal")
-        if isinstance(selected_journal, str):
-            if args.result.resolve() == (args.state_dir / selected_journal).resolve():
-                print("Result path conflicts with customer binding journal", file=sys.stderr)
-                return 1
+        for field in ("customer_binding_journal", "native_binding_journal"):
+            selected_journal = config["demo-3"].get(field)
+            if isinstance(selected_journal, str):
+                if args.result.resolve() == (args.state_dir / selected_journal).resolve():
+                    print("Result path conflicts with customer binding journal", file=sys.stderr)
+                    return 1
         verification_timeout(config)
         if args.mode == "cleanup" and not args.yes:
             raise ValueError("cleanup requires --yes; no resources were removed")
@@ -223,7 +225,9 @@ def main(argv=None):
             result["diagnostics"].append(
                 "Local ownership candidate only; live identity, access, and readiness are not established."
             )
-        elif args.mode == "validate-only" and config["demo-3"].get("customer_preflight") is True:
+        elif args.mode == "validate-only" and any(
+            config["demo-3"].get(field) is True for field in ("customer_preflight", "native_preflight")
+        ):
             from customer_preflight import validate
 
             result["diagnostics"].extend(validate(config, args.prefix, args.state_dir))

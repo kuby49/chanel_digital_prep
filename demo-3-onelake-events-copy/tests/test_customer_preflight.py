@@ -133,6 +133,46 @@ class CustomerPreflightTests(unittest.TestCase):
                 preflight._storage_token()
             token.assert_called_once_with("https://storage.azure.com/", timeout=120)
 
+    def test_native_binding_accepts_generated_run_ids_but_requires_policy_and_preserved_journal(self):
+        config = copy.deepcopy(self.config)
+        config["demo-3"].pop("customer_preflight")
+        policy = {"version": 1, "max_file_count": 10, "max_rows_per_file": 1000,
+                  "max_admission_seconds": 3600, "run_template": {
+                      key: value for key, value in preflight.RUN.items()
+                      if key not in ("run_id", "file_count", "rows_per_file")}}
+        config["demo-3"].update(native_preflight=True, native_policy=policy,
+                                native_binding_journal=preflight.NATIVE_JOURNAL)
+        config["data"].update(run_id="native_generated_new_run", file_count=10, rows_per_file=1000)
+        original = {"runtime_stop": "rule-disabled-jobs-terminal-lock-absent",
+                    "actions": {"disable": {"status": "confirmed-readback"}}}
+        previous = {"actions": {key: {"status": "confirmed-readback"}
+                                for key in ("guard_update", "activator_update")},
+                    "previous_journal": preflight.JOURNAL,
+                    "previous_journal_sha256": preflight.config_sha256(original)}
+        previous_name = "demo3-customer-" + preflight.FRESH_RUN_ID + "-binding-state.json"
+        state = {
+            "workspace_id": preflight.WORKSPACE, "lakehouse_id": preflight.LAKEHOUSE,
+            "guard_notebook_id": preflight.NOTEBOOK, "pipeline_id": preflight.PIPELINE,
+            "reflex_id": preflight.REFLEX, "producer_workspace_id": preflight.STAGING_WORKSPACE,
+            "producer_lakehouse_id": preflight.STAGING_LAKEHOUSE,
+            "generator_sha256": preflight.GENERATOR_SHA, "native_policy": policy,
+            "native_policy_sha256": preflight.config_sha256(policy), "actions": previous["actions"],
+            "previous_journal": previous_name, "previous_journal_sha256": preflight.config_sha256(previous),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / preflight.JOURNAL).write_text(json.dumps(original))
+            (root / previous_name).write_text(json.dumps(previous))
+            journal = root / preflight.NATIVE_JOURNAL
+            journal.write_text(json.dumps(state))
+            with mock.patch.object(preflight, "_producer", side_effect=deploy.CandidateBlocked("passed native lineage")):
+                with self.assertRaisesRegex(deploy.CandidateBlocked, "passed native lineage"):
+                    preflight.validate(config, "chanel", root)
+                state["native_policy_sha256"] = "changed"
+                journal.write_text(json.dumps(state))
+                with self.assertRaisesRegex(deploy.CandidateBlocked, "binding journal differs"):
+                    preflight.validate(config, "chanel", root)
+
     def test_entrypoint_reports_ready_only_after_successful_customer_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

@@ -36,6 +36,20 @@ class SharedManifestIntegrationTest(unittest.TestCase):
             self.assertEqual(validate_manifest(manifest), [])
             self.assertEqual(measured_batches(manifest), [entry])
 
+    def test_real_producer_accepts_selected_demos_for_blocked_validation(self):
+        orchestration = load_script("orchestration_producer_validation", ROOT / "scripts" / "deploy-demos")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            config = root / "config.json"
+            config.write_text((ROOT / "config.example.json").read_text(encoding="utf-8"), encoding="utf-8")
+            outcome = orchestration.invoke("shared", "validate-only", config, "chanel", state,
+                                           root, 30, ["demo-1", "demo-3"])
+            self.assertEqual((outcome["status"], outcome["ready"]), ("blocked", False), outcome)
+            self.assertTrue(any("readiness" in message.lower() or "requires" in message.lower()
+                                for message in outcome["diagnostics"]))
+
     def test_orchestrator_resolves_real_producer_journal_without_cloud_calls(self):
         producer = load_script("producer_deploy_integration", ROOT / "demo-data-generator" / "deploy.py")
         orchestration = load_script("orchestration_integration", ROOT / "scripts" / "deploy-demos")

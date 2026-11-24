@@ -67,6 +67,27 @@ class SharedManifestIntegrationTest(unittest.TestCase):
             self.assertTrue(any("target candidates" in message.lower() for message in outcome["diagnostics"]))
             self.assertFalse(any(state.iterdir()))
 
+    def test_real_producer_recovery_receives_selection_and_remains_blocked(self):
+        orchestration = load_script("orchestration_producer_recovery", ROOT / "scripts" / "deploy-demos")
+        config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["capacity"]["id"] = "11111111-1111-4111-8111-111111111111"
+        config["shared"]["identity_id"] = "22222222-2222-4222-8222-222222222222"
+        config["data"]["run_id"] = "recovery-probe"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            path = root / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            for mode in ("producer-status", "stop-producer"):
+                with self.subTest(mode=mode):
+                    outcome = orchestration.invoke("shared", mode, path, "chanel", state,
+                                                   root, 30, ["demo-1", "demo-3"])
+                    self.assertEqual((outcome["status"], outcome["ready"]), ("blocked", False), outcome)
+                    self.assertTrue(any("termination unconfirmed" in message.lower()
+                                        for message in outcome["diagnostics"]))
+            self.assertFalse(any(state.iterdir()))
+
     def test_orchestrator_resolves_real_producer_journal_without_cloud_calls(self):
         producer = load_script("producer_deploy_integration", ROOT / "demo-data-generator" / "deploy.py")
         orchestration = load_script("orchestration_integration", ROOT / "scripts" / "deploy-demos")

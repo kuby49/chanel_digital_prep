@@ -161,7 +161,7 @@ def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout,
     if yes:
         args.append("--yes")
     if (mode in {"run-data", "start-monitor", "monitor-status", "wait-monitor", "stop-monitor"}
-            or track == "shared" and mode == "validate-only"):
+            or track == "shared" and mode in {"validate-only", "producer-status", "stop-producer"}):
         args += ["--selected-demos", ",".join(selected)]
     try:
         with log_path.open("w", encoding="utf-8") as log:
@@ -188,6 +188,8 @@ def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout,
             raise ValueError(f"exit code {completed.returncode} disagrees with status")
         if mode in {"resolve-candidate-ids", "resolve-target-candidate"} and data["ready"]:
             raise ValueError("candidate resolution must not claim readiness")
+        if track == "shared" and mode in {"producer-status", "stop-producer"} and data["status"] == "pass":
+            return result(track, mode, "blocked", "Producer recovery is inspection only; termination unconfirmed.")
         if mode in {"deploy", "validate-only", "monitor-status", "wait-monitor"} and data["status"] == "pass" and not data["ready"]:
             return result(track, mode, "blocked", "Entry point reported pass but did not verify readiness")
         return data

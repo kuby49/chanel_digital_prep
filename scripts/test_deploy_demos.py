@@ -745,6 +745,20 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(events[-1]["mode"], "run-data")
         self.assertNotIn("stop-monitor", summary["phases"])
 
+    def test_producer_recovery_inspection_cannot_claim_termination(self):
+        state = self.root / "recovery-state"
+        state.mkdir()
+        config_path = self.root / "config.json"
+        for mode in ("producer-status", "stop-producer"):
+            for ready in (False, True):
+                with self.subTest(mode=mode, ready=ready):
+                    self.config["behavior"] = {f"shared:{mode}": {"ready": ready}}
+                    config_path.write_text(json.dumps(self.config), encoding="utf-8")
+                    outcome = deploy.invoke("shared", mode, config_path, "chanel", state, self.root,
+                                            10, ["demo-1"])
+                    self.assertEqual((outcome["status"], outcome["ready"]), ("blocked", False))
+                    self.assertIn("termination unconfirmed", outcome["diagnostics"][0].lower())
+
     def test_incomplete_or_unready_monitor_never_reports_success(self):
         for behavior in ({"status": "blocked", "ready": False},
                          {"ready": False}, {"evidence": {"state": "running"}},

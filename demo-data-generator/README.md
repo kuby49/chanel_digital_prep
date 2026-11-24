@@ -110,8 +110,8 @@ that matches `shared.target_bindings`. A prepared profile pins `data.run_id`
 and its generation settings; the customer settings are 10 files, 1,000 rows
 each, at 60-second intervals. The definition embeds only the projected runtime
 configuration, not desktop paths, journal settings or credentials. Updating
-existing owned definitions requires a coordinated publication; ordinary deploy
-and validation still refuse to overwrite drift. Guarded CLI `run-data` is
+existing owned definitions requires the explicit publication below; ordinary
+deploy and validation still refuse to overwrite drift. Guarded CLI `run-data` is
 not the launcher for a config reserved for native use.
 
 Observe **Monitor** in Fabric for the parent and `RunProducer` notebook,
@@ -126,6 +126,43 @@ basis. The producer marks Demo 3 admission stopped under its writer lock on
 cooperative stop or failure when the ledger remains writable. On success the
 admission remains open until the fixed expiry so queued copies can finish;
 after force cancellation do not rely on an admission update having happened.
+
+### Publish prepared definitions to existing owned items
+
+Only the operator should run this during a maintenance window. Stop or
+disable other launchers and schedules and ensure nobody uses Fabric **Run**
+or edits either item concurrently. Fabric's definition update does not
+atomically exclude native launches or external edits; the controller
+serializes the guarded producer CLI using the same state directory and
+checks the pipeline and notebook job histories and the local job journals.
+Do not use a different state directory to bypass an unresolved intent.
+
+Use the same frozen resolved config and owned state directory for both
+commands. Run the notebook first; the wrapper update requires an exact
+notebook definition readback.
+
+```powershell
+python .\demo-data-generator\deploy.py --mode update-definition --definition-kind notebook --expected-definition-sha256 $ApprovedNotebookDigest --config $Config --prefix chanel --state-dir $State --result $NotebookResult --yes
+python .\demo-data-generator\deploy.py --mode update-definition --definition-kind pipeline --expected-definition-sha256 $ApprovedPipelineDigest --config $Config --prefix chanel --state-dir $State --result $PipelineResult --yes
+```
+
+`$Config`, `$State`, `$NotebookResult`, and `$PipelineResult` are absolute
+paths. The baseline digest is lowercase SHA-256 of the UTF-8 canonical JSON
+mapping `{part path: decoded JSON value}` from the approved live definition,
+including `.platform` if present. Canonical JSON uses sorted keys, compact
+separators, no trailing newline, and unescaped Unicode. Retrieve the notebook
+in `ipynb` format. A mismatching digest is reported without writing, but
+inspect and approve the actual definition before using that digest.
+
+The controller preserves `.platform` byte-for-byte and does not update item
+metadata. If publication is interrupted, rerun the **same command** with
+the same config and approved baseline. The durable
+`shared-producer-definition-update-v1.json` intent records the target and any
+accepted Fabric operation ID. The controller polls only that ID or checks
+exact readback when acceptance is unknown; it does not retry an uncertain
+update POST. If exact readback cannot establish the outcome, keep the
+journal and reconcile manually. Successful publication does not declare demo
+readiness or start a producer.
 
 ## Isolated Demo 2 synthetic staging
 

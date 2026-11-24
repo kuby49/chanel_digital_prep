@@ -42,8 +42,8 @@ from fabric_runtime import _kusto_endpoint, _tenant, native_parameters, require_
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
                        strict_json_loads, validate_run_manifest)
-from job_lifecycle import (JOURNAL_DIR_NAME, STARTUP_HEADROOM_SECONDS, LifecycleBlocked, PipelineJob,
-                           activity_timeout)
+from job_lifecycle import (JOURNAL_DIR_NAME, STARTUP_HEADROOM_SECONDS, TERMINAL, LifecycleBlocked,
+                           PipelineJob, _read_journal, activity_timeout)
 from target_readback import (OneLakeTableClient, TargetReadbackBlocked, _configured_landing,
                              read_selected_targets, selected_candidates)
 
@@ -54,6 +54,7 @@ API_ROOT = "https://api.fabric.microsoft.com"
 STORAGE_RESOURCE = "https://storage.azure.com/"
 AZURE_CLI_TOKEN_TIMEOUT_SECONDS = 120
 STATE_NAME = "shared-producer-v1.json"
+DEFINITION_UPDATE_NAME = "shared-producer-definition-update-v1.json"
 LOCK_NAME = ".shared-producer-v1.lock"
 CANDIDATE_NAME = "shared-producer-candidate-ids.json"
 OWNER = "chanel_digital_prep/demo-data-generator"
@@ -1139,22 +1140,171 @@ def _parts(definition):
     return result
 
 
-def _verify_definition(client, state, kind, config=None):
-    expected_definition = _definition(state, kind, config)
-    expected = _parts(expected_definition)
+def _definition_path(state, kind):
     workspace_id = state["resources"]["workspace"]["id"]
     item_id = state["resources"][kind]["id"]
-    path = f"/v1/workspaces/{workspace_id}/items/{item_id}/getDefinition"
+    return f"/v1/workspaces/{workspace_id}/items/{item_id}"
+
+
+def _read_definition(client, state, kind):
+    path = _definition_path(state, kind) + "/getDefinition"
     if kind == "notebook":
-        if expected_definition.get("format") != "ipynb":
-            raise Blocked("Local notebook definition does not use the supported ipynb format.")
         path += "?format=ipynb"
     _, response = client.post_operation(path)
     if not isinstance(response, dict):
         raise Blocked("Fabric did not return the item definition.")
-    actual = _parts(response.get("definition"))
+    definition = response.get("definition")
+    return definition, _parts(definition)
+
+
+def _verify_definition(client, state, kind, config=None):
+    expected_definition = _definition(state, kind, config)
+    expected = _parts(expected_definition)
+    if kind == "notebook" and expected_definition.get("format") != "ipynb":
+        raise Blocked("Local notebook definition does not use the supported ipynb format.")
+    _, actual = _read_definition(client, state, kind)
     if set(actual) - set(expected) - {".platform"} or any(actual.get(key) != value for key, value in expected.items()):
         raise Blocked("Live item definition differs from local assets; no overwrite was attempted.")
+
+
+def _definition_digest(parts):
+    return hashlib.sha256(canonical_bytes(parts)).hexdigest()
+
+
+def _platform_part(definition):
+    return next((part for part in definition["parts"] if part["path"] == ".platform"), None)
+
+
+def _platform_digest(definition):
+    part = _platform_part(definition)
+    return hashlib.sha256(base64.b64decode(part["payload"], validate=True)).hexdigest() if part else None
+
+
+def _definition_update_record(store):
+    path = store.directory / DEFINITION_UPDATE_NAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
+        raise Blocked("Definition-update journal is unreadable; reconcile before continuing.") from None
+    try:
+        value = strict_json_loads(raw)
+        binding = value["binding"]
+        if (not isinstance(binding, dict)
+                or set(value) != {"version", "binding", "phase", "operation_id", "retry_after"}
+                or type(value["version"]) is not int or value["version"] != 1
+                or value["phase"] not in ("pending", "completed")
+                or set(binding) != {"kind", "item_id", "workspace_id", "tenant_id", "before_sha256",
+                                    "after_sha256", "platform_sha256"}
+                or binding["kind"] not in ("notebook", "pipeline")
+                or any(not _same_uuid(binding[key], binding[key]) for key in ("item_id", "workspace_id", "tenant_id"))
+                or any(not re.fullmatch(r"[a-f0-9]{64}", binding[key]) for key in ("before_sha256", "after_sha256"))
+                or (binding["platform_sha256"] is not None
+                    and not re.fullmatch(r"[a-f0-9]{64}", binding["platform_sha256"]))
+                or (value["operation_id"] is None and value["retry_after"] is not None)
+                or (value["operation_id"] is not None
+                    and (not _same_uuid(value["operation_id"], value["operation_id"])
+                         or type(value["retry_after"]) is not int or value["retry_after"] < 0))):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise Blocked("Definition-update journal is invalid; reconcile before continuing.") from None
+    return value
+
+
+def _require_idle_producer(client, store, state, tenant_id):
+    resources = state["resources"]
+    for kind in ("pipeline", "notebook"):
+        seen = set()
+        for row in client.list_all(_definition_path(state, kind) + "/jobs/instances"):
+            if not isinstance(row, dict) or row.get("itemId") != resources[kind]["id"]:
+                raise Blocked(f"Producer {kind} job history is ambiguous; no definition was updated.")
+            job_id = _uuid(row.get("id"), "job ID", Blocked)
+            if job_id in seen or not isinstance(row.get("status"), str) or row["status"] not in TERMINAL:
+                raise Blocked(f"Producer {kind} has active or uncertain jobs; no definition was updated.")
+            seen.add(job_id)
+    for path in (store.directory / JOURNAL_DIR_NAME).glob("*.json"):
+        record = _read_journal(path)
+        binding = record.get("binding") if isinstance(record, dict) else None
+        job = PipelineJob(store.directory, binding, client)
+        if (path != job.path or binding["workspace_id"] != resources["workspace"]["id"]
+                or binding["pipeline_id"] != resources["pipeline"]["id"]
+                or binding["notebook_id"] != resources["notebook"]["id"]
+                or binding["tenant_id"] != tenant_id):
+            raise Blocked("Producer job journal is outside the owned scope; no definition was updated.")
+        if job.status_detail()["status"] not in TERMINAL:
+            raise Blocked("An exact journaled producer job is active; no definition was updated.")
+
+
+def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
+    store = StateStore(state_dir)
+    with store.lock():
+        state = load_owned_state(store, plan)
+        if state is None or state.get("pending") or any(key not in state["resources"] for key in KINDS):
+            raise Blocked("A complete owned producer deployment with no pending operation is required.")
+        record = _definition_update_record(store)
+        target = _definition(state, kind, config)
+        target_parts = _parts(target)
+        client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
+        principal_type = _workspace_principal(client, state, plan)
+        for owned_kind in ITEM_TYPES:
+            _verify_item(client, state, plan, owned_kind, principal_type)
+        if kind == "pipeline":
+            _verify_definition(client, state, "notebook", config)
+        live, actual = _read_definition(client, state, kind)
+        if set(actual) - {".platform"} != set(target_parts):
+            raise Blocked("Live definition differs from the supported part layout; no overwrite was attempted.")
+        after = dict(target_parts)
+        if ".platform" in actual:
+            after[".platform"] = actual[".platform"]
+            target["parts"].append(_platform_part(live))
+        binding = {"kind": kind, "workspace_id": state["resources"]["workspace"]["id"],
+                   "item_id": state["resources"][kind]["id"], "tenant_id": plan["tenant_id"],
+                   "before_sha256": before_sha256, "after_sha256": _definition_digest(after),
+                   "platform_sha256": _platform_digest(live)}
+        matches = record is not None and record["binding"] == binding
+        if record and record["phase"] == "pending" and not matches:
+            raise Blocked("Another definition update is unresolved or its binding changed; no POST was attempted.")
+        _require_idle_producer(client, store, state, plan["tenant_id"])
+        path = store.directory / DEFINITION_UPDATE_NAME
+
+        def persist():
+            _atomic_json(path, record)
+
+        if matches:
+            if record["phase"] == "pending" and record["operation_id"] is not None:
+                client.poll(record["operation_id"], record["retry_after"], require_result=False)
+        elif _definition_digest(actual) != before_sha256:
+            raise Blocked(f"Live {kind} baseline differs from approved SHA-256; observed "
+                          f"{_definition_digest(actual)}. No POST was attempted.")
+        elif before_sha256 != binding["after_sha256"]:
+            current, current_parts = _read_definition(client, state, kind)
+            if _definition_digest(current_parts) != before_sha256 or _platform_digest(current) != binding["platform_sha256"]:
+                raise Blocked("Live definition changed during admission; no POST was attempted.")
+            record = {"version": 1, "binding": binding, "phase": "pending",
+                      "operation_id": None, "retry_after": None}
+            persist()
+
+            def accepted(operation_id, delay):
+                record.update(operation_id=operation_id, retry_after=delay)
+                persist()
+
+            try:
+                status, _ = client.post_operation(_definition_path(state, kind) + "/updateDefinition?updateMetadata=false",
+                                                  {"definition": target}, on_accepted=accepted, require_result=False)
+            except (FabricHttpError, FabricTransportError, Blocked, OSError):
+                raise Blocked("Definition update is unconfirmed; reconcile the same intent. No POST was retried.") from None
+            if status not in (200, 202) or status == 202 and record["operation_id"] is None:
+                raise Blocked("Definition update returned an unconfirmed response; no POST will be retried.")
+            matches = True
+        if matches:
+            live, actual = _read_definition(client, state, kind)
+        if _definition_digest(actual) != binding["after_sha256"] or _platform_digest(live) != binding["platform_sha256"]:
+            raise Blocked("Exact definition or .platform readback is unconfirmed; no POST was retried.")
+        if matches and record["phase"] == "pending":
+            record["phase"] = "completed"
+            persist()
+        return [f"Owned {kind} definition and .platform read back exactly; no data job was started."]
 
 
 def _record(state, plan, kind, resource_id):
@@ -1625,8 +1775,12 @@ def _run_measured(config, plan, state_dir, selected_demos):
             job.client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
 
         try:
-            job_id = job.submit(payload, admission=lambda: _fresh_admission(
-                config, config_path, plan["prefix"], state_dir, directory, selected, token_ready))
+            with StateStore(state_dir).lock():
+                definition_update = _definition_update_record(StateStore(state_dir))
+                if definition_update and definition_update["phase"] == "pending":
+                    raise Blocked("A producer definition update is unresolved; no job was started.")
+                job_id = job.submit(payload, admission=lambda: _fresh_admission(
+                    config, config_path, plan["prefix"], state_dir, directory, selected, token_ready))
         except (FabricHttpError, FabricTransportError, OSError) as exc:
             if job.path.exists():
                 raise Blocked("Producer submission outcome may be unknown; reconcile its journal before retrying.") from None
@@ -1758,8 +1912,18 @@ def _recover_pipeline(mode, config, plan, state_dir, selected_demos):
             action, blocker]
 
 
-def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, candidate_path=None):
+def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, candidate_path=None,
+            definition_kind=None, expected_definition_sha256=None):
     plan = parse_config(config, prefix)
+    if mode == "update-definition":
+        if (not yes or definition_kind not in ("notebook", "pipeline")
+                or not re.fullmatch(r"[a-f0-9]{64}", expected_definition_sha256 or "") or selected_demos is not None):
+            raise ContractError("update-definition requires --yes, --definition-kind and --expected-definition-sha256.")
+        if not all(plan[field] for field in ("tenant_id", "capacity_id", "identity_id")):
+            raise ContractError("update-definition requires the configured tenant, capacity and identity.")
+        return _update_producer_definition(config, plan, state_dir, definition_kind, expected_definition_sha256)
+    if definition_kind is not None or expected_definition_sha256 is not None:
+        raise ContractError("Definition update arguments require --mode update-definition.")
     if mode == "cleanup" and not yes:
         raise ContractError("cleanup requires --yes.")
     if mode == "run-data":
@@ -1873,7 +2037,7 @@ def _result_target(args):
         raise ContractError("config, state-dir and result must be absolute paths.")
     paths = tuple(Path(path) for path in (args.config, args.state_dir, args.result))
     config, directory, result = (path.resolve() for path in paths)
-    protected = {config, directory / STATE_NAME, directory / LOCK_NAME}
+    protected = {config, directory / STATE_NAME, directory / LOCK_NAME, directory / DEFINITION_UPDATE_NAME}
     protected.update((HERE / name).resolve() for name in (
         "deploy.py", "test_deploy.py", "deployment-mcap.json", "generator.py", "fabric_assets.py",
         "notebook.ipynb", "pipeline-content.json", "delivery.py", "runner.py", "fabric_files.py",
@@ -1885,8 +2049,8 @@ def _result_target(args):
         part.casefold() == JOURNAL_DIR_NAME for path in (*paths, config, directory, result) for part in path.parts
     )
     if (result in protected or source_path or in_job_directory or result.name.casefold() in
-            (STATE_NAME.casefold(), LOCK_NAME.casefold(), CANDIDATE_NAME.casefold())
-            or config in (directory / STATE_NAME, directory / LOCK_NAME)):
+            (STATE_NAME.casefold(), LOCK_NAME.casefold(), CANDIDATE_NAME.casefold(), DEFINITION_UPDATE_NAME.casefold())
+            or config in (directory / STATE_NAME, directory / LOCK_NAME, directory / DEFINITION_UPDATE_NAME)):
         raise ContractError("result and state paths must not overwrite config, source files or owned state.")
     return result
 
@@ -1940,12 +2104,14 @@ def main(argv=None):
     parser = _ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--mode", required=True, choices=("dry-run", "validate-only", "deploy", "cleanup",
                                                           "run-data", "resolve-candidate-ids",
-                                                          "producer-status", "stop-producer"))
+                                                          "producer-status", "stop-producer", "update-definition"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--result", required=True)
     parser.add_argument("--selected-demos")
+    parser.add_argument("--definition-kind", choices=("notebook", "pipeline"))
+    parser.add_argument("--expected-definition-sha256")
     parser.add_argument("--yes", action="store_true")
     raw_args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -1970,9 +2136,10 @@ def main(argv=None):
         except (OSError, UnicodeError, ValueError):
             raise ContractError("Config is unreadable or is not valid JSON.") from None
         diagnostics = perform(args.mode, config, args.prefix, args.state_dir, args.selected_demos, args.yes,
-                              candidate_path=candidate_path)
-        result = _envelope(args.mode, "pass" if args.mode in ("dry-run", "resolve-candidate-ids", "run-data", "validate-only") else "blocked",
-                           diagnostics)
+                              candidate_path=candidate_path, definition_kind=args.definition_kind,
+                              expected_definition_sha256=args.expected_definition_sha256)
+        passed = args.mode in ("dry-run", "resolve-candidate-ids", "run-data", "update-definition", "validate-only")
+        result = _envelope(args.mode, "pass" if passed else "blocked", diagnostics)
     except ContractError as exc:
         result = _envelope(args.mode, "fail", [str(exc)])
     except (Blocked, TargetReadbackBlocked, LifecycleBlocked) as exc:

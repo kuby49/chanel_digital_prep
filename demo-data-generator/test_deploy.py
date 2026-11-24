@@ -74,6 +74,153 @@ def definition(content, path="notebook-content.ipynb"):
     return {"parts": [{"path": path, "payloadType": "InlineBase64", "payload": payload}]}
 
 
+class DefinitionUpdateTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = deploy.StateStore(temp.name)
+        self.config = config()
+        self.plan = deploy.parse_config(self.config, "sample")
+        self.state = owned_state(self.plan)
+        self.store.write(self.state)
+        self.client = mock.Mock()
+        self.client.list_all.return_value = []
+        self.targets = {"notebook": definition({"revision": "new"}),
+                        "pipeline": definition({"revision": "new"}, "pipeline-content.json")}
+        self.targets["notebook"]["format"] = "ipynb"
+        self.live = copy.deepcopy(self.targets)
+        self.platform = definition({"metadata": {"displayName": "owned"}}, ".platform")["parts"][0]
+        for kind, live in self.live.items():
+            live["parts"].append(self.platform)
+            live["parts"][0] = definition({"revision": "old"}, live["parts"][0]["path"])["parts"][0]
+        self.calls = []
+        self.behavior = self.complete
+        self.client.post_operation.side_effect = self.post
+        for name, options in (
+            ("FabricClient", {"return_value": self.client}),
+            ("azure_cli_token", {"return_value": "dummy"}),
+            ("_workspace_principal", {"return_value": "User"}),
+            ("_verify_item", {}),
+            ("_definition", {"side_effect": lambda state, kind, config=None: copy.deepcopy(self.targets[kind])}),
+        ):
+            patcher = mock.patch.object(deploy, name, **options)
+            self.addCleanup(patcher.stop)
+            patcher.start()
+
+    def post(self, path, payload=None, **kwargs):
+        kind = "notebook" if NOTEBOOK in path else "pipeline"
+        if "/getDefinition" in path:
+            return 200, {"definition": copy.deepcopy(self.live[kind])}
+        self.assertTrue(path.endswith("/updateDefinition?updateMetadata=false"))
+        journal = deploy._definition_update_record(self.store)
+        self.assertEqual((journal["phase"], journal["binding"]["kind"], journal["operation_id"]),
+                         ("pending", kind, None))
+        self.assertEqual(payload["definition"]["parts"][-1], self.platform)
+        self.calls.append(kind)
+        return self.behavior(kind, payload["definition"], kwargs["on_accepted"])
+
+    def complete(self, kind, target, accepted):
+        self.live[kind] = copy.deepcopy(target)
+        return 200, None
+
+    def digest(self, kind):
+        return deploy._definition_digest(deploy._parts(self.live[kind]))
+
+    def update(self, kind, digest=None):
+        return deploy.perform("update-definition", self.config, "sample", str(self.store.directory), yes=True,
+                              definition_kind=kind, expected_definition_sha256=digest or self.digest(kind))
+
+    def test_only_approved_baselines_are_changed_in_notebook_then_pipeline_order(self):
+        with self.assertRaisesRegex(deploy.Blocked, "Local|Live item definition differs"):
+            self.update("pipeline")
+        with self.assertRaisesRegex(deploy.Blocked, "baseline differs"):
+            self.update("notebook", "0" * 64)
+        digest = self.digest("notebook")
+        self.update("notebook", digest)
+        self.update("notebook", digest)
+        self.update("pipeline")
+        self.assertEqual(self.calls, ["notebook", "pipeline"])
+        self.assertEqual(deploy._definition_update_record(self.store)["phase"], "completed")
+
+    def test_known_operation_polls_exact_id_without_reposting(self):
+        digest = self.digest("notebook")
+
+        def interrupted(kind, target, accepted):
+            accepted(OPERATION, 6)
+            self.assertEqual(deploy._definition_update_record(self.store)["operation_id"], OPERATION)
+            self.target = target
+            raise deploy.FabricTransportError("poll disconnected")
+
+        def poll(operation_id, delay, *, require_result):
+            self.assertEqual((operation_id, delay, require_result), (OPERATION, 6, False))
+            self.live["notebook"] = self.target
+
+        self.behavior = interrupted
+        self.client.poll.side_effect = poll
+        with self.assertRaisesRegex(deploy.Blocked, "unconfirmed"):
+            self.update("notebook", digest)
+        self.update("notebook", digest)
+        self.assertEqual(self.calls, ["notebook"])
+        self.client.poll.assert_called_once_with(OPERATION, 6, require_result=False)
+
+    def test_unknown_post_never_retries_even_when_old_definition_remains(self):
+        digest = self.digest("notebook")
+
+        def uncertain(kind, target, accepted):
+            self.target = target
+            raise deploy.FabricTransportError("response lost")
+
+        self.behavior = uncertain
+        with self.assertRaisesRegex(deploy.Blocked, "unconfirmed"):
+            self.update("notebook", digest)
+        with self.assertRaisesRegex(deploy.Blocked, "readback is unconfirmed"):
+            self.update("notebook", digest)
+        self.live["notebook"] = copy.deepcopy(self.target)
+        self.live["notebook"]["parts"][-1] = definition({"different": "platform"}, ".platform")["parts"][0]
+        with self.assertRaisesRegex(deploy.Blocked, "binding changed"):
+            self.update("notebook", digest)
+        self.live["notebook"] = self.target
+        self.update("notebook", digest)
+        self.assertEqual(self.calls, ["notebook"])
+        self.client.poll.assert_not_called()
+
+    def test_active_and_unknown_scheduler_jobs_block_before_intent(self):
+        for status in ("NotStarted", "InProgress", "NewStatus"):
+            with self.subTest(status=status):
+                self.client.list_all.side_effect = lambda path: (
+                    [{"id": OPERATION, "itemId": NOTEBOOK, "status": status}] if NOTEBOOK in path else [])
+                with self.assertRaisesRegex(deploy.Blocked, "active or uncertain"):
+                    self.update("notebook")
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(deploy._definition_update_record(self.store))
+
+    def test_unresolvable_cli_intent_blocks_even_when_scheduler_looks_idle(self):
+        binding = {"run_id": "already-attempted", "nonce": "a" * 32, "tenant_id": TENANT,
+                   "prefix": "sample", "config_sha256": "a" * 64, "selected_demos": ["demo-1"],
+                   "workspace_id": WORKSPACE, "pipeline_id": PIPELINE, "notebook_id": NOTEBOOK,
+                   "manifest_uri": "https://example.invalid/manifest", "deadline_utc": "2024-01-02T00:00:00Z"}
+        job = deploy.PipelineJob(self.store.directory, binding, self.client)
+        deploy._atomic_json(job.path, {"version": 1, "binding": binding, "phase": "submitting",
+                                      "payload_sha256": "a" * 64, "intent_at_utc": "2024-01-01T00:00:00Z"})
+        with self.assertRaisesRegex(deploy.LifecycleBlocked, "Submission outcome unknown"):
+            self.update("notebook")
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(deploy._definition_update_record(self.store))
+
+    def test_cli_requires_confirmation_and_does_not_claim_readiness(self):
+        config_path = self.store.directory / "config.json"
+        result_path = self.store.directory / "result.json"
+        deploy._atomic_json(config_path, self.config)
+        args = ["--mode", "update-definition", "--definition-kind", "notebook",
+                "--expected-definition-sha256", self.digest("notebook"), "--config", str(config_path),
+                "--prefix", "sample", "--state-dir", str(self.store.directory), "--result", str(result_path)]
+        self.assertEqual(deploy.main(args), 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(deploy.main(args + ["--yes"]), 0)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual((result["status"], result["ready"]), ("pass", False))
+
+
 def pinned_libraries():
     return [{"name": name, "version": version, "libraryType": "External"}
             for name, version in deploy._environment_spec()["pins"].items()]

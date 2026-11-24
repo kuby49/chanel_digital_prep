@@ -151,6 +151,23 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(original["prefix"], "chanel")
         self.assertEqual(original["common"]["prefix"], "chanel")
 
+    def test_external_config_change_does_not_change_this_invocation(self):
+        run_phase = deploy.run_phase
+
+        def mutate_original(*args, **kwargs):
+            if args[1] == "deploy":
+                changed = dict(self.config)
+                changed["data"] = dict(self.config["data"], run_id="different-run")
+                (self.root / "config.json").write_text(json.dumps(changed), encoding="utf-8")
+            return run_phase(*args, **kwargs)
+
+        with mock.patch.object(deploy, "run_phase", side_effect=mutate_original):
+            code, summary, events = self.run_cli("demo-2", "--deploy", "--run-data")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["phases"]["run-data"]["shared"]["status"], "pass")
+        run_event = next(event for event in events if event["mode"] == "run-data")
+        self.assertEqual(json.loads(Path(run_event["config_path"]).read_text())["data"]["run_id"], "run-1")
+
     def test_existing_orchestrator_lock_blocks_without_clearing_it(self):
         state = self.root / "state" / ("chanel-" + self.config["tenant_id"])
         state.mkdir(parents=True)
@@ -249,6 +266,9 @@ class OrchestrationTests(unittest.TestCase):
     def test_missing_ids_resolved_once_before_fresh_validation_and_monitor(self):
         self.config["shared"]["workspace_id"] = None
         self.config["shared"]["staging_lakehouse_id"] = None
+        self.config["shared"]["identity_id"] = "55555555-5555-4555-8555-555555555555"
+        self.config["data"]["seed"] = 42
+        self.config["demo-2"] = {"verification_batch": "bootstrap", "query_endpoint": "example"}
         code, summary, events = self.run_cli("demo-2,demo-3", "--deploy", "--run-data")
         self.assertEqual(code, 0)
         self.assertEqual(summary["phases"]["resolve-candidate-ids"]["shared"]["status"], "pass")
@@ -260,6 +280,11 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(all(event["shared"]["workspace_id"] == "11111111-1111-4111-8111-111111111111"
                             and event["shared"]["staging_lakehouse_id"] == "22222222-2222-4222-8222-222222222222"
                             for event in after))
+        effective = json.loads(Path(after[0]["config_path"]).read_text())
+        expected = json.loads(json.dumps(self.config))
+        expected["shared"]["workspace_id"] = "11111111-1111-4111-8111-111111111111"
+        expected["shared"]["staging_lakehouse_id"] = "22222222-2222-4222-8222-222222222222"
+        self.assertEqual(effective, expected)
         self.assertIsNone(self.config["shared"]["workspace_id"])
         self.assertIsNone(json.loads((self.root / "config.json").read_text())["shared"]["workspace_id"])
 

@@ -209,8 +209,8 @@ completed pipeline jobs, and fresh exact Delta/dimension readback for every
 batch. Failed or unavailable evidence blocks the run. The hooks and their
 profile integration have not been verified in Fabric.
 
-`native_binding.py` is an offline-tested publisher for this specific owned
-binding; it has not been run against Fabric. It checks the stopped predecessor,
+`native_binding.py` is a publisher for this specific owned
+binding. It checks the stopped predecessor,
 ownership, target, job history and writer lock, records an intent before each
 update, and requires operation success and matching readback. A lost response
 without an operation identity remains blocked: do not resubmit it or create a
@@ -244,6 +244,17 @@ in the common configuration; remove `customer_preflight`. Standard
 event binding, unchanged exact-file Copy, ownership, dimensions and writer/job
 quiescence without pinning a specific `data.run_id`. It cannot pass against
 the currently deployed fixed-run notebook.
+
+The separately journaled `native_guard_hc.py` corrects the native guard once
+by inserting `spark.conf.set("spark.fabric.session.highConcurrency.enabled",
+"true")` into its generated cell. It verifies the original stopped proof,
+unchanged candidate and ownership, terminal jobs and absent writer lock before
+the update. Its `demo3-native-guard-hc-state.json` preserves both definitions
+and the exact receipt; on an uncertain response use only `--mode reconcile`
+with the same inputs, never resubmit. `native_binding.py --mode proof` requires
+the confirmed correction journal and fresh readback, and creates a new proof
+without changing the original. The flag and matching pipeline session tag do
+not demonstrate actual high-concurrency execution or session reuse.
 
 **Native operation after that deployment:** open the existing
 [Demo 3 workspace](https://app.fabric.microsoft.com/groups/744223de-ceab-4c4f-82ba-f811bcb5c7d7/list?experience=real-time-intelligence).

@@ -29,12 +29,14 @@ def run_config_from_shared(generator, config):
 
 
 def build_notebook(producer_dir, run_config, workspace_id, item_id, lakehouse_name,
-                   producer_workspace_id, producer_item_id, *, native_policy=None):
+                   producer_workspace_id, producer_item_id, *, native_policy=None, high_concurrency=False):
     workspace_id, item_id = _guid(workspace_id), _guid(item_id)
     if not isinstance(lakehouse_name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", lakehouse_name):
         raise ValueError("invalid Lakehouse name")
     if not isinstance(run_config, dict):
         raise ValueError("expected an approved run configuration")
+    if type(high_concurrency) is not bool or (high_concurrency and native_policy is None):
+        raise ValueError("high concurrency is supported only for native guards")
     approved = json.dumps(run_config, sort_keys=True, allow_nan=False)
     producer = Path(producer_dir)
     local = Path(__file__).parent
@@ -92,6 +94,8 @@ with _GuardTemp(prefix="demo3-guard-") as _guard_dir:
             _guard_sys.modules.pop(_guard_name, None)
 notebookutils.notebook.exit(_guard_result)
 """
+    if high_concurrency:
+        loader = 'spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")\n' + loader
     binding = {"default_lakehouse": item_id, "default_lakehouse_name": lakehouse_name,
                "default_lakehouse_workspace_id": workspace_id, "known_lakehouses": [{"id": item_id}]}
     return {"nbformat": 4, "nbformat_minor": 4, "metadata": {
@@ -102,7 +106,7 @@ notebookutils.notebook.exit(_guard_result)
 
 
 def build_native_notebook(producer_dir, policy, workspace_id, item_id, lakehouse_name,
-                          producer_workspace_id, producer_item_id):
+                          producer_workspace_id, producer_item_id, *, high_concurrency=True):
     return build_notebook(
         producer_dir, {}, workspace_id, item_id, lakehouse_name,
-        producer_workspace_id, producer_item_id, native_policy=policy)
+        producer_workspace_id, producer_item_id, native_policy=policy, high_concurrency=high_concurrency)

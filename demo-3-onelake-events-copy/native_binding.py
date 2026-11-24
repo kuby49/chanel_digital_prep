@@ -29,6 +29,8 @@ _PREVIOUS = "demo3-customer-" + check.FRESH_RUN_ID + "-binding-state.json"
 _BASE = "/v1/workspaces/" + check.WORKSPACE
 _ACTIONS = ("guard_update", "activator_update")
 RULE_JOURNAL = "demo3-native-rule-state.json"
+HC_JOURNAL = "demo3-native-guard-hc-state.json"
+HC_FLAG = 'spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")\n'
 
 
 def _utc():
@@ -141,7 +143,7 @@ def candidate_inputs(candidate, config, state_dir):
     notebook = _decode_part(candidate["guard_update_body"], "notebook-content.ipynb")
     expected = guarded_notebook.build_native_notebook(
         producer, policy, check.WORKSPACE, check.LAKEHOUSE, check.HOUSE_NAME,
-        check.STAGING_WORKSPACE, check.STAGING_LAKEHOUSE)
+        check.STAGING_WORKSPACE, check.STAGING_LAKEHOUSE, high_concurrency=False)
     if _notebook(notebook) != _notebook(expected):
         raise ValueError("candidate guard source or Lakehouse binding differs")
     graph = _decode_part(candidate["reflex_update_body"], "ReflexEntities.json")
@@ -479,7 +481,8 @@ class NativeBinding:
     def proof(self, output):
         output = Path(output)
         protected = (self.candidate_path, self.native_config_path, self.previous_config_path,
-                     self.journal, self.root / RULE_JOURNAL, self.root / _PREVIOUS, self.root / check.JOURNAL)
+                     self.journal, self.root / RULE_JOURNAL, self.root / HC_JOURNAL,
+                     self.root / _PREVIOUS, self.root / check.JOURNAL)
         if not output.is_absolute() or any(output.resolve() == path.resolve() for path in protected):
             raise ValueError("proof output must be a distinct absolute path")
         with _state_lock(self.root):
@@ -494,11 +497,43 @@ class NativeBinding:
             raise CandidateBlocked("Both native updates require confirmed readbacks before proof.")
         return state
 
+    def _correction(self, state):
+        correction = _load_json(self.root / HC_JOURNAL)
+        record = correction.get("update", {})
+        old, target = correction.get("before"), correction.get("target")
+        if not isinstance(old, dict) or not isinstance(target, dict):
+            raise CandidateBlocked("Native guard correction definitions are missing.")
+        expected_target = copy.deepcopy(old)
+        expected_target["cells"][1]["source"].insert(0, HC_FLAG)
+        if (correction.get("binding_sha256") != check.config_sha256(state)
+                or correction.get("old_sha256") != check.config_sha256(old)
+                or correction.get("target_sha256") != check.config_sha256(target)
+                or _notebook(old) != _notebook(self.notebook) or target != expected_target
+                or not isinstance(record, dict) or record.get("status") not in
+                ("in-flight", "confirmed-readback") or not record.get("time_utc")):
+            raise CandidateBlocked("Native high-concurrency guard correction lineage differs.")
+        if record["status"] == "confirmed-readback" and (
+                record.get("http") not in (200, 202) or not record.get("confirmed_at_utc")):
+            raise CandidateBlocked("Native high-concurrency guard correction is not confirmed.")
+        if record["status"] == "confirmed-readback" and record["http"] == 202:
+            _operation_location({"x-ms-operation-id": record.get("operation_id"),
+                                 "location": record.get("location")})
+        producer, _, _ = check._producer(self.root)
+        expected = guarded_notebook.build_native_notebook(
+            producer, state["native_policy"], check.WORKSPACE, check.LAKEHOUSE, check.HOUSE_NAME,
+            check.STAGING_WORKSPACE, check.STAGING_LAKEHOUSE)
+        if _notebook(target) != _notebook(expected):
+            raise CandidateBlocked("Native corrected guard differs from the current builder.")
+        return correction
+
     def _read_proof(self, state):
+        correction = self._correction(state)
+        if correction["update"]["status"] != "confirmed-readback":
+            raise CandidateBlocked("Native high-concurrency guard correction is not confirmed.")
         check.validate(self.native_config, "chanel", self.root, api=self.api)
         pipeline = _quiescent(self.api, self.root)
         notebook, graph = _guard(self.api), _graph(self.api)
-        if _notebook(notebook) != _notebook(self.notebook):
+        if notebook != correction["target"]:
             raise CandidateBlocked("Native guard changed before proof.")
         _stopped(graph, self.graph)
         self._unchanged()

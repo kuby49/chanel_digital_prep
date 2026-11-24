@@ -422,6 +422,123 @@ class NativeBindingTests(unittest.TestCase):
         self.assertFalse(controller.journal.exists())
         self.api.request.assert_not_called()
 
+    def completed_first_cycle(self):
+        first = self.rule_controller()
+        state = {"binding_sha256": first._binding_hash(), "proof_sha256": "a" * 64,
+                 "actions": {action: {"status": "confirmed-readback", "http": 200,
+                                      "time_utc": "start", "confirmed_at_utc": "end"}
+                             for action in ("enable", "disable")}}
+        native_binding._create(first.journal, state)
+        return first, state, native_rule.NativeRule(self.binding, cycle=2)
+
+    def test_second_rule_cycle_preserves_and_pins_first_cycle(self):
+        first, _, second = self.completed_first_cycle()
+        before = first.journal.read_bytes()
+        operation = "468567aa-fc56-4b9f-b61a-0e39ae31fe51"
+        location = "https://api.fabric.microsoft.com/v1/operations/" + operation
+        self.api.request.side_effect = [(202, {"x-ms-operation-id": operation, "Location": location}, None),
+                                        (200, {}, None)]
+        with mock.patch.object(second, "_verify_proof", return_value="b" * 64), \
+             mock.patch.object(second, "_readback"), mock.patch.object(native_binding, "_quiescent"):
+            result = second.change("enable", self.root / "proof.json")
+            self.assertEqual(result["previous_journal"], native_binding.RULE_JOURNAL)
+            self.assertEqual(result["previous_journal_sha256"], native_binding._sha(before))
+            second.change("disable")
+            self.assertEqual(second.drain()["event_queue"], "unverified")
+            with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
+                second.change("enable", self.root / "proof.json")
+        self.assertEqual(first.journal.read_bytes(), before)
+        self.poll.assert_called_once_with(self.api, location, operation, "activator-cli")
+        self.assertEqual(self.api.request.call_count, 2)
+
+    def test_second_rule_cycle_requires_confirmed_predecessor_and_stopped_readback(self):
+        first, state, second = self.completed_first_cycle()
+        for value in (None, {"status": "in-flight", "time_utc": "start"},
+                      {"status": "confirmed-readback", "time_utc": "start"}):
+            modified = copy.deepcopy(state)
+            if value is None:
+                del modified["actions"]["disable"]
+            else:
+                modified["actions"]["disable"] = value
+            native_binding._save(first.journal, modified)
+            with mock.patch.object(second, "_verify_proof", return_value="b" * 64), \
+                 self.assertRaises(CandidateBlocked):
+                second.change("enable", self.root / "proof.json")
+            self.assertFalse(second.journal.exists())
+        native_binding._save(first.journal, state)
+        with mock.patch.object(second, "_verify_proof", return_value="b" * 64), \
+             mock.patch.object(second, "_readback", side_effect=CandidateBlocked("rule running")), \
+             self.assertRaisesRegex(CandidateBlocked, "rule running"):
+            second.change("enable", self.root / "proof.json")
+        self.assertFalse(second.journal.exists())
+        self.api.request.assert_not_called()
+
+    def test_second_rule_cycle_rejects_missing_or_malformed_predecessor(self):
+        first = self.rule_controller()
+        second = native_rule.NativeRule(self.binding, cycle=2)
+        with mock.patch.object(second, "_verify_proof", return_value="b" * 64):
+            with self.assertRaises(FileNotFoundError):
+                second.change("enable", self.root / "proof.json")
+            first.journal.write_text("{", encoding="utf-8")
+            with self.assertRaises(json.JSONDecodeError):
+                second.change("enable", self.root / "proof.json")
+        self.assertFalse(second.journal.exists())
+        self.api.request.assert_not_called()
+
+    def test_proof_cannot_overwrite_second_rule_journal(self):
+        with self.assertRaisesRegex(ValueError, "distinct absolute path"):
+            self.binding.proof(self.root / native_binding.RULE_SECOND_JOURNAL)
+        self.api.request.assert_not_called()
+
+    def test_second_rule_cycle_blocks_changed_predecessor_and_unknown_receipt(self):
+        first, _, second = self.completed_first_cycle()
+        self.api.request.side_effect = RuntimeError("response lost")
+        with mock.patch.object(second, "_verify_proof", return_value="b" * 64), \
+             mock.patch.object(second, "_readback"):
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                second.change("enable", self.root / "proof.json")
+            with self.assertRaisesRegex(CandidateBlocked, "acceptance is unknown"):
+                second.reconcile()
+            with first.journal.open("a", encoding="utf-8") as file:
+                file.write(" ")
+            with self.assertRaisesRegex(CandidateBlocked, "journal changed"):
+                second.reconcile()
+            with self.assertRaisesRegex(CandidateBlocked, "journal changed"):
+                second.change("disable")
+        self.assertEqual(self.api.request.call_count, 1)
+
+    def test_second_rule_cycle_reconciles_exact_recorded_operation(self):
+        _, _, second = self.completed_first_cycle()
+        operation = "468567aa-fc56-4b9f-b61a-0e39ae31fe51"
+        location = "https://api.fabric.microsoft.com/v1/operations/" + operation
+        self.api.request.return_value = (202, {"x-ms-operation-id": operation, "Location": location}, None)
+        self.poll.side_effect = [TimeoutError("pending"), None]
+        with mock.patch.object(second, "_verify_proof", return_value="b" * 64), \
+             mock.patch.object(second, "_readback"):
+            with self.assertRaises(TimeoutError):
+                second.change("enable", self.root / "proof.json")
+            state = second.reconcile()
+            self.assertEqual(state["actions"]["enable"]["status"], "confirmed-readback")
+        self.assertEqual(self.api.request.call_count, 1)
+        self.assertEqual(self.poll.call_args_list, [mock.call(self.api, location, operation, "activator-cli")] * 2)
+
+    def test_second_rule_cycle_rechecks_predecessor_after_receipt(self):
+        first, _, second = self.completed_first_cycle()
+
+        def request(*args, **kwargs):
+            with first.journal.open("a", encoding="utf-8") as file:
+                file.write(" ")
+            return 200, {}, None
+
+        self.api.request.side_effect = request
+        with mock.patch.object(second, "_verify_proof", return_value="b" * 64), \
+             mock.patch.object(second, "_readback"), \
+             self.assertRaisesRegex(CandidateBlocked, "journal changed"):
+            second.change("enable", self.root / "proof.json")
+        self.assertEqual(json.loads(second.journal.read_text(encoding="utf-8"))["actions"]["enable"]["status"],
+                         "in-flight")
+        self.assertEqual(self.api.request.call_count, 1)
+
     def test_hc_correction_preserves_metadata_and_rule_admits_new_proof(self):
         controller = self.rule_controller()
         correction = native_guard_hc.GuardCorrection(self.binding)

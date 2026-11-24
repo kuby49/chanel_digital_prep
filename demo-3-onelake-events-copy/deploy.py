@@ -190,6 +190,7 @@ def main(argv=None):
                  args.state_dir / "demo3-customer-binding-state.json",
                  args.state_dir / "demo3-native-binding-state.json",
                  args.state_dir / "demo3-native-rule-state.json",
+                 args.state_dir / "demo3-native-rule-cycle-2-state.json",
                  args.state_dir / "demo3-native-guard-hc-state.json",
                  args.state_dir / "demo3-staging-access-state.json")
     if args.result.resolve() in {path.resolve() for path in protected}:

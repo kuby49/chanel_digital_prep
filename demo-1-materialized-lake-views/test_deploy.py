@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from definition_plan import (
     bootstrap_csv_bytes,
@@ -14,7 +15,7 @@ from definition_plan import (
     render_silver_sql,
 )
 from manifest_validation import measured_batches, validate_manifest
-from ownership import _config_fingerprint
+from ownership import CandidateBlocked, _config_fingerprint, resolve_target_candidate
 
 
 SCRIPT = Path(__file__).with_name("deploy.py")
@@ -157,40 +158,51 @@ class ContractTest(unittest.TestCase):
             self.assertEqual(journal.read_text(encoding="utf-8"), '{"status":"pending"}')
             self.assertFalse((root / "demo-1-target-candidate.json").exists())
 
-    def test_candidate_from_confirmed_journal_is_local_only_and_non_overwriting(self):
+    def test_candidate_requires_fresh_provenance_even_when_journal_is_confirmed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = candidate_config()
-            config_path = root / "config.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
             state = root / "state"
             state.mkdir()
             journal_path = state / "demo-1-state.json"
-            journal = json.dumps(candidate_journal(config))
-            journal_path.write_text(journal, encoding="utf-8")
+            record = candidate_journal(config)
+            raw = json.dumps(record)
+            journal_path.write_text(raw, encoding="utf-8")
             result_path = root / "result.json"
-            command = [sys.executable, str(SCRIPT), "--mode", "resolve-target-candidate",
-                       "--config", str(config_path), "--prefix", "chanel", "--state-dir",
-                       str(state), "--result", str(result_path)]
-            process = subprocess.run(command, capture_output=True, text=True, check=False)
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
-            self.assertEqual(result["status"], "pass")
-            self.assertFalse(result["ready"])
-            path = root / "demo-1-target-candidate.json"
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {
-                "contract_version": 1, "track": "demo-1", "tenant_id": TENANT,
-                "prefix": "chanel", "target": {
-                    "workspace_id": WORKSPACE, "item_id": LAKEHOUSE, "fact": "silver.sales_joined",
-                },
-            })
-            original = path.read_bytes()
-            repeat = subprocess.run(command, capture_output=True, text=True, check=False)
-            self.assertNotEqual(repeat.returncode, 0)
-            self.assertEqual(json.loads(result_path.read_text())["status"], "blocked")
-            self.assertEqual(path.read_bytes(), original)
-            self.assertEqual(journal_path.read_text(encoding="utf-8"), journal)
-            self.assertFalse((state / "demo-1-state.lock").exists())
+            marker = record["owner"]["marker"]
+            workspace = {
+                "id": WORKSPACE, "displayName": "chanel-demo1-mlv", "type": "Workspace",
+                "capacityId": config["capacity"]["id"], "capacityAssignmentProgress": "Completed",
+                "description": marker,
+            }
+            lakehouse = {
+                "id": LAKEHOUSE, "displayName": "ChanelDemo1Lakehouse", "type": "Lakehouse",
+                "workspaceId": WORKSPACE, "description": marker,
+            }
+            account = {"tenantId": TENANT, "id": OWNER}
+            for replies, message, calls in (
+                ([{"tenantId": OWNER}], "tenant does not match", 1),
+                ([{"tenantId": TENANT}], "no usable subscription context", 1),
+                ([account, {**workspace, "description": "Manual workspace"}],
+                 "Live Workspace description", 2),
+                ([account, workspace, {**lakehouse, "workspaceId": OWNER}],
+                 "Live Lakehouse workspaceId", 3),
+                ([account, workspace, {**lakehouse, "description": None}],
+                 "Live Lakehouse description", 3),
+                ([account, workspace, lakehouse], "does not attest the creator", 3),
+                ([account, CandidateBlocked("Unauthorized")], "Unauthorized", 2),
+            ):
+                with self.subTest(message=message), patch("ownership._az_json", side_effect=replies) as az:
+                    with self.assertRaisesRegex(CandidateBlocked, message):
+                        resolve_target_candidate(config, "chanel", state, result_path)
+                    self.assertEqual(az.call_count, calls)
+                    if calls == 3:
+                        self.assertIn(f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE}", az.call_args_list[1].args)
+                        self.assertIn(f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE}/lakehouses/{LAKEHOUSE}", az.call_args_list[2].args)
+                        self.assertIn("x-ms-fabric-skill=spark-cli", az.call_args_list[2].args)
+                    self.assertFalse((root / "demo-1-target-candidate.json").exists())
+                    self.assertEqual(journal_path.read_text(encoding="utf-8"), raw)
+                    self.assertFalse((state / "demo-1-state.lock").exists())
 
     def test_candidate_rejects_mismatched_and_uncertain_journals(self):
         config = candidate_config()
@@ -346,11 +358,24 @@ class ContractTest(unittest.TestCase):
 
         mixed = copy.deepcopy(manifest)
         bootstrap = copy.deepcopy(mixed["batches"]["1"])
-        bootstrap.update(batch_number=2, batch_class="bootstrap")
+        bootstrap.update(batch_number=2, batch_class="bootstrap", batch_id="bootstrap")
         negative = copy.deepcopy(mixed["batches"]["1"])
-        negative.update(batch_number=3, batch_class="negative-test")
+        negative.update(batch_number=3, batch_class="negative-test", batch_id="negative")
         mixed["batches"].update({"2": bootstrap, "3": negative})
+        self.assertEqual(validate_manifest(mixed), [])
         self.assertEqual([b["batch_class"] for b in measured_batches(mixed)], ["measured"])
+
+    def test_manifest_rejects_missing_or_repeated_batch_identity(self):
+        manifest = json.loads(MANIFEST_FIXTURE.read_text(encoding="utf-8"))
+        repeated = copy.deepcopy(manifest["batches"]["1"])
+        repeated["batch_number"] = 2
+        manifest["batches"]["2"] = repeated
+        self.assertTrue(any("batch_id must be unique" in item for item in validate_manifest(manifest)))
+        repeated["batch_id"] = "another-batch"
+        self.assertEqual(validate_manifest(manifest), [])
+        repeated["batch_id"] = " "
+        self.assertTrue(any("batch_id must be a nonempty string" in item
+                            for item in validate_manifest(manifest)))
 
     def test_manifest_requires_supported_version_and_class(self):
         manifest = json.loads(MANIFEST_FIXTURE.read_text(encoding="utf-8"))

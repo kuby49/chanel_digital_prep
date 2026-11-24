@@ -1,9 +1,11 @@
-"""Local candidate resolution; journal contents are not live ownership proof."""
+"""Validate candidate journals and independently check Fabric metadata."""
 
 import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -17,6 +19,62 @@ FACT = "silver.sales_joined"
 
 class CandidateBlocked(Exception):
     pass
+
+
+FABRIC_ORIGIN = "https://api.fabric.microsoft.com"
+
+
+def _az_json(*args):
+    executable = shutil.which("az")
+    if not executable:
+        raise CandidateBlocked("Azure CLI is required for live Demo 1 ownership readback.")
+    try:
+        result = subprocess.run(
+            [executable, *args, "--output", "json", "--only-show-errors"],
+            capture_output=True, text=True, encoding="utf-8", timeout=45, check=False,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+        raise CandidateBlocked(f"Azure CLI {args[0]} could not complete live readback.") from exc
+    if result.returncode:
+        raise CandidateBlocked(f"Azure CLI {args[0]} failed during live ownership readback.")
+    try:
+        value = json.loads(result.stdout, object_pairs_hook=_unique_pairs)
+    except ValueError as exc:
+        raise CandidateBlocked("Azure CLI did not return valid ownership metadata.") from exc
+    if not isinstance(value, dict):
+        raise CandidateBlocked("Azure CLI did not return an ownership metadata object.")
+    return value
+
+
+def _verify_live_provenance(config, tenant, workspace_id, item_id, workspace_name,
+                            lakehouse_name, marker):
+    account = _az_json("account", "show")
+    if account.get("tenantId") != tenant:
+        raise CandidateBlocked("Azure CLI tenant does not match the Demo 1 ownership journal.")
+    try:
+        subscription = _uuid(account.get("id"))
+    except ValueError as exc:
+        raise CandidateBlocked("Azure CLI account has no usable subscription context.") from exc
+    resources = (
+        ("Workspace", f"workspaces/{workspace_id}", {
+            "id": workspace_id, "displayName": workspace_name,
+            "capacityId": config["capacity"]["id"], "capacityAssignmentProgress": "Completed",
+        }),
+        ("Lakehouse", f"workspaces/{workspace_id}/lakehouses/{item_id}", {
+            "id": item_id, "displayName": lakehouse_name, "workspaceId": workspace_id,
+        }),
+    )
+    for kind, path, expected in resources:
+        live = _az_json("rest", "--method", "get", "--url", f"{FABRIC_ORIGIN}/v1/{path}",
+                        "--subscription", subscription, "--resource", FABRIC_ORIGIN,
+                        "--headers", "x-ms-fabric-skill=spark-cli")
+        for field, value in {**expected, "type": kind, "description": marker}.items():
+            if live.get(field) != value:
+                raise CandidateBlocked(f"Live {kind} {field} is absent or mismatched.")
+    raise CandidateBlocked(
+        "Fabric workspace metadata does not attest the creator or creation operation; "
+        "matching descriptions are mutable, and no verified creation provenance source is configured."
+    )
 
 
 def _uuid(value):
@@ -176,6 +234,9 @@ def resolve_target_candidate(config, prefix, state_dir, result_path):
         bindings = shared.get("target_bindings", {})
         if "demo-1" in bindings and bindings["demo-1"] != target:
             raise CandidateBlocked("Configured shared target binding conflicts with the owned target.")
+        _verify_live_provenance(
+            config, tenant, workspace_id, item_id, workspace_name, demo["lakehouse_name"], marker,
+        )
         candidate = {"contract_version": 1, "track": "demo-1", "tenant_id": tenant,
                      "prefix": prefix, "target": target}
         _publish_candidate(result_path.parent / CANDIDATE_FILE, candidate)

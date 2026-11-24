@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
-from urllib import error, parse
+from urllib import error, parse, request
 
 import deploy
 
@@ -1377,6 +1377,24 @@ class FabricClientTests(unittest.TestCase):
     def client(self, opener, clock=None):
         clock = clock or Clock()
         return deploy.FabricClient("fake-sensitive-token", opener=opener, clock=clock.now, sleep=clock.sleep)
+
+    def test_bodyless_post_does_not_acquire_form_content_type(self):
+        opener = Opener(Response(202))
+        self.client(opener).request("POST", "/v1/workspaces")
+        handler = request.HTTPHandler()
+        handler.add_parent(SimpleNamespace(addheaders=[]))
+        req = handler.do_request_(opener.requests[0][0])
+        self.assertIsNone(req.data)
+        self.assertIsNone(req.get_header("Content-type"))
+
+    def test_json_post_retains_json_body_and_content_type(self):
+        opener = Opener(Response(202))
+        self.client(opener).request("POST", "/v1/workspaces", {"value": "example"})
+        handler = request.HTTPHandler()
+        handler.add_parent(SimpleNamespace(addheaders=[]))
+        req = handler.do_request_(opener.requests[0][0])
+        self.assertEqual(json.loads(req.data), {"value": "example"})
+        self.assertEqual(req.get_header("Content-type"), "application/json")
 
     def test_pagination_follows_canonical_continuation_and_token_only(self):
         path = "/v1/workspaces"

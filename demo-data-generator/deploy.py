@@ -725,8 +725,8 @@ class FabricClient:
             url = _operation_location(path, match.group(1))
         else:
             url = self._url(path)
-        data = None if method == "GET" else (
-            b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        data = None if method == "GET" or payload is None else json.dumps(
+            payload, separators=(",", ":")).encode("utf-8")
         headers = {"Accept": "application/json", "Authorization": "Bearer " + self._token,
                    "x-ms-fabric-skill": self._skill}
         if payload is not None:

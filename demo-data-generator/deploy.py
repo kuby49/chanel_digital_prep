@@ -1066,9 +1066,15 @@ def _native_profile(config, resources):
     selection = shared.get("native_selected_demos", "demo-1,demo-2,demo-3")
     if not isinstance(selection, str):
         raise ValueError("Native launch selection must be a comma-delimited string")
-    selected = sorted(_validate_run(config, selection))
+    reusable = shared.get("native_reusable", False)
+    if type(reusable) is not bool:
+        raise ValueError("shared.native_reusable must be a boolean")
+    profile_config = config
+    if reusable and isinstance(config.get("data"), dict):
+        profile_config = {**config, "data": {**config["data"], "run_id": "native_template"}}
+    selected = sorted(_validate_run(profile_config, selection))
     targets = selected_candidates(config, selected)
-    run, duration = run_config(config)
+    run, duration = run_config(profile_config)
     producer = {field: resources[kind]["id"] for field, kind in (
         ("workspace_id", "workspace"), ("staging_lakehouse_id", "staging_lakehouse"), ("notebook_id", "notebook"))}
     if any(shared.get(field) != producer[key] for field, key in (
@@ -1101,9 +1107,6 @@ def _native_profile(config, resources):
                 raise ValueError("Native Eventhouse target does not match the CSV v1 binding")
         else:
             _configured_landing(runtime, name, targets[name])
-    reusable = shared.get("native_reusable", False)
-    if type(reusable) is not bool:
-        raise ValueError("shared.native_reusable must be a boolean")
     if reusable:
         native_fields = {
             "demo-1": ("workspace_id", "workspace_name", "lakehouse_id", "lakehouse_name",
@@ -1116,7 +1119,6 @@ def _native_profile(config, resources):
         }
         for name in selected:
             runtime[name].update({key: config[name][key] for key in native_fields[name] if key in config[name]})
-        runtime["data"]["run_id"] = "native_template"
         window = shared.get("native_run_window_seconds", 7200)
         profile = {"version": 2, "document": runtime, "selected": selected, "producer": producer,
                    "run_window_seconds": window,

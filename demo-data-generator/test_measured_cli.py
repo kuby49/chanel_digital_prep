@@ -295,21 +295,39 @@ class MeasuredSubmissionTests(unittest.TestCase):
                                                    f"{target['item_id']}/Files/raw")}
         self.document["shared"].update(native_launch=True, native_reusable=True, native_selected_demos="demo-1",
                                        producer_notebook_id=NOTEBOOK)
+        self.document["data"]["run_id"] = None
         first = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        self.assertIsNone(self.document["data"]["run_id"])
         self.document["data"]["run_id"] = "previous-template-id-does-not-control-click"
         second = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
         self.assertEqual(first, second)
+        del self.document["data"]["run_id"]
+        omitted = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        self.assertEqual(first, omitted)
+        self.assertNotIn("run_id", self.document["data"])
         profile = json.loads(first["properties"]["activities"][0]["typeProperties"]["parameters"][
             "native_profile_json"]["value"])
         self.assertEqual(profile["version"], 2)
         self.assertNotIn("binding", profile)
         self.assertNotIn("expires_at_utc", profile)
+        self.assertEqual(profile["document"]["data"]["run_id"], "native_template")
         self.assertEqual(profile["document"]["demo-1"]["lakehouse_name"], "demo_lakehouse")
         now = datetime(2030, 1, 1, tzinfo=timezone.utc)
         first_run = fabric_runtime.native_parameters(profile, now=now)
         next_run = fabric_runtime.native_parameters(profile, now=now + timedelta(days=1))
         self.assertNotEqual(first_run[0]["data"]["run_id"], next_run[0]["data"]["run_id"])
         self.assertEqual(datetime.fromisoformat(next_run[4]) - datetime.fromisoformat(first_run[4]), timedelta(days=1))
+
+        self.document["data"]["run_id"] = None
+        self.document["data"]["seed"] = None
+        with self.assertRaisesRegex(deploy.ContractError, "all data parameters"):
+            deploy._native_profile(self.document, self.state["resources"])
+        self.document["data"]["seed"] = 42
+        with self.assertRaisesRegex(deploy.ContractError, "all data parameters"):
+            deploy._validate_run(self.document, "demo-1")
+        self.document["shared"]["native_reusable"] = False
+        with self.assertRaisesRegex(deploy.ContractError, "all data parameters"):
+            deploy._native_profile(self.document, self.state["resources"])
 
 
 class ManifestReconciliationTests(unittest.TestCase):

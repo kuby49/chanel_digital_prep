@@ -91,8 +91,10 @@ expiry for each Fabric **Run**, without per-run definition publication,
 JSON input or presenter CLI. Enable this template with
 `shared.native_launch: true` and `shared.native_reusable: true` in the
 resolved deployment config before one-time authorized definition publication.
-The configured data controls count, rows and interval; the template's run ID
-does not control actual run IDs. Defaults are 10 files of 1,000 rows, 60s
+The configured data controls count, rows and interval; its `run_id` may be
+null or omitted for a reusable template and does not control actual run IDs.
+Single-use profiles and CLI runs still require an explicit run ID.
+Defaults are 10 files of 1,000 rows, 60s
 apart. The SHA-256 and exact stop nonce are derived again from the entire
 fresh projected runtime document, not reused from the template.
 

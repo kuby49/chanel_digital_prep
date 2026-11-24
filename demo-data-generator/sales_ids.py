@@ -83,6 +83,11 @@ def _targets(value, scope, *, allow_empty=False):
     return copy.deepcopy(value)
 
 
+def validate_fabric_targets(value):
+    """Validate candidate identities without establishing ownership or access."""
+    return _targets(value, {"kind": "fabric"})
+
+
 def _decimal(value, *, signed=False):
     pattern = r"0|-?[1-9][0-9]*" if signed else r"[1-9][0-9]*"
     if not isinstance(value, str) or not re.fullmatch(pattern, value):

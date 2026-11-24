@@ -199,7 +199,17 @@ definitions have not been deployed or verified in Fabric.
 The effective configuration may carry selected-only `shared.target_bindings`
 entries of `{workspace_id, item_id, fact}`. These are candidate bindings,
 not evidence of target ownership, permissions, allocator safety or monitor
-liveness. Fresh authoritative checks remain necessary before execution.
+liveness. When `validate-only` receives `--selected-demos`, it requires exactly
+those candidates and reads each workspace and typed target item with the CLI
+principal. It checks Demo 2's KQL database, Eventhouse parent and configured
+adapter endpoints, database, table and mapping; Demo 3's landing must name its
+candidate Lakehouse. Demo 1 may use a separate landing Lakehouse, whose item is
+read independently. Missing or mismatched bindings block validation.
+
+These are metadata and configuration checks only: they do not prove the
+physical fact exists, the landing feeds that fact, owner provenance, the
+actual notebook principal's access, or a quiesced retained-key inventory. A
+successful read is not a readiness decision; `validate-only` remains blocked.
 
 For a fresh deployment, `deploy.py --mode resolve-candidate-ids` accepts the
 normal v1 arguments, reads and validates the owned `shared-producer-v1.json`

@@ -34,6 +34,7 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from generator import RunConfig, strict_json_loads
+from target_readback import TargetReadbackBlocked, read_selected_targets, selected_candidates
 
 
 HERE = Path(__file__).resolve().parent
@@ -233,11 +234,16 @@ def _environment_definition(spec):
                        "payload": base64.b64encode(spec["content"]).decode("ascii")}]}
 
 
-def _validate_run(config, selected_demos):
+def _selected_demos(selected_demos):
     selected = selected_demos.split(",") if selected_demos else []
     if (not selected or len(selected) != len(set(selected))
             or any(name not in ("demo-1", "demo-2", "demo-3") for name in selected)):
-        raise ContractError("run-data requires distinct --selected-demos (demo-1,demo-2,demo-3).")
+        raise ContractError("Distinct --selected-demos are required (demo-1,demo-2,demo-3).")
+    return selected
+
+
+def _validate_run(config, selected_demos):
+    selected = _selected_demos(selected_demos)
     data = config.get("data")
     required = ("run_id", "seed", "start_date", "date_count", "product_count", "customer_count",
                 "rows_per_file", "file_count", "interval_seconds", "max_duration_seconds", "currency")
@@ -621,8 +627,11 @@ def _retry_after(headers, default=1):
 
 
 class FabricClient:
-    def __init__(self, token, opener=None, clock=None, sleep=None):
+    def __init__(self, token, opener=None, clock=None, sleep=None, *, skill="spark-cli"):
+        if skill not in ("spark-cli", "eventhouse-cli"):
+            raise ContractError("Unsupported Fabric telemetry skill.")
         self._token = token
+        self._skill = skill
         self._opener = opener or request.build_opener(_NoRedirect())
         self._clock = clock or time.monotonic
         self._sleep = sleep or time.sleep
@@ -645,7 +654,7 @@ class FabricClient:
         data = None if method == "GET" else (
             b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         headers = {"Accept": "application/json", "Authorization": "Bearer " + self._token,
-                   "x-ms-fabric-skill": "spark-cli"}
+                   "x-ms-fabric-skill": self._skill}
         if payload is not None:
             headers["Content-Type"] = "application/json"
         req = request.Request(url, data=data, headers=headers, method=method)
@@ -1195,14 +1204,24 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
         return ["Blocked: deployment/readback requires " + ", ".join(missing) + ".", *BLOCKERS]
     store = StateStore(state_dir)
     if mode == "validate-only":
+        selected = _selected_demos(selected_demos) if selected_demos is not None else None
+        if selected is not None:
+            selected_candidates(config, selected)
         state = load_owned_state(store, plan)
         if state is None:
             return ["Blocked: no owned producer deployment state exists.", *BLOCKERS]
         if state.get("pending"):
             return ["Blocked: deployment has a pending operation; reconcile or resume it before validation.", *BLOCKERS]
-        client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
+        token = azure_cli_token(plan["tenant_id"], plan["identity_id"])
+        client = FabricClient(token)
         _verify_all(client, state, plan)
-        return ["Owned workspace, item metadata, published Environment libraries and local definitions were read back successfully; runtime readiness remains unproven.", *BLOCKERS]
+        observations = []
+        if selected is not None:
+            clients = {name: client for name in selected}
+            if "demo-2" in selected:
+                clients["demo-2"] = FabricClient(token, skill="eventhouse-cli")
+            observations = read_selected_targets(config, selected, clients)
+        return ["Owned workspace, item metadata, published Environment libraries and local definitions were read back successfully; runtime readiness remains unproven.", *observations, *BLOCKERS]
     if mode != "deploy":
         raise ContractError("Unsupported mode.")
     with store.lock():
@@ -1344,7 +1363,7 @@ def main(argv=None):
                            diagnostics)
     except ContractError as exc:
         result = _envelope(args.mode, "fail", [str(exc)])
-    except Blocked as exc:
+    except (Blocked, TargetReadbackBlocked) as exc:
         result = _envelope(args.mode, "blocked", [str(exc), *BLOCKERS])
     except (FabricHttpError, FabricTransportError) as exc:
         result = _envelope(args.mode, "fail", [str(exc)])

@@ -84,7 +84,85 @@ OneLake reads/writes can skew staging, and a blocking SDK call can outlast
 cooperative stop or the deadline. Demo 2's separate downstream verifier
 applies its own deadline.
 
-## Interim single-use Fabric profile
+## Reusable native launch: implemented interface, track blockers remain
+
+The reusable producer profile allocates a fresh run ID and fixed admission
+expiry for each Fabric **Run**, without per-run definition publication,
+JSON input or presenter CLI. Enable this template with
+`shared.native_launch: true` and `shared.native_reusable: true` in the
+resolved deployment config before one-time authorized definition publication.
+The configured data controls count, rows and interval; the template's run ID
+does not control actual run IDs. Defaults are 10 files of 1,000 rows, 60s
+apart. The SHA-256 and exact stop nonce are derived again from the entire
+fresh projected runtime document, not reused from the template.
+
+**This is not yet a runnable all-demo launch.** Demo 1 needs its read-only
+hook and an approved one-time bounded control-plane schedule receipt;
+notebook-resident MLV schedule mutations are not bundled. The shared setup
+schedule intentionally remains enabled between runs, and its remaining
+coverage must include the fresh run's complete verification deadline.
+Demo 3 needs complete native readiness, verification and cooperating-writer
+drain hooks. Missing or unsuccessful
+hooks fail before sales, rather than assuming a manually started monitor
+or accepting recorded readiness. Demo 2's native hook must establish and
+observe its exact owned monitor/verifier jobs automatically. No live result
+is implied by the local producer implementation.
+
+`native_lifecycle.py` expects track-owned flat modules `native_demo1`,
+`native_demo2` and `native_demo3`, each exposing `prepare(context)`,
+`verify(context, prepared)` and `stop(context, prepared)`. Return JSON dicts
+with status `ready`, `verified` and `stopped` respectively only after proving
+the corresponding outcome. The producer preserves the evidence and errors.
+Prepare runs inside the per-run ledger after empty manifest initialization,
+before scheduler/source start. Demo 1 prepares last and must additionally
+implement `check_ready(context, prepared)` immediately before staging.
+Verify runs only after successful producer delivery/scheduler completion is
+durable. Overall pipeline success additionally requires all track verification
+and cleanup; delivery success alone is not end-to-end success.
+
+Context is a dict with immutable-by-contract `document` and `binding`,
+conditional producer-staging `store`, checked-token `store_factory(ws, lh)`,
+`fabric`, active `spark`, `token_provider(audience)`, `manifest_path`,
+`read_manifest()`, `stop_requested()`, UTC `clock()`, and `sleep(seconds)`.
+It includes fixed UTC strings `preparation_deadline_utc`,
+`verification_deadline_utc`, `cleanup_deadline_utc` and `expires_at_utc`.
+The runtime Fabric client's `request(method, path, payload=None, timeout=30)`
+supports bounded GET/POST/PATCH/DELETE and returns `(status, headers, body)`
+without mutation retries. Each track owns its durable mutation intent,
+exact operation/job receipts and bounded reconciliation; a prepare exception
+does not mean its mutation failed. Cleanup is called with `prepared=None`
+after a partial prepare, and all previously attempted tracks are cleaned
+up even if another cleanup fails.
+
+The fixed producer staging object `Files/producer/native/writer.lock`
+serializes the complete native lifecycle across different run IDs and
+target selections. A second click while it exists is blocked, even after
+the receipt expires; there is no automatic lock stealing. The per-run
+`native-lifecycle.json` records its immutable runtime document, binding,
+hook results and errors; `Files/producer/native/latest.json` identifies the
+latest admitted run. Normal completion releases global exclusion only after
+all verification and cleanup succeeds. Failure, collision, uncertain
+storage/mutation outcome or forced cancellation retains the gate for explicit
+reconciliation. Other entrypoints are not magically covered: track readiness
+must reject conflicting pre-existing schedules, jobs and writers.
+
+The default window is 7,200 seconds, preparation budget 1,200 seconds, cleanup
+reserve 300 seconds; set `shared.native_run_window_seconds`,
+`shared.native_preparation_timeout_seconds` and
+`shared.native_cleanup_timeout_seconds` before template publication when
+needed. The window must cover preparation, producer duration, downstream
+verification and cleanup. Expiry is fixed at run allocation, never extended.
+In particular, the generous default window cannot fit Demo 1's currently
+approved 60-minute setup schedule: activation must choose explicit compatible
+budgets, and the read-only hook must reject launches without enough remaining
+coverage rather than silently shorten verification or widen the schedule.
+Native cleanup first persists and reads back the exact immutable stop marker,
+then closes Demo 3 admission only while holding its per-run ledger.
+Track cleanup must prove its owned schedules/jobs stopped or its precisely
+documented cooperating-writer barrier; a service job listing alone is not
+a queue-drain proof. Unproven cleanup remains blocked.
+
+## Interim single-use prepared customer demo
 
 This profile has not been published or verified for the recurring customer
 demo. It is not the requested reusable one-click experience: each run needs

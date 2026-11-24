@@ -13,7 +13,8 @@ from fabric_ledger import FabricLedger
 def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attempts, *,
                        selected_targets, clock=None, sleep=None, poll_seconds=5,
                        allow_staged_pending=False, stop_requested=None,
-                       independent_source=False, fresh_only=False, demo3_admission=None):
+                       independent_source=False, fresh_only=False, demo3_admission=None,
+                       before_source=None):
     config.validate()
     if not adapters or any(not callable(getattr(adapter, "submit", None))
                            or not callable(getattr(adapter, "verify", None)) for adapter in adapters.values()):
@@ -29,6 +30,8 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
         raise ValueError("poll_seconds must be positive")
     if stop_requested is not None and not callable(stop_requested):
         raise ValueError("stop_requested must be callable")
+    if before_source is not None and not callable(before_source):
+        raise ValueError("before_source must be callable")
     clock = clock or (lambda: datetime.now(timezone.utc))
     sleep = sleep or time.sleep
     now = clock()
@@ -47,6 +50,11 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
     executor = ThreadPoolExecutor(max_workers=1) if independent_source else nullcontext()
     with (FabricLedger(store, config, list(adapters), selected_targets=selected_targets,
                        fresh_only=fresh_only) as ledger, executor as worker):
+        if before_source is not None:
+            if not fresh_only or ledger.manifest["batches"]:
+                raise RuntimeError("Native preparation requires a fresh empty manifest")
+            before_source()
+            now = clock()
         scheduler = ledger.manifest.get("scheduler")
         if scheduler is None:
             if ledger.manifest["batches"]:

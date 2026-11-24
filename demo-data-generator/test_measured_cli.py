@@ -287,6 +287,30 @@ class MeasuredSubmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No prepared"):
             fabric_runtime.native_parameters({}, now=expiry)
 
+    def test_reusable_profile_is_stable_across_clicks_and_has_no_static_expiry(self):
+        target = TEST_TARGETS["demo-1"]
+        self.document["demo-1"] = {"workspace_id": target["workspace_id"], "lakehouse_id": target["item_id"],
+                                   "lakehouse_name": "demo_lakehouse",
+                                   "landing_uri": (f"abfss://{target['workspace_id']}@onelake.dfs.fabric.microsoft.com/"
+                                                   f"{target['item_id']}/Files/raw")}
+        self.document["shared"].update(native_launch=True, native_reusable=True, native_selected_demos="demo-1",
+                                       producer_notebook_id=NOTEBOOK)
+        first = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        self.document["data"]["run_id"] = "previous-template-id-does-not-control-click"
+        second = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
+        self.assertEqual(first, second)
+        profile = json.loads(first["properties"]["activities"][0]["typeProperties"]["parameters"][
+            "native_profile_json"]["value"])
+        self.assertEqual(profile["version"], 2)
+        self.assertNotIn("binding", profile)
+        self.assertNotIn("expires_at_utc", profile)
+        self.assertEqual(profile["document"]["demo-1"]["lakehouse_name"], "demo_lakehouse")
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        first_run = fabric_runtime.native_parameters(profile, now=now)
+        next_run = fabric_runtime.native_parameters(profile, now=now + timedelta(days=1))
+        self.assertNotEqual(first_run[0]["data"]["run_id"], next_run[0]["data"]["run_id"])
+        self.assertEqual(datetime.fromisoformat(next_run[4]) - datetime.fromisoformat(first_run[4]), timedelta(days=1))
+
 
 class ManifestReconciliationTests(unittest.TestCase):
     def completed(self, destination):

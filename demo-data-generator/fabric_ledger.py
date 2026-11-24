@@ -163,9 +163,16 @@ class FabricLedger:
         }
         self._save(updated)
 
-    def stop_demo3_admission(self):
+    def stop_demo3_admission(self, *, native_owner=False):
         admission = self.manifest.get("demo3_admission")
-        if self.fresh_only and admission is not None and admission["state"] == "open":
+        if admission is not None and admission["state"] == "open" and (self.fresh_only or native_owner):
+            if not self.fresh_only:
+                marker, _ = self.store.read(f"{self.directory}/stop.json")
+                digest = admission["stop_config_sha256"]
+                expected = {"version": 1, "run_id": self.config.run_id, "config_sha256": digest,
+                            "nonce": "native-" + digest[:32]}
+                if marker != canonical_bytes(expected):
+                    raise RuntimeError("Native admission revocation requires the exact immutable stop marker")
             updated = copy.deepcopy(self.manifest)
             updated["demo3_admission"]["state"] = "stopped"
             self._save(updated)

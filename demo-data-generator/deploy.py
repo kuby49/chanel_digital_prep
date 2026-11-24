@@ -38,7 +38,8 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from fabric_ledger import _validate_ingestion_outcome
-from fabric_runtime import _kusto_endpoint, _tenant, native_parameters, require_write_roles, run_config
+from fabric_runtime import (_kusto_endpoint, _tenant, native_parameters, require_write_roles,
+                            run_config, validate_native_template)
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
                        strict_json_loads, validate_run_manifest)
@@ -1100,6 +1101,30 @@ def _native_profile(config, resources):
                 raise ValueError("Native Eventhouse target does not match the CSV v1 binding")
         else:
             _configured_landing(runtime, name, targets[name])
+    reusable = shared.get("native_reusable", False)
+    if type(reusable) is not bool:
+        raise ValueError("shared.native_reusable must be a boolean")
+    if reusable:
+        native_fields = {
+            "demo-1": ("workspace_id", "workspace_name", "lakehouse_id", "lakehouse_name",
+                       "bronze_schema", "bronze_view", "silver_schema", "silver_view", "native_schedule"),
+            "demo-2": ("workspace_id", "lakehouse_id", "monitor_notebook_id", "verifier_notebook_id",
+                       "monitor_definition_sha256", "verifier_definition_sha256", "shortcut_name",
+                       "shortcut_target_path", "verification_batch", "verification_timeout_seconds",
+                       "poll_interval_seconds", "max_concurrent_batches"),
+            "demo-3": (),
+        }
+        for name in selected:
+            runtime[name].update({key: config[name][key] for key in native_fields[name] if key in config[name]})
+        runtime["data"]["run_id"] = "native_template"
+        window = shared.get("native_run_window_seconds", 7200)
+        profile = {"version": 2, "document": runtime, "selected": selected, "producer": producer,
+                   "run_window_seconds": window,
+                   "preparation_timeout_seconds": shared.get("native_preparation_timeout_seconds", 1200),
+                   "cleanup_timeout_seconds": shared.get("native_cleanup_timeout_seconds", 300),
+                   "activity_timeout": activity_timeout(window)}
+        validate_native_template(profile)
+        return profile
     digest = hashlib.sha256(canonical_bytes(runtime)).hexdigest()
     profile = {"document": runtime, "selected": selected, "activity_timeout": activity_timeout(duration),
                "expires_at_utc": shared["native_launch_expires_at_utc"],

@@ -396,6 +396,29 @@ class MeasuredRuntimeTests(unittest.TestCase):
         self.assertEqual((req.get_header("Authorization"), req.get_header("X-ms-fabric-skill"), timeout),
                          ("Bearer runtime-token", "spark-cli", 30))
 
+    def test_runtime_mutations_are_bounded_authenticated_and_never_automatically_retried(self):
+        from urllib.error import URLError
+
+        calls = []
+
+        class Unknown:
+            def open(self, request, timeout):
+                calls.append((request, timeout))
+                raise URLError("unconfirmed")
+
+        client = RuntimeFabricClient(lambda: "checked-token", opener=Unknown())
+        with self.assertRaisesRegex(RuntimeError, "outcome may be unconfirmed"):
+            client.request("POST", f"/v1/workspaces/{WORKSPACE}/notebooks/{NOTEBOOK}/jobs/instances",
+                           {"executionData": {"parameters": {}}}, timeout=15)
+        self.assertEqual(len(calls), 1)
+        req, timeout = calls[0]
+        self.assertEqual((req.method, timeout, req.get_header("X-ms-fabric-skill")), ("POST", 15, "spark-cli"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer checked-token")
+        self.assertEqual(json.loads(req.data), {"executionData": {"parameters": {}}})
+        with self.assertRaises(ValueError):
+            client.request("POST", "https://untrusted.invalid/run")
+        self.assertEqual(len(calls), 1)
+
 
 class OneLakeTableClientTests(unittest.TestCase):
     def test_uses_fixed_endpoint_storage_token_and_exact_candidate(self):

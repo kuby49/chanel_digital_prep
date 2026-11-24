@@ -1,6 +1,7 @@
 """Runtime checks and destination adapters for the Fabric-hosted producer."""
 
 import hashlib
+import copy
 import re
 import time
 import uuid
@@ -35,7 +36,7 @@ class _NoRedirect(request.HTTPRedirectHandler):
 
 
 class RuntimeFabricClient:
-    """Read Fabric metadata with the notebook's own token."""
+    """Bounded Fabric requests using checked notebook credentials; no mutation retries."""
 
     def __init__(self, token_provider, *, skill="spark-cli", opener=None, clock=time.monotonic):
         if not callable(token_provider) or skill not in ("spark-cli", "eventhouse-cli"):
@@ -45,36 +46,53 @@ class RuntimeFabricClient:
         self.opener = opener or request.build_opener(_NoRedirect())
         self._clock = clock
 
-    def get(self, path, deadline=None):
-        if (not isinstance(path, str) or not path.startswith("/v1/workspaces/")
+    def request(self, method, path, payload=None, timeout=30):
+        if (method not in ("GET", "POST", "PATCH", "DELETE")
+                or not isinstance(path, str) or not path.startswith(("/v1/workspaces/", "/v1/operations/"))
                 or "\\" in path or "#" in path or any(ord(char) < 32 for char in path)):
-            raise ValueError("Invalid runtime Fabric metadata path")
-        deadline = self._clock() + 60 if deadline is None else deadline
-        remaining = deadline - self._clock()
-        if remaining <= 0:
-            raise RuntimeError("Runtime Fabric metadata read exceeded its deadline")
+            raise ValueError("Invalid runtime Fabric request")
+        if type(timeout) not in (int, float) or not 0 < timeout <= 600:
+            raise ValueError("Runtime Fabric request requires a bounded timeout")
         token = self.token_provider()
         if not isinstance(token, str) or not token or any(ord(char) < 33 or ord(char) > 126 for char in token):
             raise RuntimeError("Runtime Fabric token is invalid")
-        req = request.Request("https://api.fabric.microsoft.com" + path,
-                              headers={"Accept": "application/json", "Authorization": "Bearer " + token,
-                                       "x-ms-fabric-skill": self.skill}, method="GET")
+        headers = {"Accept": "application/json", "Authorization": "Bearer " + token,
+                   "x-ms-fabric-skill": self.skill}
+        data = None
+        if payload is not None:
+            data = canonical_bytes(payload)
+            headers["Content-Type"] = "application/json"
+        elif method in ("POST", "PATCH"):
+            data = b""
+        req = request.Request("https://api.fabric.microsoft.com" + path, data=data, headers=headers, method=method)
         try:
-            with self.opener.open(req, timeout=min(30, remaining)) as response:
+            with self.opener.open(req, timeout=timeout) as response:
                 status, headers = response.status, response.headers
                 raw = response.read(8 * 1024 * 1024 + 1)
         except error.HTTPError as exc:
             status = exc.code
             exc.close()
-            raise RuntimeError(f"Runtime Fabric metadata read failed (HTTP {status})") from None
+            raise RuntimeError(f"Runtime Fabric {method} failed (HTTP {status}); outcome may be unconfirmed") from None
         except (error.URLError, OSError, TimeoutError):
-            raise RuntimeError("Runtime Fabric metadata read failed or timed out") from None
-        if status != 200 or len(raw) > 8 * 1024 * 1024:
-            raise RuntimeError("Runtime Fabric metadata response was unsuccessful or too large")
+            raise RuntimeError(f"Runtime Fabric {method} failed or timed out; outcome may be unconfirmed") from None
+        if not 200 <= status < 300 or len(raw) > 8 * 1024 * 1024:
+            raise RuntimeError("Runtime Fabric response was unsuccessful or too large")
+        if not raw:
+            return status, headers, None
         try:
-            return headers, strict_json_loads(raw.decode("utf-8"))
+            return status, headers, strict_json_loads(raw.decode("utf-8"))
         except (UnicodeError, ValueError, RecursionError):
-            raise RuntimeError("Runtime Fabric metadata response is invalid JSON") from None
+            raise RuntimeError("Runtime Fabric response is invalid JSON") from None
+
+    def get(self, path, deadline=None):
+        deadline = self._clock() + 60 if deadline is None else deadline
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise RuntimeError("Runtime Fabric metadata read exceeded its deadline")
+        status, headers, body = self.request("GET", path, timeout=min(30, remaining))
+        if status != 200:
+            raise RuntimeError("Runtime Fabric metadata response was unsuccessful")
+        return headers, body
 
     def list_all(self, path):
         deadline = self._clock() + 120
@@ -98,7 +116,7 @@ class RuntimeFabricClient:
             if not isinstance(token, str) or token in seen:
                 raise RuntimeError("Runtime workspace role continuation is invalid")
             seen.add(token)
-            next_path = path + "?" + parse.urlencode({"continuationToken": token})
+            next_path = path + ("&" if "?" in path else "?") + parse.urlencode({"continuationToken": token})
         raise RuntimeError("Runtime workspace role listing exceeded its page limit")
 
 
@@ -169,6 +187,21 @@ def require_write_roles(client, document, selected, targets, producer_workspace,
 
 def native_parameters(profile, *, now):
     """Resolve the operator-pinned, single-run profile, not caller-supplied overrides."""
+    if isinstance(profile, dict) and profile.get("version") == 2:
+        validate_native_template(profile)
+        if now is None or now.tzinfo is None or now.utcoffset() != timedelta(0):
+            raise ValueError("Reusable native launch requires the actual UTC start time")
+        document = copy.deepcopy(profile["document"])
+        document["data"]["run_id"] = "native_" + now.strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex
+        expiry = now + timedelta(seconds=profile["run_window_seconds"])
+        document["shared"]["native_started_at_utc"] = now.isoformat()
+        document["shared"]["native_expires_at_utc"] = expiry.isoformat()
+        digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
+        nonce = "native-" + digest[:32]
+        binding = {"nonce": nonce, "run_id": document["data"]["run_id"], "config_sha256": digest,
+                   "tenant_id": _tenant(document), "identity_id": document["shared"]["identity_id"],
+                   "producer": copy.deepcopy(profile["producer"])}
+        return document, list(profile["selected"]), binding, nonce, expiry.isoformat()
     if (not isinstance(profile, dict)
             or set(profile) != {"document", "selected", "binding", "expires_at_utc", "activity_timeout"}):
         raise ValueError("No prepared native producer profile")
@@ -188,6 +221,35 @@ def native_parameters(profile, *, now):
             or binding.get("config_sha256") != digest):
         raise ValueError("Native profile does not match the prepared run binding")
     return document, selected, binding, nonce, expiry.astimezone(timezone.utc).isoformat()
+
+
+def validate_native_template(profile):
+    fields = {"version", "document", "selected", "producer", "activity_timeout", "run_window_seconds",
+              "preparation_timeout_seconds", "cleanup_timeout_seconds"}
+    if not isinstance(profile, dict) or set(profile) != fields or type(profile.get("version")) is not int or profile["version"] != 2:
+        raise ValueError("Invalid reusable native profile")
+    _, duration = run_config(profile["document"])
+    selected, producer = profile["selected"], profile["producer"]
+    if (not isinstance(selected, list) or not selected or any(
+            name not in ("demo-1", "demo-2", "demo-3") for name in selected)
+            or selected != sorted(set(selected)) or not isinstance(producer, dict)
+            or set(producer) != {"workspace_id", "staging_lakehouse_id", "notebook_id"}):
+        raise ValueError("Invalid reusable native producer or selected tracks")
+    shared = profile["document"].get("shared", {})
+    for key in producer:
+        _uuid(producer[key])
+    if (shared.get("workspace_id") != producer["workspace_id"]
+            or shared.get("staging_lakehouse_id") != producer["staging_lakehouse_id"]
+            or shared.get("producer_notebook_id") != producer["notebook_id"]):
+        raise ValueError("Reusable native producer IDs differ from runtime template")
+    _uuid(shared.get("identity_id"))
+    _tenant(profile["document"])
+    bounds = ("run_window_seconds", "preparation_timeout_seconds", "cleanup_timeout_seconds")
+    if (any(type(profile[key]) is not int or profile[key] <= 0 for key in bounds)
+            or profile["run_window_seconds"] + STARTUP_HEADROOM_SECONDS > MAX_ACTIVITY_SECONDS
+            or profile["run_window_seconds"] <= profile["preparation_timeout_seconds"] + duration
+            + profile["cleanup_timeout_seconds"]):
+        raise ValueError("Native window must cover bounded preparation, source, verification and cleanup")
 
 
 def prepare_measured(document, selected, probe_id, binding, context, identities, clients, table_client=None):

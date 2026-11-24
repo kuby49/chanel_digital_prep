@@ -12,6 +12,7 @@ PRODUCER_MODULES = (
     "generator.py", "delivery.py", "runner.py", "fabric_storage.py",
     "fabric_ledger.py", "fabric_delivery.py", "fabric_runner.py", "fabric_runtime.py",
     "synthetic_fixture.py", "target_readback.py",
+    "native_lifecycle.py",
 )
 
 
@@ -45,6 +46,18 @@ def _bundle_cell():
             raise ValueError("Both Eventhouse adapter modules are required")
         files.update({path.name: path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
                       for path in peer_files})
+    native_companions = {
+        "demo-2-eventhouse": ("native_demo2.py", "monitor_controller.py", "lakehouse_validation.py", "eventhouse_core.py"),
+    }
+    for folder, names in native_companions.items():
+        root = HERE.parent / folder
+        if not (root / names[0]).is_file():
+            continue
+        for name in names:
+            content = (root / name).read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if name in files and files[name] != content:
+                raise ValueError("Native companion modules have colliding import names")
+            files[name] = content
     encoded = {name: base64.b64encode(content).decode("ascii") for name, content in files.items()}
     source = [
         "import base64 as _bundle_base64\n",

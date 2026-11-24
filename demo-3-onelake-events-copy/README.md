@@ -5,8 +5,8 @@ real OneLake event through Activator, guarded Copy and target verification.
 Its rule is stopped. The customer-run assets are bound to the shared producer;
 the explicit preflight below verifies admission, not live delivery.
 General deployment remains fail-closed; `dry-run` only validates the local contract.
-Reusable native binding support is implemented offline below, but has not been
-installed or exercised against the live items.
+The reusable native binding was installed and subsequently stopped; the
+distinct-staging rebind below has not yet been exercised against live items.
 
 ## Contract
 
@@ -237,7 +237,84 @@ definition updates have no established conditional-write protection, so an
 external editor or writer can race the checks. A stopped rule, terminal job
 listing and absent lock do not prove the event queue is drained.
 
-Set `demo-3.native_preflight:true`,
+### Rebinding a distinct staging Lakehouse
+
+`native_rebind.py` prepares one separately journaled recovery after a confirmed
+first rule-cycle disable. It keeps the original candidate, proof, publication,
+correction, access and rule journals unchanged. It does not enable the rule or
+start the sales producer. Use it only after the old producer is fenced and the
+coordinator has confirmed fresh ownership, definitions, jobs, audit and locks.
+The fence is cooperative, not a storage access-control or immutable-storage
+guarantee.
+
+Create a separate absolute-path specification with the independently confirmed
+staging and target probe object fingerprints and expected pipeline storage
+principal. Probe objects must be existing, non-admitting files; the staging
+probe cannot be a run manifest. Do not copy these example placeholders into a
+live run:
+
+```json
+{
+  "version": 1,
+  "producer_workspace_id": "<new staging workspace UUID>",
+  "producer_lakehouse_id": "<new staging Lakehouse UUID>",
+  "principal_id": "<expected pipeline storage principal UUID>",
+  "producer_probe": {"path": "Files/probe/staging.json", "sha256": "<64 lowercase hex>", "etag": "<exact ETag>"},
+  "target_probe": {"path": "Files/probe/target.csv", "sha256": "<64 lowercase hex>", "etag": "<exact ETag>"}
+}
+```
+
+With the same immutable `@inputs` as the native publisher, prepare the
+following PowerShell array and obtain the complete access-notebook baseline
+fingerprint. Add that result as `access_baseline_sha256` to the specification
+and freeze it before either update. Execute the later steps only after their
+individual gates and separate coordination are satisfied:
+
+```powershell
+$rebind = @('--rebind-spec', '<spec.json>', '--previous-proof', '<first-cycle-proof.json>')
+python native_rebind.py --mode inspect-access @inputs @rebind
+python native_rebind.py --mode access-update @inputs @rebind --yes
+python native_rebind.py --mode access-run @inputs @rebind --yes
+python native_rebind.py --mode access-reconcile @inputs @rebind
+python native_rebind.py --mode update @inputs @rebind --yes
+python native_rebind.py --mode proof @inputs @rebind --output <new-proof.json>
+```
+
+`access-update` preserves every notebook part and checks complete readback.
+`access-run` launches the existing one-activity pipeline **once**. Reconcile
+until its exact pipeline run and activity-linked notebook job both complete;
+the activity ID must match that notebook job ID. This match was observed for
+the previous probe, not guaranteed by the API, so missing or different IDs
+block. The notebook verifies pipeline context, storage principal, both
+Lakehouse object hashes and exact ETags. It does not write an admission or
+prove that a later producer run is authorized.
+
+Only after that confirmed access proof does `update` replace the guard's
+staging settings, preserving the rest of the full notebook definition.
+`demo3-native-staging-access-rebind-state.json` and
+`demo3-native-staging-rebind-state.json` pin the inputs and predecessor
+journals. Each attempted mutation is submitted once. After a lost response,
+use `--mode access-reconcile` or `--mode reconcile`, respectively; these poll
+only recorded operation or job identities and never resubmit. An unknown
+acceptance remains blocked. `.platform` is omitted from definition updates
+because metadata updates are not requested, then must match in full readback.
+
+For a separately authorized rebound second rule cycle, pass `--cycle 2` and
+the same `@rebind` to `native_rule.py`; enable requires the new proof. Its
+separate journal retains and verifies the complete Activator definition
+before and after each change. For the common profile, set
+`demo-3.native_rebind` to absolute paths under keys `candidate`, `native_config`,
+`previous_config`, `spec`, `previous_proof`, and `proof`; set
+`demo-3.native_proof` to the new proof and shared staging IDs to the new
+Lakehouse. The preflight rejects a guard and producer bound to different
+staging. A stopped second cycle cannot be admitted again.
+
+ETags and hashes are point-in-time checks, not WORM guarantees. An outside
+writer can alter source bytes between guard validation and the Copy's later
+filename read. The checks do not prove external-writer exclusion, event-queue
+drainage, successful notification delivery or actual high-concurrency reuse.
+
+For an unrebound native profile, set `demo-3.native_preflight:true`,
 `native_binding_journal:"demo3-native-binding-state.json"` and `native_policy`
 in the common configuration; remove `customer_preflight`. Standard
 `deploy.py --mode validate-only ...` then verifies the native notebook, broad

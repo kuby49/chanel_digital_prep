@@ -192,6 +192,8 @@ def main(argv=None):
                  args.state_dir / "demo3-native-rule-state.json",
                  args.state_dir / "demo3-native-rule-cycle-2-state.json",
                  args.state_dir / "demo3-native-guard-hc-state.json",
+                 args.state_dir / "demo3-native-staging-access-rebind-state.json",
+                 args.state_dir / "demo3-native-staging-rebind-state.json",
                  args.state_dir / "demo3-staging-access-state.json")
     if args.result.resolve() in {path.resolve() for path in protected}:
         print("Result path conflicts with input, state, or candidate", file=sys.stderr)
@@ -213,6 +215,12 @@ def main(argv=None):
                 if args.result.resolve() == (args.state_dir / selected_journal).resolve():
                     print("Result path conflicts with customer binding journal", file=sys.stderr)
                     return 1
+        rebind = config["demo-3"].get("native_rebind")
+        if isinstance(rebind, dict) and any(
+                isinstance(value, str) and args.result.resolve() == Path(value).resolve()
+                for value in rebind.values()):
+            print("Result path conflicts with rebound native inputs", file=sys.stderr)
+            return 1
         verification_timeout(config)
         if args.mode == "cleanup" and not args.yes:
             raise ValueError("cleanup requires --yes; no resources were removed")

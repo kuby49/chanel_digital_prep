@@ -326,6 +326,10 @@ def _validate(config, prefix, state_dir, *, api=None):
 
 def validate(config, prefix, state_dir, *, api=None):
     try:
+        if "native_rebind" in config["demo-3"]:
+            from native_rebind import validate_rebound
+
+            return validate_rebound(config, prefix, state_dir, api=api)
         return _validate(config, prefix, state_dir, api=api)
     except (KeyError, TypeError, IndexError, RuntimeError, subprocess.SubprocessError) as exc:
         raise CandidateBlocked(f"Customer preflight could not verify its evidence: {type(exc).__name__}.") from exc

@@ -1,5 +1,6 @@
 """Native producer hooks for the deployment-pinned Demo 3 event path."""
 
+import ast
 import base64
 import copy
 import hashlib
@@ -110,6 +111,22 @@ def _guard(notebook):
             "lakehouse": notebook["metadata"]["trident"]["lakehouse"]}
 
 
+def _guard_staging(notebook):
+    try:
+        cells = notebook["cells"]
+        if len(cells) != 2 or not isinstance(cells[1]["source"], list):
+            raise ValueError("unexpected guard notebook cells")
+        tree = ast.parse("".join(cells[1]["source"]))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "execute"]
+        if len(calls) != 1 or len(calls[0].args) != 4:
+            raise ValueError("unexpected guard entry point")
+        settings = ast.literal_eval(calls[0].args[2])
+        return _guid(settings["producer_workspace_id"]), _guid(settings["producer_item_id"])
+    except (KeyError, TypeError, ValueError, SyntaxError) as exc:
+        raise ValueError("native guard staging binding is unavailable") from exc
+
+
 def _proof(document):
     proof = document["demo-3"]["native_proof"]
     if (not isinstance(proof, dict) or set(proof) != _FIELDS
@@ -211,6 +228,9 @@ def prepare(context):
             or _digest(pipeline["properties"]) != proof["pipeline_sha256"]
             or _digest(_graph(graph, enabled=True)) != proof["graph_disabled_sha256"]):
         raise RuntimeError("native guard, pipeline or enabled event rule differs from deployment proof")
+    if _guard_staging(notebook) != (document["shared"]["workspace_id"],
+                                    document["shared"]["staging_lakehouse_id"]):
+        raise RuntimeError("native guard and producer staging bindings differ")
     for item, kind in ((proof["pipeline_id"], "Pipeline"), (proof["guard_notebook_id"], "RunNotebook")):
         _remaining(context, deadline)
         jobs = spark_client.list_all(base + f"/items/{item}/jobs/instances?jobType={kind}")

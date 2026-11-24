@@ -28,6 +28,7 @@ from ownership import FabricControl
 _PREVIOUS = "demo3-customer-" + check.FRESH_RUN_ID + "-binding-state.json"
 _BASE = "/v1/workspaces/" + check.WORKSPACE
 _ACTIONS = ("guard_update", "activator_update")
+RULE_JOURNAL = "demo3-native-rule-state.json"
 
 
 def _utc():
@@ -478,32 +479,38 @@ class NativeBinding:
     def proof(self, output):
         output = Path(output)
         protected = (self.candidate_path, self.native_config_path, self.previous_config_path,
-                     self.journal, self.root / _PREVIOUS, self.root / check.JOURNAL)
+                     self.journal, self.root / RULE_JOURNAL, self.root / _PREVIOUS, self.root / check.JOURNAL)
         if not output.is_absolute() or any(output.resolve() == path.resolve() for path in protected):
             raise ValueError("proof output must be a distinct absolute path")
         with _state_lock(self.root):
-            self._unchanged()
-            state = self._state()
-            if any(state["actions"].get(action, {}).get("status") != "confirmed-readback" for action in _ACTIONS):
-                raise CandidateBlocked("Both native updates require confirmed readbacks before proof.")
-            check.validate(self.native_config, "chanel", self.root, api=self.api)
-            pipeline = _quiescent(self.api, self.root)
-            notebook, graph = _guard(self.api), _graph(self.api)
-            if _notebook(notebook) != _notebook(self.notebook):
-                raise CandidateBlocked("Native guard changed before proof.")
-            _stopped(graph, self.graph)
-            self._unchanged()
-            proof = {
-                "version": 1, "workspace_id": check.WORKSPACE, "lakehouse_id": check.LAKEHOUSE,
-                "guard_notebook_id": check.NOTEBOOK, "pipeline_id": check.PIPELINE,
-                "reflex_id": check.REFLEX, "connection_id": check.CONNECTION, "marker": check.MARKER,
-                "native_policy": state["native_policy"], "generator_sha256": check.GENERATOR_SHA,
-                "guard_sha256": check.config_sha256(_notebook(notebook)),
-                "pipeline_sha256": check.config_sha256(pipeline["properties"]),
-                "graph_disabled_sha256": check.config_sha256(check._canonical(graph)),
-            }
+            proof = self._read_proof(self._published())
             _create(output, proof)
             return proof
+
+    def _published(self):
+        self._unchanged()
+        state = self._state()
+        if any(state["actions"].get(action, {}).get("status") != "confirmed-readback" for action in _ACTIONS):
+            raise CandidateBlocked("Both native updates require confirmed readbacks before proof.")
+        return state
+
+    def _read_proof(self, state):
+        check.validate(self.native_config, "chanel", self.root, api=self.api)
+        pipeline = _quiescent(self.api, self.root)
+        notebook, graph = _guard(self.api), _graph(self.api)
+        if _notebook(notebook) != _notebook(self.notebook):
+            raise CandidateBlocked("Native guard changed before proof.")
+        _stopped(graph, self.graph)
+        self._unchanged()
+        return {
+            "version": 1, "workspace_id": check.WORKSPACE, "lakehouse_id": check.LAKEHOUSE,
+            "guard_notebook_id": check.NOTEBOOK, "pipeline_id": check.PIPELINE,
+            "reflex_id": check.REFLEX, "connection_id": check.CONNECTION, "marker": check.MARKER,
+            "native_policy": state["native_policy"], "generator_sha256": check.GENERATOR_SHA,
+            "guard_sha256": check.config_sha256(_notebook(notebook)),
+            "pipeline_sha256": check.config_sha256(pipeline["properties"]),
+            "graph_disabled_sha256": check.config_sha256(check._canonical(graph)),
+        }
 
 
 def main(argv=None):

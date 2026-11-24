@@ -4,9 +4,11 @@ The [specification](SPECIFICATION.md) defines three isolated comparisons using t
 
 **Native recurring launch is not yet ready.** Reusable producer and track
 lifecycle hooks and the Demo 3 publisher are integrated and locally tested.
-Publication, rule enablement, live setup and repeated-run verification remain
-incomplete. The older prepared profile is single-use and requires a separately
-started monitor. No coordinated 10-file run has been verified.
+The Demo 3 native definitions and stopped-rule proof have been read back in
+Fabric; its rule remains stopped. Producer publication, rule enablement, live
+setup and repeated-run verification remain incomplete. The older prepared
+profile is single-use and requires a separately started monitor. No
+coordinated 10-file run has been verified.
 
 The user accepted Fabric's documented five-minute MLV schedule instead of a
 shorter cadence and asked not to use the event-triggered MLV preview. A longer

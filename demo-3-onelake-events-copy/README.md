@@ -273,14 +273,37 @@ the currently deployed fixed-run notebook.
 
 **Native operation after that deployment:** open the existing
 [Demo 3 workspace](https://app.fabric.microsoft.com/groups/744223de-ceab-4c4f-82ba-f811bcb5c7d7/list?experience=real-time-intelligence).
-Start only `Copy sales file` inside `Demo3EventE2eActivatorA9bbae81`, then launch
-the separately prepared native recurring producer once. Do not manually Run
+Once separately authorized, use the same four immutable input arguments as
+`native_binding.py` with the journaled rule controller:
+
+```powershell
+python native_rule.py --mode enable @inputs --proof <confirmed-proof.json> --yes
+python native_rule.py --mode disable @inputs --yes
+python native_rule.py --mode drain @inputs
+```
+
+Here `@inputs` is a PowerShell array containing `--candidate`, `--native-config`,
+`--previous-config`, and `--state-dir`, each followed by its absolute path.
+Enable checks the proof against fresh stopped readback and changes only
+`Copy sales file`. The separate `demo3-native-rule-state.json` permits **one**
+enable/disable cycle; leave the rule enabled across recurring launches until
+it is time to stop it. Do not reset the journal to repeat a cycle. On an
+interrupted update run `--mode reconcile @inputs` only: it uses the recorded
+operation ID and Location and never resubmits. If acceptance is unknown,
+stop and reconcile with the operator; neither a second submission nor a
+graph snapshot can prove the first operation will not complete later.
+
+After confirming enable, launch the separately prepared native recurring
+producer. Do not manually Run
 `Demo3EventE2ePipelineA9bbae81` or `Demo3EventE2eGuardA9bbae81`; their parameters
 come from events. Observe Activator history, pipeline monitoring, exact
 manifest batch IDs, batch audits and any writer-wait tickets, then inspect
 `Demo3EventE2eA9bbae81` / `dbo.factsales` by those batch IDs. Stop the rule first,
-request the producer's cooperative stop, and drain already-admitted owned jobs;
-do not clear an ambiguous writer lock. SQL metadata can lag Delta, so lack of
+request the producer's cooperative stop, and check drain after admitted work
+has finished. Drain checks terminal owned jobs and the absent writer lock
+at that moment; it does not prove that the Fabric event queue has drained.
+If jobs or a lock remain, wait and repeat only the read-only drain check.
+Do not clear an ambiguous writer lock. SQL metadata can lag Delta, so lack of
 immediate SQL visibility is not proof of missing Copy. These are operator
 steps, not an instruction to enable or run anything during preparation.
 

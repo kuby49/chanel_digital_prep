@@ -189,6 +189,7 @@ def main(argv=None):
                  args.result.parent / CANDIDATE_FILE,
                  args.state_dir / "demo3-customer-binding-state.json",
                  args.state_dir / "demo3-native-binding-state.json",
+                 args.state_dir / "demo3-native-rule-state.json",
                  args.state_dir / "demo3-staging-access-state.json")
     if args.result.resolve() in {path.resolve() for path in protected}:
         print("Result path conflicts with input, state, or candidate", file=sys.stderr)

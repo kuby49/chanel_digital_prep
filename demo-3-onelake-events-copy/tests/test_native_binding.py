@@ -1054,7 +1054,7 @@ class NativeBindingTests(unittest.TestCase):
                         "endTimeUtc": "2026-11-24T21:04:00Z"}
         notebook_job = {"id": notebook_id, "status": "Completed", "jobType": "PipelineRunNotebook",
                         "startTimeUtc": "2026-11-24T21:00:02Z",
-                        "endTimeUtc": "2026-11-24T21:03:00Z"}
+                        "endTimeUtc": "2026-11-24T21:05:12Z"}
         self.api.get.side_effect = lambda url, **kwargs: (
             pipeline_job if url == location else notebook_job)
         self.api.request.side_effect = None
@@ -1077,6 +1077,10 @@ class NativeBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(CandidateBlocked, "notebook job is not confirmed"):
                 rebound._job_evidence(record)
             notebook_job["status"] = "Completed"
+            notebook_job["endTimeUtc"] = "2026-11-24T21:00:00Z"
+            with self.assertRaisesRegex(CandidateBlocked, "notebook job is not confirmed"):
+                rebound._job_evidence(record)
+            notebook_job["endTimeUtc"] = "2026-11-24T21:05:12Z"
             jobs.append({**jobs[-1], "id": str(uuid.uuid4())})
             with self.assertRaisesRegex(CandidateBlocked, "does not identify"):
                 rebound._job_evidence(record)

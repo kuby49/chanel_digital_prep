@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Coordinate independent demo deployment entry points without starting data implicitly."""
+
+import argparse
+import concurrent.futures
+import contextlib
+import copy
+import datetime
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from scripts.monitor_contract import (PRODUCER_HEADROOM_SECONDS, demo2_deployment_scope,
+                                      matching_monitor_identity, monitor_binding, monitor_config,
+                                      monitor_evidence, strict_json)
+
+TRACKS = {
+    "demo-1": ROOT / "demo-1-materialized-lake-views" / "deploy.py",
+    "demo-2": ROOT / "demo-2-eventhouse" / "deploy.py",
+    "demo-3": ROOT / "demo-3-onelake-events-copy" / "deploy.py",
+    "shared": ROOT / "demo-data-generator" / "deploy.py",
+}
+STATUSES = {"pass", "fail", "blocked"}
+DEMOS = ("demo-1", "demo-2", "demo-3")
+LEGACY_STATE = {"shared-producer-v1.json", ".shared-producer-v1.lock",
+                "demo-1-state.json", "demo-2-state.json", "demo-3-state.json",
+                "demo-2-monitor-start.json", "demo-2-monitor.json", "demo-2.lock"}
+
+
+def require_config_snapshot(path, expected):
+    options = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": False, "allow_nan": False}
+    try:
+        actual = json.dumps(strict_json(path), **options)
+        original = json.dumps(expected, **options)
+    except RecursionError as error:
+        raise ValueError(f"{path.name} exceeds the supported JSON nesting depth") from error
+    if actual != original:
+        raise ValueError(f"{path.name} no longer matches the invocation configuration")
+
+
+def config_snapshot_intact(phases, path, expected):
+    try:
+        require_config_snapshot(path, expected)
+        return True
+    except (OSError, ValueError, TypeError) as error:
+        phases["config-integrity"] = {"shared": result(
+            "shared", "config-integrity", "fail", f"Configuration snapshot cannot be trusted: {error}")}
+        return False
+
+
+def canonical_uuid(value, label, require_canonical=False):
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a nonzero UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as error:
+        raise ValueError(f"{label} must be a nonzero UUID") from error
+    if parsed.int == 0 or (require_canonical and str(parsed) != value):
+        raise ValueError(f"{label} must be a canonical nonzero UUID" if require_canonical
+                         else f"{label} must be a nonzero UUID")
+    return str(parsed)
+
+
+def parse_selector(value):
+    if value == "all":
+        return list(TRACKS)[:3]
+    parts = value.split(",")
+    if not parts or any(part not in TRACKS or part == "shared" for part in parts):
+        raise argparse.ArgumentTypeError("select all or comma-separated demo-1,demo-2,demo-3")
+    if len(set(parts)) != len(parts):
+        raise argparse.ArgumentTypeError("a demo may only be selected once")
+    return parts
+
+
+def load_config(path):
+    config = strict_json(path)
+    if not isinstance(config, dict) or type(config.get("contract_version")) is not int or config["contract_version"] != 1:
+        raise ValueError("configuration contract_version must be 1")
+    if not isinstance(config.get("execution"), dict):
+        raise ValueError("configuration execution must be an object")
+    if not isinstance(config.get("data"), dict) or config["data"].get("currency") != "USD":
+        raise ValueError("data.currency must be USD; the current producer only supports USD")
+    for track in ("demo-1", "demo-2", "demo-3"):
+        settings = config.get(track)
+        if settings is not None:
+            if not isinstance(settings, dict):
+                raise ValueError(f"{track} must be an object")
+            timeout = settings.get("verification_timeout_seconds")
+            if timeout is not None and (type(timeout) is not int or timeout < 1):
+                raise ValueError(f"{track}.verification_timeout_seconds must be a positive integer")
+    return config
+
+
+def result(track, mode, status, message):
+    return {"contract_version": 1, "track": track, "mode": mode,
+            "status": status, "ready": False, "diagnostics": [message]}
+
+
+def validate_run_data(config):
+    data = config.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("data must be an object")
+    if not isinstance(data.get("run_id"), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", data["run_id"]):
+        raise ValueError("data.run_id must be a nonempty safe logical run identifier")
+    for key in ("file_count", "rows_per_file", "max_duration_seconds"):
+        if type(data.get(key)) is not int or data[key] < 1:
+            raise ValueError(f"data.{key} must be a positive integer")
+    if type(data.get("interval_seconds")) is not int or data["interval_seconds"] < 0:
+        raise ValueError("data.interval_seconds must be a nonnegative integer")
+    if data["max_duration_seconds"] <= (data["file_count"] - 1) * data["interval_seconds"]:
+        raise ValueError("data.max_duration_seconds must exceed the time of the last scheduled batch")
+
+
+def producer_timeout(config, selected, track_timeout):
+    for track in selected:
+        settings = config.get(track) or {}
+        timeout = settings.get("verification_timeout_seconds")
+        if timeout is None:
+            timeout = config["execution"].get("verification_timeout_seconds")
+        if type(timeout) is not int or timeout < 1:
+            raise ValueError(f"{track} verification timeout must be a positive integer")
+    duration = (track_timeout * (2 if "demo-2" in selected else 1)
+                + config["data"]["max_duration_seconds"] + PRODUCER_HEADROOM_SECONDS)
+    try:
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
+    except OverflowError as error:
+        raise ValueError("Producer timeout bound is too large") from error
+    return duration
+
+
+def invoke(track, mode, config_path, prefix, state_dir, invocation_dir, timeout, selected, yes=False):
+    script = TRACKS[track]
+    result_path = invocation_dir / f"{track}-{mode}.json"
+    log_path = invocation_dir / f"{track}-{mode}.log"
+    if not script.is_file():
+        return result(track, mode, "blocked", f"Missing entry point: {script}")
+    if track == "demo-2":
+        try:
+            prefix, state_dir = demo2_deployment_scope(strict_json(config_path), prefix, state_dir)
+        except (OSError, ValueError, TypeError) as error:
+            return result(track, mode, "blocked", f"Invalid Demo 2 deployment scope: {error}")
+    args = [sys.executable, str(script), "--mode", mode, "--config", str(config_path),
+            "--prefix", prefix, "--state-dir", str(state_dir), "--result", str(result_path)]
+    if yes:
+        args.append("--yes")
+    if (mode in {"run-data", "start-monitor", "monitor-status", "wait-monitor", "stop-monitor"}
+            or track == "shared" and mode in {"validate-only", "producer-status", "stop-producer"}):
+        args += ["--selected-demos", ",".join(selected)]
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            completed = subprocess.run(args, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                       timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return result(track, mode, "fail", f"Entry point timed out after {timeout} seconds; inspect {log_path}")
+    except OSError as error:
+        return result(track, mode, "fail", f"Could not launch entry point: {error}")
+    try:
+        data = strict_json(result_path)
+        if not isinstance(data, dict):
+            raise ValueError("result must be an object")
+        if (type(data.get("contract_version")) is not int or data["contract_version"] != 1
+                or data.get("track") != track or data.get("mode") != mode
+                or not isinstance(data.get("status"), str) or data["status"] not in STATUSES
+                or type(data.get("ready")) is not bool
+                or not isinstance(data.get("diagnostics"), list)
+                or not all(isinstance(item, str) for item in data["diagnostics"])):
+            raise ValueError("invalid result contract")
+        if data["status"] != "pass" and (data["ready"] or not data["diagnostics"]):
+            raise ValueError("failed/blocked result must be not ready and explain why")
+        if (completed.returncode == 0) != (data["status"] == "pass"):
+            raise ValueError(f"exit code {completed.returncode} disagrees with status")
+        if mode in {"resolve-candidate-ids", "resolve-target-candidate"} and data["ready"]:
+            raise ValueError("candidate resolution must not claim readiness")
+        if track == "shared" and mode in {"producer-status", "stop-producer"} and data["status"] == "pass":
+            return result(track, mode, "blocked", "Producer recovery is inspection only; termination unconfirmed.")
+        if mode in {"deploy", "validate-only", "monitor-status", "wait-monitor"} and data["status"] == "pass" and not data["ready"]:
+            return result(track, mode, "blocked", "Entry point reported pass but did not verify readiness")
+        return data
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return result(track, mode, "fail", f"Invalid or missing result ({error}); inspect {log_path}")
+
+
+def run_phase(tracks, mode, config_path, prefix, state_dir, invocation_dir, timeout, selected, concurrency, yes):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {track: executor.submit(invoke, track, mode, config_path, prefix,
+                                          state_dir, invocation_dir, timeout, selected, yes)
+                   for track in tracks}
+        return {track: future.result() for track, future in futures.items()}
+
+
+def check_legacy_state(root):
+    candidates = [root]
+    candidates.extend(path for path in root.glob("run-*") if path.is_dir())
+    for directory in candidates:
+        for name in LEGACY_STATE:
+            path = directory / name
+            if path.exists():
+                raise ValueError(f"Legacy deployment state found at {path}; reconcile ownership and "
+                                 "move it into the scoped directory only after review")
+
+
+@contextlib.contextmanager
+def deployment_lock(state_dir):
+    path = state_dir / ".orchestrator-v1.lock"
+    nonce = uuid.uuid4().hex
+    try:
+        with path.open("x", encoding="utf-8") as file:
+            file.write(nonce)
+            file.flush()
+            os.fsync(file.fileno())
+    except FileExistsError as error:
+        raise ValueError(f"Deployment state is locked: {path}; reconcile before retrying") from error
+    except OSError as error:
+        raise ValueError(f"Cannot persist deployment lock at {path}; reconcile before retrying: {error}") from error
+    try:
+        yield
+    finally:
+        try:
+            if path.read_text(encoding="utf-8") != nonce:
+                raise ValueError(f"Deployment lock changed at {path}; reconciliation required")
+            path.unlink()
+        except OSError as error:
+            raise ValueError(f"Cannot release deployment lock at {path}; reconciliation required: {error}") from error
+
+
+def target_candidate(path, track, tenant_id, prefix):
+    candidate = strict_json(path)
+    if (not isinstance(candidate, dict) or set(candidate) !=
+            {"contract_version", "track", "tenant_id", "prefix", "target"}
+            or type(candidate["contract_version"]) is not int or candidate["contract_version"] != 1
+            or candidate["track"] != track or candidate["tenant_id"] != tenant_id
+            or candidate["prefix"] != prefix):
+        raise ValueError("candidate identity or contract version mismatch")
+    target = candidate["target"]
+    if not isinstance(target, dict) or set(target) != {"workspace_id", "item_id", "fact"}:
+        raise ValueError("target must contain exactly workspace_id, item_id, and fact")
+    for field in ("workspace_id", "item_id"):
+        canonical_uuid(target[field], field, require_canonical=True)
+    if not isinstance(target["fact"], str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,255}", target["fact"]):
+        raise ValueError("target fact has an invalid identifier")
+    return target
+
+
+def check_target_config(config, track, target, configured):
+    if configured is not None and configured != target:
+        raise ValueError(f"shared.target_bindings.{track} conflicts with its journal candidate")
+    settings = config.get(track) or {}
+    item_field = {"demo-1": "lakehouse_id", "demo-2": "kql_database_id", "demo-3": "lakehouse_id"}[track]
+    for target_field, config_field in (("workspace_id", "workspace_id"), ("item_id", item_field)):
+        value = settings.get(config_field)
+        if value is not None and canonical_uuid(value, f"{track}.{config_field}") != target[target_field]:
+            raise ValueError(f"{track}.{config_field} conflicts with its journal candidate")
+    if track == "demo-1":
+        schema, separator, view = target["fact"].partition(".")
+        if not separator or "." in view:
+            raise ValueError("Demo 1 target fact must be schema.view")
+        for value, name, actual in ((settings.get("silver_schema"), "silver_schema", schema),
+                                    (settings.get("silver_view"), "silver_view", view)):
+            if value is not None and value != actual:
+                raise ValueError(f"demo-1.{name} conflicts with its journal candidate")
+    else:
+        fact_field = "sales_table" if track == "demo-2" else "destination_table"
+        value = settings.get(fact_field)
+        if value is not None and value != target["fact"]:
+            raise ValueError(f"{track}.{fact_field} conflicts with its journal candidate")
+
+
+def effective_run_config(config, prefix, state_dir, invocation_dir, timeout, selected, concurrency,
+                         check_monitor=False):
+    phases = {}
+    resolved = copy.deepcopy(config)
+    shared = resolved.get("shared")
+    try:
+        if not isinstance(shared, dict):
+            raise ValueError("shared must be an object")
+        keys = ("workspace_id", "staging_lakehouse_id")
+        if any(shared.get(key) is None for key in keys):
+            require_config_snapshot(invocation_dir / "input-config.json", config)
+            candidate_result = invoke("shared", "resolve-candidate-ids", invocation_dir / "input-config.json",
+                                      prefix, state_dir, invocation_dir, timeout, selected)
+            phases["resolve-candidate-ids"] = {"shared": candidate_result}
+            require_config_snapshot(invocation_dir / "input-config.json", config)
+            if candidate_result["status"] != "pass":
+                return phases, None, None
+            candidate = strict_json(invocation_dir / "shared-producer-candidate-ids.json")
+            if (not isinstance(candidate, dict) or set(candidate) != {"version", *keys}
+                    or type(candidate["version"]) is not int or candidate["version"] != 1):
+                raise ValueError("invalid candidate ID sidecar")
+            for key in keys:
+                candidate_id = canonical_uuid(candidate[key], key, require_canonical=True)
+                if shared.get(key) is not None and canonical_uuid(shared[key], key) != candidate_id:
+                    raise ValueError(f"explicit shared.{key} conflicts with the producer journal candidate")
+                shared[key] = candidate_id
+        else:
+            for key in keys:
+                shared[key] = canonical_uuid(shared[key], key)
+        if check_monitor and "demo-2" in selected:
+            monitor_config(resolved)
+        configured_targets = shared.get("target_bindings", {})
+        if not isinstance(configured_targets, dict) or set(configured_targets) - set(DEMOS):
+            raise ValueError("shared.target_bindings must be an object keyed by demo names")
+        candidate_config = invocation_dir / "candidate-config.json"
+        candidate_config.write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
+        candidates = run_phase(selected, "resolve-target-candidate", candidate_config, prefix, state_dir,
+                               invocation_dir, timeout, selected, concurrency, False)
+        phases["resolve-target-candidate"] = candidates
+        require_config_snapshot(candidate_config, resolved)
+        targets = {}
+        tenant_id = canonical_uuid(resolved["tenant_id"], "tenant_id")
+        for track in selected:
+            if candidates[track]["status"] != "pass":
+                continue
+            try:
+                candidate_prefix = (demo2_deployment_scope(resolved, prefix, state_dir)[0]
+                                    if track == "demo-2" else prefix)
+                target = target_candidate(invocation_dir / f"{track}-target-candidate.json",
+                                          track, tenant_id, candidate_prefix)
+                check_target_config(resolved, track, target, configured_targets.get(track))
+                targets[track] = target
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                candidates[track] = result(track, "resolve-target-candidate", "fail",
+                                           f"Invalid target candidate: {error}")
+        if any(outcome["status"] != "pass" for outcome in candidates.values()):
+            return phases, None, None
+        workspace_owners = {shared["workspace_id"]: "shared"}
+        for track, target in targets.items():
+            other = workspace_owners.get(target["workspace_id"])
+            if other is None:
+                workspace_owners[target["workspace_id"]] = track
+                continue
+            candidates[track] = result(track, "resolve-target-candidate", "fail",
+                                       f"Target workspace conflicts with {other}")
+            if other != "shared":
+                candidates[other] = result(other, "resolve-target-candidate", "fail",
+                                           f"Target workspace conflicts with {track}")
+        if any(outcome["status"] != "pass" for outcome in candidates.values()):
+            return phases, None, None
+        shared["target_bindings"] = targets
+        effective_path = invocation_dir / "effective-config.json"
+        effective_path.write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
+        phases["resolve-shared-config"] = {"shared": result(
+            "shared", "resolve-shared-config", "pass",
+            "Resolved configuration is provisional; fresh live readiness validation is required")}
+        return phases, resolved, effective_path
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+        phases["resolve-shared-config"] = {"shared": result(
+            "shared", "resolve-shared-config", "blocked", f"Could not resolve shared configuration: {error}")}
+        return phases, None, None
+
+
+def stop_monitor(initial, config_path, prefix, state_dir, invocation_dir, timeout, selected, expected_config=None):
+    try:
+        scope_config = expected_config if expected_config is not None else strict_json(config_path)
+        prefix, state_dir = demo2_deployment_scope(scope_config, prefix, state_dir)
+        if initial is not None:
+            record = strict_json(state_dir / "demo-2-monitor-start.json")
+            matching_monitor_identity(initial, record)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return result("demo-2", "stop-monitor", "fail",
+                      f"Start record changed or is unreadable; termination unconfirmed: {error}")
+    if expected_config is not None:
+        try:
+            require_config_snapshot(config_path, expected_config)
+        except (OSError, ValueError, TypeError):
+            try:
+                config_path = invocation_dir / "monitor-stop-config.json"
+                with config_path.open("x", encoding="utf-8") as file:
+                    json.dump(expected_config, file, indent=2, allow_nan=False)
+                    file.write("\n")
+                require_config_snapshot(config_path, expected_config)
+            except (OSError, ValueError, TypeError) as error:
+                return result("demo-2", "stop-monitor", "fail",
+                              f"Cannot persist the original stop configuration; termination unconfirmed: {error}")
+    return invoke("demo-2", "stop-monitor", config_path, prefix, state_dir, invocation_dir, timeout, selected)
+
+
+def start_monitor(config, config_path, prefix, state_dir, invocation_dir, timeout, selected, monitor_settings):
+    phases = {}
+    started = False
+    attempted = False
+    initial = None
+    try:
+        try:
+            prefix, state_dir = demo2_deployment_scope(config, prefix, state_dir)
+            binding = monitor_binding(config)
+            require_config_snapshot(config_path, config)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
+            phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "blocked",
+                                                        f"Cannot bind monitor configuration: {error}")}
+            return phases, False, None
+        attempted = True
+        start = invoke("demo-2", "start-monitor", config_path, prefix, state_dir, invocation_dir, timeout, selected)
+        phases["start-monitor"] = {"demo-2": start}
+        if start["status"] != "pass":
+            return phases, False, None
+        try:
+            initial = monitor_evidence(state_dir / "demo-2-monitor-start.json",
+                                       config["data"]["run_id"], *monitor_settings, "start", binding)
+            sidecar = monitor_evidence(state_dir / "demo-2-monitor.json",
+                                       config["data"]["run_id"], *monitor_settings, "start", binding)
+            matching_monitor_identity(initial, sidecar)
+            require_config_snapshot(config_path, config)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            phases["start-monitor"] = {"demo-2": result("demo-2", "start-monitor", "fail",
+                                                        f"Invalid monitor evidence: {error}")}
+            return phases, False, None
+        status = invoke("demo-2", "monitor-status", config_path, prefix, state_dir, invocation_dir, timeout, selected)
+        phases["monitor-status"] = {"demo-2": status}
+        if status["status"] != "pass":
+            return phases, False, None
+        try:
+            binding = monitor_binding(config)
+            record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
+                                      config["data"]["run_id"], *monitor_settings, "start", binding)
+            current = monitor_evidence(state_dir / "demo-2-monitor.json",
+                                       config["data"]["run_id"], *monitor_settings, "running", binding)
+            matching_monitor_identity(initial, record)
+            matching_monitor_identity(initial, current)
+            require_config_snapshot(config_path, config)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
+            phases["monitor-status"] = {"demo-2": result("demo-2", "monitor-status", "fail",
+                                                         f"Invalid monitor evidence: {error}")}
+            return phases, False, None
+        started = True
+        return phases, True, initial
+    finally:
+        if attempted and not started:
+            phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
+                                                               state_dir, invocation_dir, timeout, selected, config)}
+
+
+def wait_monitor(initial, config, config_path, prefix, state_dir, invocation_dir, timeout, selected, monitor_settings):
+    try:
+        prefix, state_dir = demo2_deployment_scope(config, prefix, state_dir)
+        require_config_snapshot(config_path, config)
+    except (OSError, ValueError, TypeError) as error:
+        return {
+            "wait-monitor": {"demo-2": result("demo-2", "wait-monitor", "fail",
+                                              f"Configuration snapshot cannot be trusted: {error}")},
+            "stop-monitor": {"demo-2": stop_monitor(initial, config_path, prefix, state_dir,
+                                                       invocation_dir, timeout, selected, config)},
+        }
+    deadline = datetime.datetime.fromisoformat(initial["deadline_utc"].replace("Z", "+00:00"))
+    remaining = max(0, math.ceil((deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+    outcome = invoke("demo-2", "wait-monitor", config_path, prefix, state_dir, invocation_dir,
+                     remaining + timeout, selected)
+    phases = {"wait-monitor": {"demo-2": outcome}}
+    if outcome["status"] == "pass":
+        try:
+            binding = monitor_binding(config)
+            record = monitor_evidence(state_dir / "demo-2-monitor-start.json",
+                                      config["data"]["run_id"], *monitor_settings, "start", binding, False)
+            current = monitor_evidence(state_dir / "demo-2-monitor.json",
+                                       config["data"]["run_id"], *monitor_settings, "completed", binding, False)
+            matching_monitor_identity(initial, record)
+            matching_monitor_identity(initial, current)
+            require_config_snapshot(config_path, config)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
+            phases["wait-monitor"] = {"demo-2": result("demo-2", "wait-monitor", "fail",
+                                                       f"Invalid terminal monitor evidence: {error}")}
+    if phases["wait-monitor"]["demo-2"]["status"] != "pass":
+        phases["stop-monitor"] = {"demo-2": stop_monitor(initial, config_path, prefix,
+                                                          state_dir, invocation_dir, timeout, selected, config)}
+    return phases
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("selector", type=parse_selector, help="all or comma-separated demo selectors")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    for mode in ("dry-run", "validate-only", "deploy", "cleanup"):
+        modes.add_argument("--" + mode, action="store_const", const=mode, dest="mode")
+    parser.add_argument("--config", type=Path, default=ROOT / "config.example.json")
+    parser.add_argument("--prefix", help="override configuration deployment prefix")
+    parser.add_argument("--state-dir", type=Path, default=ROOT / ".deployment-state")
+    parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--yes", action="store_true", help="confirm cleanup")
+    parser.add_argument("--run-data", action="store_true", help="start a bounded producer after fresh readiness checks")
+    args = parser.parse_args(argv)
+    if args.mode == "cleanup" and not args.yes:
+        parser.error("--cleanup requires --yes")
+    if args.run_data and args.mode != "deploy":
+        parser.error("--run-data requires --deploy")
+    try:
+        config_path = args.config.resolve(strict=True)
+        config = load_config(config_path)
+        prefix = args.prefix or config.get("prefix")
+        if not isinstance(prefix, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", prefix):
+            raise ValueError("prefix must contain only lowercase letters, digits and hyphens, beginning with a letter or digit")
+        if "demo-2" in args.selector:
+            demo2_deployment_scope(config, prefix, args.state_dir)
+        try:
+            tenant_id = canonical_uuid(config["tenant_id"], "tenant_id")
+        except (KeyError, ValueError, TypeError, AttributeError) as error:
+            raise ValueError("tenant_id must be a UUID") from error
+        execution = config["execution"]
+        concurrency = args.concurrency if args.concurrency is not None else execution.get("max_concurrency")
+        timeout = execution.get("track_timeout_seconds")
+        if type(concurrency) is not int or not 1 <= concurrency <= 4:
+            raise ValueError("concurrency must be an integer from 1 to 4")
+        if type(timeout) is not int or timeout < 1:
+            raise ValueError("track_timeout_seconds must be a positive integer")
+        if args.run_data:
+            validate_run_data(config)
+            run_timeout = producer_timeout(config, args.selector, timeout)
+            shared = config.get("shared")
+            if not isinstance(shared, dict):
+                raise ValueError("shared must be an object")
+            if "demo-2" in args.selector and all(shared.get(key) is not None for key in
+                                                  ("workspace_id", "staging_lakehouse_id")):
+                monitor_config(config)
+        state_root = args.state_dir.resolve()
+        state_root.mkdir(parents=True, exist_ok=True)
+        if args.mode != "dry-run":
+            check_legacy_state(state_root)
+        state_dir = state_root / f"{prefix}-{tenant_id}"
+        state_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        return 2
+    try:
+        with deployment_lock(state_dir):
+            runs_dir = state_dir / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            invocation_dir = Path(tempfile.mkdtemp(prefix="run-", dir=runs_dir))
+            config = copy.deepcopy(config)
+            if args.prefix is not None:
+                config["prefix"] = prefix
+                if isinstance(config.get("common"), dict) and "prefix" in config["common"]:
+                    config["common"]["prefix"] = prefix
+            config_path = invocation_dir / "input-config.json"
+            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            tracks = args.selector + (["shared"] if args.mode != "cleanup" or len(args.selector) == 3 else [])
+            phases = {}
+            if args.mode == "validate-only":
+                resolution_phases, effective_config, effective_path = effective_run_config(
+                    config, prefix, state_dir, invocation_dir, timeout, args.selector, concurrency)
+                phases.update(resolution_phases)
+                if effective_config is not None:
+                    config = effective_config
+                    config_path = effective_path
+            snapshot_ok = config_snapshot_intact(phases, config_path, config)
+            if snapshot_ok:
+                phases[args.mode] = run_phase(tracks, args.mode, config_path, prefix, state_dir, invocation_dir,
+                                              timeout, args.selector, concurrency, args.yes)
+                snapshot_ok = config_snapshot_intact(phases, config_path, config)
+            if (args.run_data and snapshot_ok
+                    and all(item["status"] == "pass" for item in phases["deploy"].values())):
+                resolution_phases, effective_config, effective_path = effective_run_config(
+                    config, prefix, state_dir, invocation_dir, timeout, args.selector, concurrency, check_monitor=True)
+                phases.update(resolution_phases)
+                if effective_config is not None:
+                    config = effective_config
+                    config_path = effective_path
+                    monitor_settings = monitor_config(config) if "demo-2" in args.selector else None
+                    snapshot_ok = config_snapshot_intact(phases, config_path, config)
+                    if snapshot_ok:
+                        phases["validate-only"] = run_phase(tracks, "validate-only", config_path, prefix,
+                                                            state_dir, invocation_dir, timeout,
+                                                            args.selector, concurrency, False)
+                        snapshot_ok = config_snapshot_intact(phases, config_path, config)
+                if (snapshot_ok and "validate-only" in phases and
+                        all(item["status"] == "pass" and item["ready"] for item in phases["validate-only"].values())):
+                    monitor_ready = True
+                    if "demo-2" in args.selector:
+                        monitor_phases, monitor_ready, monitor_initial = start_monitor(
+                            config, config_path, prefix, state_dir, invocation_dir,
+                            timeout, args.selector, monitor_settings)
+                        phases.update(monitor_phases)
+                    if monitor_ready and not config_snapshot_intact(phases, config_path, config):
+                        if "demo-2" in args.selector:
+                            phases["stop-monitor"] = {"demo-2": stop_monitor(
+                                monitor_initial, config_path, prefix, state_dir, invocation_dir,
+                                timeout, args.selector, config)}
+                        monitor_ready = False
+                    if monitor_ready:
+                        phases["run-data"] = {"shared": invoke("shared", "run-data", config_path, prefix,
+                                                                state_dir, invocation_dir, run_timeout, args.selector)}
+                        if not config_snapshot_intact(phases, config_path, config):
+                            phases["run-data"]["shared"] = result(
+                                "shared", "run-data", "fail",
+                                "Configuration changed during producer execution; remote outcome is unconfirmed.")
+                        if phases["run-data"]["shared"]["status"] != "pass":
+                            print("Producer outcome is not confirmed; inspect remote job state. "
+                                  "A local failure or timeout does not prove termination.", file=sys.stderr)
+                        elif "demo-2" in args.selector:
+                            phases.update(wait_monitor(monitor_initial, config, config_path, prefix, state_dir,
+                                                       invocation_dir, timeout, args.selector, monitor_settings))
+    except (OSError, ValueError) as error:
+        print(f"Orchestration error: {error}", file=sys.stderr)
+        return 1
+    summary = {"contract_version": 1, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               "selected_demos": args.selector, "prefix": prefix, "phases": phases}
+    (invocation_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    print(f"Deployment state: {state_dir}; invocation: {invocation_dir}", file=sys.stderr)
+    success = all(item["status"] == "pass" for phase in phases.values() for item in phase.values())
+    if args.run_data and "run-data" not in phases:
+        print("Producer not started: deployment, readiness or monitor checks did not pass.", file=sys.stderr)
+        success = False
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

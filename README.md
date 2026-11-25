@@ -174,7 +174,10 @@ minus two hours. Demo 1's narrower runtime check uses the default 115-minute
 verification deadline; that is not permission to abandon the two-hour budget.
 Click earlier to allow for Fabric queueing and notebook startup: click time is
 not allocation time. A five-minute schedule keeps generating refresh workload
-while enabled, including between presentations. Capacity remains running at F32.
+while enabled, including between presentations. The capacity was scaled to
+F16 and read back Active at 09:26 UTC on November 25, 2026. The verified demo
+run used F32; a full run has not been tested at F16, where less compute may
+increase queueing or duration.
 The schedule expires without renewal; the Activator rule has **no automatic
 TTL** and needs an explicit owner stop. Keep both dependencies enabled and
 unchanged through the final run's verification and cleanup.
@@ -219,7 +222,7 @@ the owner must independently reconcile/drain owned jobs and locks, then
 journal-stop/read back the shared schedule and rule. Do this before leaving the
 setup unattended or at the operating-window expiry; the rule does not stop
 itself. Point-in-time drain checks do not prove Fabric event queues are empty
-or exclude external writers. Leave F32 running as requested.
+or exclude external writers. Leave F16 running as requested.
 The owner uses the original schedule setup config and journal with Demo 1's
 `managed_refresh.py status` and `stop --yes`, and the retained rebound inputs
 and cycle-7 journal with Demo 3's `native_rule.py --mode disable --cycle 7`

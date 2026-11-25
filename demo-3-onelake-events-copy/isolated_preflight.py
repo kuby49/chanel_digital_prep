@@ -1,6 +1,9 @@
 """Read-only evidence for a replacement; never authorizes publication."""
 
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from deploy import CandidateBlocked, _guid
 
@@ -11,6 +14,49 @@ _NOTEBOOK = "7d7f2229-4caf-409b-bee0-296d061e14ec"
 _PARENT_JOB = "30b42ef3-a8e9-47eb-83a9-f3782aa5e943"
 _NOTEBOOK_JOB = "caea88ad-08d0-4dac-b71f-eec1f3389463"
 _TERMINAL = {"Completed", "Failed", "Cancelled", "Canceled", "Deduped"}
+
+
+def require_f32(api, capacity_id):
+    """Read capacity state only; this controller never resizes or suspends it."""
+    capacity_id = _guid(capacity_id)
+    matches = [item for item in api.list("/v1/capacities") if item.get("id") == capacity_id]
+    if len(matches) != 1 or matches[0].get("state") != "Active" or matches[0].get("sku") != "F32":
+        raise CandidateBlocked("Replacement requires the configured capacity to be active F32.")
+    return {"capacity_id": capacity_id, "sku": "F32", "state": "Active"}
+
+
+def staging(api, producer_dir, config_path, prefix, state_dir):
+    """Resolve the producer's owned journal and check live staging identity."""
+    import isolated_candidate
+    import customer_preflight as original
+
+    path = Path(state_dir) / "shared-producer-v1.json"
+    before = path.read_bytes()
+    workspace_id, lakehouse_id = isolated_candidate._producer_ids(
+        producer_dir, config_path, prefix, state_dir)
+    if path.read_bytes() != before:
+        raise CandidateBlocked("Producer ownership journal changed during staging verification.")
+    state = json.loads(before.decode("utf-8"))
+    workspace, lakehouse = state["resources"]["workspace"], state["resources"]["staging_lakehouse"]
+    if (lakehouse_id == original.STAGING_LAKEHOUSE or state.get("tenant_id") != original.TENANT
+            or state.get("pending") is not None or workspace.get("id") != workspace_id
+            or lakehouse.get("id") != lakehouse_id or lakehouse.get("workspace_id") != workspace_id):
+        raise CandidateBlocked("Producer staging journal differs or points to the original staging Lakehouse.")
+    live_workspace = api.get("/v1/workspaces/" + workspace_id)
+    live_lakehouse = api.get(f"/v1/workspaces/{workspace_id}/lakehouses/{lakehouse_id}")
+    for live, expected in ((live_workspace, workspace), (live_lakehouse, lakehouse)):
+        if any(live.get(actual) != expected.get(recorded) for actual, recorded in (
+                ("id", "id"), ("displayName", "name"), ("type", "type"), ("description", "description"))):
+            raise CandidateBlocked("Producer staging live ownership readback differs.")
+    if (live_workspace.get("capacityId") != state.get("capacity_id")
+            or live_lakehouse.get("workspaceId") != workspace_id):
+        raise CandidateBlocked("Producer staging parent or capacity differs.")
+    require_f32(api, state["capacity_id"])
+    if path.read_bytes() != before:
+        raise CandidateBlocked("Producer ownership journal changed during staging verification.")
+    return {"workspace_id": workspace_id, "lakehouse_id": lakehouse_id,
+            "capacity_id": state["capacity_id"],
+            "journal_sha256": hashlib.sha256(before).hexdigest(), "ready": False}
 
 
 def _time(value):

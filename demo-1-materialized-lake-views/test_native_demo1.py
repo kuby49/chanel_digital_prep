@@ -278,6 +278,58 @@ class NativeDemo1Test(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     native_demo1.check_ready(self.context, prepared)
 
+    def test_admission_waits_for_active_lineage_then_rechecks(self):
+        self.fabric.jobs.append({"id": OWNER, "itemId": LAKEHOUSE, "status": "InProgress",
+                                 "startTimeUtc": self.now.isoformat()})
+        self.on_sleep = lambda: self.fabric.jobs[-1].update(status="Completed")
+        prepared = native_demo1.prepare(self.context)
+        self.assertEqual(prepared["status"], "ready")
+        self.assertEqual(self.now, datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=10))
+        self.fabric.jobs[-1]["status"] = "InProgress"
+        self.assertEqual(native_demo1.check_ready(self.context, prepared)["status"], "ready")
+
+    def test_admission_wait_stops_at_preparation_deadline(self):
+        self.context["preparation_deadline_utc"] = (self.now + timedelta(seconds=20)).isoformat()
+        self.fabric.jobs.append({"id": OWNER, "itemId": LAKEHOUSE, "status": "InProgress",
+                                 "startTimeUtc": self.now.isoformat()})
+        with self.assertRaises(RuntimeError):
+            native_demo1.prepare(self.context)
+        self.assertEqual(self.now, datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=20))
+        self.assertEqual(self.store.data, {})
+
+    def test_admission_does_not_wait_past_minimum_coverage(self):
+        self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=19)).isoformat()
+        self.fabric.jobs.append({"id": OWNER, "itemId": LAKEHOUSE, "status": "InProgress",
+                                 "startTimeUtc": self.now.isoformat()})
+        with self.assertRaisesRegex(RuntimeError, "fixed preparation and coverage bounds"):
+            native_demo1.prepare(self.context)
+        self.assertEqual(self.store.data, {})
+
+    def test_source_gate_rechecks_state_after_wait(self):
+        for variant in ("reused", "manifest", "disabled", "failed", "stop"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                prepared = native_demo1.prepare(self.context)
+                self.fabric.jobs.append({"id": OWNER, "itemId": LAKEHOUSE, "status": "InProgress",
+                                         "startTimeUtc": self.now.isoformat()})
+
+                def complete():
+                    self.fabric.jobs[-1]["status"] = "Completed"
+                    if variant == "reused":
+                        self.spark.bronze[f"{self.run_id}_0001"] = {"row_count": 1}
+                    elif variant == "manifest":
+                        self.manifest["batches"]["1"] = {}
+                    elif variant == "disabled":
+                        self.fabric.schedule["enabled"] = False
+                    elif variant == "failed":
+                        self.fabric.jobs[-1]["status"] = "Failed"
+                    else:
+                        self.stopped = True
+
+                self.on_sleep = complete
+                with self.assertRaises(RuntimeError):
+                    native_demo1.check_ready(self.context, prepared)
+
     def test_dimension_corruption_blocks(self):
         self.spark.bad_dimension = True
         with self.assertRaisesRegex(RuntimeError, "DimProduct"):

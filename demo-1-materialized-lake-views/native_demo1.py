@@ -200,11 +200,27 @@ def _schedule(context, binding, receipt):
     _check_live(live, receipt)
 
 
-def _admit(context, binding, receipt, start, end):
-    _schedule(context, binding, receipt)
-    if not _idle(_jobs(context, binding)):
-        raise RuntimeError("Demo 1 lineage refresh is active or unknown; no job ownership exemption is assumed")
-    _coverage(context, start, end)
+def _admit(context, binding, base, receipt, start, end):
+    while True:
+        _coverage(context, start, end)
+        _schedule(context, binding, receipt)
+        if _idle(_jobs(context, binding)):
+            _empty_manifest(context, binding)
+            _no_existing_batches(context, binding, base)
+            _coverage(context, start, end)
+            _schedule(context, binding, receipt)
+            if _idle(_jobs(context, binding)):
+                _coverage(context, start, end)
+                return
+        now = context["clock"]()
+        remaining = min(
+            _time(context["preparation_deadline_utc"]) - now,
+            _time(context["verification_deadline_utc"]) - now - MINIMUM_COVERAGE,
+            end - now - MINIMUM_COVERAGE,
+        ).total_seconds()
+        if remaining <= 0:
+            raise RuntimeError("Demo 1 lineage did not become idle within the fixed preparation and coverage bounds")
+        context["sleep"](min(10, remaining))
 
 
 def _coverage(context, start, end):
@@ -271,7 +287,7 @@ def prepare(context):
     _empty_manifest(context, binding)
     _dimensions(context, base)
     _no_existing_batches(context, binding, base)
-    _admit(context, binding, receipt, start, end)
+    _admit(context, binding, base, receipt, start, end)
     _write(context, _path(binding), {"contract_version": 1, "binding": binding,
            "schedule_id": receipt["schedule_id"], "status": "prepared", "prepared_at_utc": _stamp(context["clock"]())})
     return {"status": "ready", "run_id": binding["run_id"], "schedule_id": receipt["schedule_id"],
@@ -285,7 +301,7 @@ def check_ready(context, prepared):
         raise RuntimeError("Demo 1 run was already verified or stopped")
     _empty_manifest(context, binding)
     _no_existing_batches(context, binding, base)
-    _admit(context, binding, receipt, start, end)
+    _admit(context, binding, base, receipt, start, end)
     return {"status": "ready", "run_id": binding["run_id"], "schedule_id": receipt["schedule_id"],
             "verification_deadline_utc": context["verification_deadline_utc"], "schedule_end_utc": _stamp(end)}
 

@@ -213,8 +213,11 @@ Admission checks the original 365/20/100 dimension keys and labels, matching
 tenant/principal/target/landing, no pre-existing facts for this fresh run's
 BatchIDs, one matching enabled schedule, no enabled/unknown competitors, and
 successful idle lineage history. **No active job is assumed to belong to this
-run or exempted because it is scheduled.** A scheduled refresh already active
-at admission blocks that click; the hook does not wait or cancel it.
+run or exempted because it is scheduled.** An active or unknown lineage job
+is allowed to finish without cancellation; admission waits only within the
+fixed preparation deadline and required schedule/verification coverage.
+It rechecks the empty manifest, absent run BatchIDs, schedule and idle lineage
+after waiting. If those checks or the bounds fail, the click is blocked.
 `prepare` conditionally creates and reads back
 `Files/producer/runs/<run_id>/demo1/schedule.json`. That per-run record pins the
 receipt, data, target and all fixed deadlines. `check_ready` checks those pins,

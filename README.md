@@ -10,14 +10,22 @@ ten event-origin Copy audits reported 1,000 rows each, zero row differences
 and zero orphans, and were independently reread. The Demo 1 schedule and Demo 3
 rule were stopped and read back after the run. A further
 launch requires fresh bounded setup and admission; repeated live runs remain
-unverified. Demo 1's SQL endpoint was stale even though direct Spark and Delta
-checks passed. Demo 3 event-queue drainage and exclusion of external writers
-remain unverified.
+unverified. **Clicking Run again from this stopped state is not sufficient**:
+an operator must prepare and export a fresh bounded Demo 1 schedule, enable a
+new journaled Demo 3 rule cycle, and publish a profile containing the new
+schedule receipt before invoking the pipeline. The native hooks check these
+prerequisites; they do not restart them. Demo 1's SQL endpoint was stale even
+though direct Spark and Delta checks passed, so its SQL endpoint cannot yet be
+relied on for the intended live presentation. Demo 3 event-queue drainage and
+exclusion of external writers remain unverified.
 
 For Demo 3, manifest `verified_at_utc` records landing CSV verification, not
 Copy completion or target visibility. The measured Copy activity completions
 and subsequent successful Spark-read audits are retained separately; service
 event-arrival and independent SQL-visibility timestamps were not exposed.
+Producer-clock staged-creation timestamps ran from 01:52:00.610 to
+02:01:03.964 UTC, with successive gaps of 60.345–60.406 seconds. They are not
+destination publication or query-visibility timestamps.
 
 Reusable producer and track lifecycle hooks and the Demo 3 publisher are
 integrated. The older prepared profile is single-use and requires a
@@ -143,7 +151,7 @@ Local validation results coordinate checks; they are not authenticated proof or 
 
 ### Spark high-concurrency sessions
 
-Spark notebooks in the shared producer, Demo 2 verifier/monitor, and Demo 3 setup enable Fabric's high-concurrency setting. This is not runtime proof: session reuse requires compatible runs within Fabric's supported boundaries, and pipeline-triggered notebooks may need the workspace pipeline setting and matching session tags. The successful producer run used Livy session `4992c136-c577-4f38-917a-4b5e102a8604`, reported `isHighConcurrency:false`, and used Spark application `application_1795570429201_0001`; the replacement workspace's pipeline high-concurrency setting was disabled at the later readback. Demo 1's owner reports an isolated Livy probe where two high-concurrency IDs with the same tag shared one Livy session ID with distinct REPL IDs; this verifies interactive Spark verification, not scheduled MLV refresh. Demo 2's two concurrent verifier jobs reported `isHighConcurrency:false` despite the notebook property; its owner-created workspace still has pipeline high concurrency disabled, and the monitor uses on-demand notebook jobs rather than pipeline activities. Read-only reconciliation confirmed two distinct settings changes: `chanel-demo-data-generator` (workspace `48593f2f-d3ac-474b-ba96-08282d6f69df`) has pipeline high concurrency enabled after a one-property change with a full before/after snapshot; `chanel-demo3-copy-events` (workspace `744223de-ceab-4c4f-82ba-f811bcb5c7d7`) also has it enabled after a separate one-property change, but its full before snapshot and comprehensive usage inventory were not retained. Three exactly matched Demo 3 guard activities reported `isHighConcurrency:true` and `Notebook HC Pipeline Run`; the other 17 guard activity session associations are unknown. No session reuse is inferred from those records. Capture actual session type and IDs for each supported path, and claim reuse only when compatible activities share a session ID. If an activity cannot use the supported high-concurrency path, document its actual mode and the limitation. See the [high-concurrency course correction and safeguards](SPECIFICATION.md#13-user-decisions-and-course-corrections).
+Spark notebooks in the shared producer, Demo 2 verifier/monitor, and Demo 3 setup enable Fabric's high-concurrency setting. This is not runtime proof: session reuse requires compatible runs within Fabric's supported boundaries, and pipeline-triggered notebooks may need the workspace pipeline setting and matching session tags. The successful producer run used Livy session `4992c136-c577-4f38-917a-4b5e102a8604`, reported `isHighConcurrency:false`, and used Spark application `application_1795570429201_0001`. The replacement workspace's pipeline high-concurrency setting was subsequently enabled, with all other Spark settings unchanged. A completed no-sales pipeline probe then reported `isHighConcurrency:true` for Livy session `bdd2e022-a7ea-48f3-8336-9bd9d3f3a85d`; this does not change the measured run's observed mode or prove session reuse. Demo 1's owner reports an isolated Livy probe where two high-concurrency IDs with the same tag shared one Livy session ID with distinct REPL IDs; this verifies interactive Spark verification, not scheduled MLV refresh. Demo 2's two concurrent verifier jobs reported `isHighConcurrency:false` despite the notebook property; its owner-created workspace still has pipeline high concurrency disabled, and the monitor uses on-demand notebook jobs rather than pipeline activities. Read-only reconciliation confirmed two distinct settings changes: `chanel-demo-data-generator` (workspace `48593f2f-d3ac-474b-ba96-08282d6f69df`) has pipeline high concurrency enabled after a one-property change with a full before/after snapshot; `chanel-demo3-copy-events` (workspace `744223de-ceab-4c4f-82ba-f811bcb5c7d7`) also has it enabled after a separate one-property change, but its full before snapshot and comprehensive usage inventory were not retained. Three exactly matched Demo 3 guard activities reported `isHighConcurrency:true` and `Notebook HC Pipeline Run`; the other 17 guard activity session associations are unknown. No session reuse is inferred from those records. Capture actual session type and IDs for each supported path, and claim reuse only when compatible activities share a session ID. If an activity cannot use the supported high-concurrency path, document its actual mode and the limitation. See the [high-concurrency course correction and safeguards](SPECIFICATION.md#13-user-decisions-and-course-corrections).
 
 High concurrency is only a possible Spark startup optimization. It does not fix or prove Demo 3 event delivery, Activator execution, Copy completion, missed-event recovery, or SQL freshness; treat any Demo 3 improvement as a hypothesis until measured independently.
 

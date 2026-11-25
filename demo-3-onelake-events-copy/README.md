@@ -358,6 +358,11 @@ use cycle 4 and the same rebound inputs and proof. Each cycle has its own
 uses the same one-shot enable, readback, reconcile, disable and drain checks.
 Do not overwrite existing journals or enable before coordination.
 
+For ownership and job inventory, a Fabric Wabi redirect continuation is
+accepted only when its collection path and sole opaque token match the response.
+The next page is requested through `api.fabric.microsoft.com`, not the redirect
+host. Missing, mismatched or repeated continuations block readiness and drain.
+
 ETags and hashes are point-in-time checks, not WORM guarantees. An outside
 writer can alter source bytes between guard validation and the Copy's later
 filename read. The checks do not prove external-writer exclusion, event-queue

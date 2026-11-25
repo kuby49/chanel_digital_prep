@@ -39,6 +39,42 @@ marker. The Lakehouse and its readback must name the owned workspace. A confirme
 workflow only after independently establishing creation and readback; it must
 not be fabricated from the preflight observations.
 
+### Isolated replacement candidate
+
+`isolated_candidate.build_candidate(spec, producer_dir, copy_activity, source_sample)`
+builds definitions in memory only, with `ready: false`. It does not create,
+publish, authorize or verify anything. Supply canonical IDs for `tenant_id`,
+`owner_id`, `workspace_id`, `lakehouse_id`, `notebook_id`, `pipeline_id`,
+`reflex_id`, `connection_id`, `producer_workspace_id`, and
+`producer_lakehouse_id`, plus `prefix`, `lakehouse_name` and `native_policy`.
+It rejects the original target items and owner marker, different
+producer staging, inconsistent Copy endpoints and an event from another source.
+The supplied Copy template must satisfy the exact-file, mappings and Upsert
+requirements of `guarded_pipeline.build_pipeline`. The rule is disabled.
+Returned hashes identify the generated definitions and producer files; they do
+not attest to their ownership, validity or observed deployment. Generated
+Activator entity IDs vary between builds, so retain the reviewed candidate.
+An invented test event is useful only for local tests, not source validation.
+
+A separate Lakehouse isolates its Delta data and cooperative lock; it is a
+fresh demonstration, **not recovery of the original run**. Shared capacity is
+not compute isolation. Before any future deployment, in order:
+
+1. Reconcile the original parent and any possible writers; preserve the old
+   lock and incident evidence. Obtain explicit coordinated authorization.
+2. Establish independent ownership and live readback of new resources and
+   access. Verify a schema-enabled Lakehouse, fact protocol, dimensions and
+   Lakehouse connection. Shell provisioning alone is not readiness.
+3. Capture a real representative `FileCreated` event from the new target.
+   Review a candidate and a purpose-built journaled publisher/controller;
+   the existing native publishers and preflights are bound to original IDs.
+4. Publish only under separate authorization and read back the notebook,
+   pipeline and complete disabled rule against the reviewed definitions.
+   Independently verify permissions, job inventory, locks and writer exclusion.
+5. Bind the shared producer and fresh run to the new target with its own
+   evidence and journal. Require separate coordinated approval before enabling
+   admission or launching; verify actual delivery afterward.
+
 The shared producer's v1 CSV has the header
 `SalesLineID,BatchID,SaleTimestamp,CustomerID,ProductID,Date,Quantity,UnitPriceMinorUnits,SalesAmountMinorUnits`.
 Consume the same immutable bytes and manifest as the other demos; do not generate

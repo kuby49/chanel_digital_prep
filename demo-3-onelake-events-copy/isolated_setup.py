@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 
 import customer_preflight as original
+import isolated_preflight
 import ownership
 import setup_notebook
 from deploy import CandidateBlocked
@@ -16,6 +17,7 @@ def prepare(config, prefix, state_dir, api, producer_dir):
     lakehouse_id = state["lakehouse"]["id"]
     if lakehouse_id == original.LAKEHOUSE or state["owner"]["marker"] == original.MARKER:
         raise CandidateBlocked("Replacement setup cannot bind the original target or owner marker.")
+    isolated_preflight.require_f32(api, state["deployment_spec"]["capacity_id"])
     source = (Path(producer_dir) / "generator.py").read_bytes()
     notebook = setup_notebook.build_notebook(
         source.decode("utf-8"), config, workspace_id, lakehouse_id,

@@ -98,9 +98,38 @@ it explicitly leaves runtime identity and target access unverified.
 
 A separate Lakehouse isolates its Delta data and cooperative lock; it is a
 fresh demonstration, **not recovery of the original run**. Shared capacity is
-not compute isolation. There is currently no journaled new-target publisher
-or reconciler: the existing publishers must not be pointed at the new IDs.
-Before any future deployment, in order:
+not compute isolation. The existing original-target publishers must not be
+pointed at the new IDs. `isolated_items.create_item` can create individually
+approved, owned setup notebook, guard notebook and pipeline shells, followed
+by a Reflex shell only after the operator confirms a real new-target event was
+observed. It records an intent before each create; `isolated_items.reconcile`
+only reads back a pending create and never resubmits it. The event sample hash
+binds the candidate to that operator-supplied observation; it is not itself
+proof that the event occurred.
+
+With all four owned shells and a reviewed candidate, `isolated_publish.Publisher`
+can publish the setup notebook, guard notebook and pipeline definitions one at
+a time with `approved=True`, journal each intent and acceptance, and compare
+complete readbacks. `reconcile()` only polls or reads back; an unrecorded
+acceptance remains blocked and is never resubmitted. These operations remain
+unready and require an exclusive operator: the platform update is not
+conditional on the preceding readback. They check fresh parent job linkage,
+owned target and staging readbacks, connection and caller role, target jobs,
+schedules and lock. They require the configured target and staging capacities
+to be active F32 immediately before writes. The capacity must remain F32
+indefinitely; these controllers never resize or suspend it and cannot prevent
+another actor changing it. The item and publication workflows have only been
+tested locally, not against the replacement's live items.
+
+Publishing even the **disabled** Reflex remains blocked. `isolated_access.assess`
+can inspect a controlled job's linkage but cannot prove the executed definition,
+runtime token principal or target read/write from current evidence. A separate
+approved F32 job must read a dedicated new-staging probe, write and read a
+non-admitting object in the new target, and provide authoritative, independently
+verifiable job-linked definition, identity and results. Establish connection
+credential identity and actual Copy behavior separately. No proof writer,
+rule enablement or live readiness is implied. Before any future deployment,
+coordinate the sequence and authorization, in order:
 
 1. Reconcile the original parent and any possible writers; preserve the old
    lock and incident evidence. Obtain explicit coordinated authorization.

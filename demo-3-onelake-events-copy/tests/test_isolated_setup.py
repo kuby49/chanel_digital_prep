@@ -27,9 +27,12 @@ class IsolatedSetupTests(unittest.TestCase):
         self.workspace, self.lakehouse = str(uuid.uuid4()), str(uuid.uuid4())
         self.owner = {"workspace": {"id": self.workspace}, "lakehouse": {"id": self.lakehouse},
                       "owner": {"marker": "new-demo3-" + str(uuid.uuid4())},
-                      "deployment_spec": {"lakehouse_name": "Replacement"}}
+                      "deployment_spec": {"lakehouse_name": "Replacement", "capacity_id": str(uuid.uuid4())}}
         self.config = {"contract_version": 1, "data": {"start_date": "2026-01-01",
                        "date_count": 365, "product_count": 20, "customer_count": 100, "seed": 42}}
+        capacity = mock.patch.object(isolated_setup.isolated_preflight, "require_f32")
+        capacity.start()
+        self.addCleanup(capacity.stop)
 
     def test_setup_requires_owned_readback_and_pins_context_before_execution(self):
         with mock.patch.object(isolated_setup.ownership, "provision", return_value=self.owner) as verify:

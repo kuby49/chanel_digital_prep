@@ -64,6 +64,13 @@ The default one-minute source cadence is not a downstream visibility guarantee. 
 
 Copy `config.example.json` to a private, untracked location and fill in the resolved IDs, names, feature settings and bounded run parameters. The `workspace_name` defaults contain `{prefix}`; each track expands it using the effective `--prefix`. The config is version 1 and consists of shared `environment`, `tenant_id`, `subscription_id`, `capacity`, `authentication`, `execution`, and `data` objects and `demo-1`, `demo-2`, `demo-3`, and `shared` track objects. Each demo's `verification_timeout_seconds` applies per batch and takes precedence over `execution.verification_timeout_seconds`; `execution.poll_interval_seconds` controls validation polling. Null IDs must be resolved and recorded by each track before it reports readiness. Configuration may contain secret **references**, never tokens or secret values. State files and logs must contain only sanitized data.
 
+For native Demo 1, set `shared.notebook_default_lakehouse` to a schema-enabled
+Lakehouse using an object with `workspace_id`, `lakehouse_id` and
+`lakehouse_name`; IDs must be canonical nonzero UUIDs. The default is verified
+independently of the producer staging Lakehouse, whose explicit paths and IDs
+remain unchanged. Omit the option to retain the staging default; `null` is not
+valid. A non-schema default cannot execute Demo 1's four-part Spark names.
+
 Use the signed-in MCAP identity where supported. Before invoking Azure CLI-backed operations, check any existing `AZURE_CONFIG_DIR` and confirm whether to keep or override a conflicting value; set `$env:AZURE_CONFIG_DIR = "$HOME\.azure-mcap"` only in the authorized PowerShell process. Verify the active tenant, subscription and capacity. The configured identity alone does not grant cross-workspace permissions. The user has approved access and other changes needed for live testing; determine and record the least-privilege scope before making changes. All feature, permission, API-coverage and charge checks in the specification remain required.
 
 ### Current preflight limits

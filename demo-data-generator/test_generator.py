@@ -187,6 +187,23 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pipeline_definition("not-an-id", notebook_id)
 
+    def test_pipeline_serializes_json_parameters_for_ui_run(self):
+        workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        notebook_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        for native_profile in (None, {"version": 2, "run_window_seconds": 7200,
+                                     "activity_timeout": "0.02:15:00"}):
+            with self.subTest(native_profile=native_profile):
+                definition = pipeline_definition(workspace, notebook_id, native_profile=native_profile)
+                pipeline = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+                params = pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]
+                for name in ("runtime_evidence_json", "run_config_json", "selected_demos_json"):
+                    self.assertEqual(params[name], {
+                        "type": "string",
+                        "value": {"type": "Expression", "value": f"@string(pipeline().parameters.{name})"},
+                    })
+                self.assertEqual(params["operation"]["value"]["value"], "@pipeline().parameters.operation")
+                self.assertEqual(params["probe_id"]["value"]["value"], "@pipeline().parameters.probe_id")
+
     def test_schema_catalog_binding_keeps_staging_and_environment_explicit(self):
         workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         staging = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

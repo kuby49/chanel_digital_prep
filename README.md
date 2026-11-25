@@ -133,8 +133,12 @@ The default one-minute source cadence is not a downstream visibility guarantee. 
 The prepared recovery entry point is
 [producer_wrapper_recovery](https://app.fabric.microsoft.com/groups/68971aa2-f4bc-48a2-8962-98a4cb1e9fc2/pipelines/2f42bac0-ccc3-4efc-8ff3-787fc93f3827?experience=power-bi).
 Sign in to MCAP. Opening this pipeline, its **Home** toolbar and **Run**
-control has been observed in the signed-in browser; pressing that UI control
-has not been verified. The two unchanged-profile repeat tests used the Jobs API.
+control has been observed in the signed-in browser. Reported UI Run attempts
+reached the pipeline but were rejected before notebook startup because JSON
+objects and arrays were forwarded as string parameters. The pipeline now
+explicitly serializes those JSON parameters at the notebook boundary.
+A successful UI Run has not been verified. The two unchanged-profile repeat
+tests used the Jobs API.
 
 **Prepared window, UTC:** 2026-11-25 07:42:33 through 2026-11-26 07:42:33.
 Allocate the final run no later than **2026-11-26 05:42:33 UTC** to preserve
@@ -146,7 +150,7 @@ writer locks absent. The capacity was Active at F32. The new profile then
 completed the API default run described above; a post-run readback at 08:56 UTC
 confirmed both dependencies remained enabled and the launcher was idle.
 These observations are point-in-time; runtime admission is checked again for
-each Run. Clicking Run in the UI remains unverified.
+each Run. A successful Run from the UI remains unverified.
 
 The schedule generates recurring refresh workload, including between
 presentations, until it is stopped or its fixed end passes. It does not renew

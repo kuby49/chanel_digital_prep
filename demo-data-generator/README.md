@@ -1,5 +1,13 @@
 # Shared data producer
 
+The pipeline explicitly serializes `runtime_evidence_json`, `run_config_json`
+and `selected_demos_json` with Fabric's `string(...)` expression before passing
+them to the notebook. The UI can supply `{}` and `[]` as objects and arrays
+even when the pipeline parameters are declared strings; direct forwarding
+then fails notebook-service parameter conversion before any notebook starts.
+Already serialized API values remain strings. Notebook JSON parsing and
+runtime admission checks are unchanged.
+
 The producer defines **CSV contract v1**: UTF-8, comma-delimited, a header,
 minimal RFC 4180 quoting, LF line endings, no nulls, ISO dates and UTC
 timestamps ending in `Z`. Amounts are integer USD cents and

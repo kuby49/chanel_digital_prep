@@ -22,9 +22,9 @@
           "parameters": {
             "operation": {"value": {"value": "@pipeline().parameters.operation", "type": "Expression"}, "type": "string"},
             "probe_id": {"value": {"value": "@pipeline().parameters.probe_id", "type": "Expression"}, "type": "string"},
-            "runtime_evidence_json": {"value": {"value": "@pipeline().parameters.runtime_evidence_json", "type": "Expression"}, "type": "string"},
-            "run_config_json": {"value": {"value": "@pipeline().parameters.run_config_json", "type": "Expression"}, "type": "string"},
-            "selected_demos_json": {"value": {"value": "@pipeline().parameters.selected_demos_json", "type": "Expression"}, "type": "string"}
+            "runtime_evidence_json": {"value": {"value": "@string(pipeline().parameters.runtime_evidence_json)", "type": "Expression"}, "type": "string"},
+            "run_config_json": {"value": {"value": "@string(pipeline().parameters.run_config_json)", "type": "Expression"}, "type": "string"},
+            "selected_demos_json": {"value": {"value": "@string(pipeline().parameters.selected_demos_json)", "type": "Expression"}, "type": "string"}
           }
         }
       }

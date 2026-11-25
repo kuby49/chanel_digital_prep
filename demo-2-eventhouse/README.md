@@ -126,6 +126,12 @@ selected destination. `submitted` means queued, not ingested.
    verifiers are admitted by earliest deadline, with numeric batch order for
    ties, independently of manifest JSON key order. This does not extend any
    deadline or guarantee sufficient Spark throughput for the producer cadence.
+   The durable monitor state records verifier submission/acceptance times and
+   bounded job-poll observations (request/response times, status, retry delay
+   and whether it came from a response header, fallback or throttling). It
+   retains the first 16 and latest 48 polls per job, with an explicit omitted
+   count when the bound is exceeded. These observations support capacity and
+   queue diagnosis; they do not prove Spark session reuse or relax deadlines.
 4. Confirm the monitor's terminal completion and per-batch outcomes. Each
    measured batch must have matching terminal ingestion evidence, KQL
    reconciliation, all three dimension joins, exact decimals and grouped

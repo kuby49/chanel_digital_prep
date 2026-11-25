@@ -20,6 +20,7 @@ SENTINEL_SHA256 = "aea6faa895eae3072bb28cfacf732a93cfd9968fc8d2c6d2675f415278d6f
 FABRIC = "https://api.fabric.microsoft.com"
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 TERMINAL_JOBS = {"Completed", "Failed", "Cancelled", "Deduped"}
+POLL_STATUSES = TERMINAL_JOBS | {"NotStarted", "InProgress", "Throttled", "Error"}
 
 
 class MonitorError(RuntimeError):
@@ -27,8 +28,9 @@ class MonitorError(RuntimeError):
 
 
 class RetryLater(MonitorError):
-    def __init__(self, seconds):
+    def __init__(self, seconds, source="fallback"):
         self.seconds = seconds
+        self.source = source
         super().__init__("The service requested a later retry")
 
 
@@ -468,32 +470,58 @@ class Controller:
             return
         if now < _utc(record["next_poll_utc"], "job next poll"):
             return
+        started = self.clock()
         try:
-            job, retry_after = self.client.job(record["job_id"])
+            job, retry_after, retry_source = self.client.job(record["job_id"])
         except RetryLater as exc:
-            record["next_poll_utc"] = _stamp(now + timedelta(seconds=exc.seconds))
+            finished = self._observe_poll(record, started, "Throttled", exc.seconds, f"throttle_{exc.source}")
+            record["next_poll_utc"] = _stamp(finished + timedelta(seconds=exc.seconds))
             return
+        except MonitorError:
+            self._observe_poll(record, started, "Error", None, "request_error")
+            raise
+        finished = self._observe_poll(record, started, job.get("status"), retry_after, retry_source)
         if job.get("status") == "Completed":
             _exit(job, mode, expected)
             record["status"] = "spark_verified"
         elif job.get("status") in ("Failed", "Cancelled", "Deduped"):
             raise MonitorError(f"A {mode} notebook ended in state {job['status']}")
         elif job.get("status") in ("NotStarted", "InProgress"):
-            record["next_poll_utc"] = _stamp(now + timedelta(seconds=retry_after))
+            record["next_poll_utc"] = _stamp(finished + timedelta(seconds=retry_after))
         else:
             raise MonitorError("Verification notebook returned an unknown job state")
+
+    def _observe_poll(self, record, started, status, retry_after, source):
+        finished = self.clock()
+        observations = record.setdefault("verification_poll_observations", [])
+        if len(observations) == 64:
+            del observations[16]
+            record["verification_polls_omitted"] = record.get("verification_polls_omitted", 0) + 1
+        observations.append({
+            "started_at_utc": _stamp(started),
+            "finished_at_utc": _stamp(finished),
+            "status": status if isinstance(status, str) and status in POLL_STATUSES else "Unknown",
+            "retry_after_seconds": retry_after,
+            "retry_after_source": source,
+        })
+        return finished
 
     def _launch(self, record, mode, value, deadline, now):
         remaining = math.floor((deadline - now).total_seconds())
         if remaining < 1:
             raise MonitorError("Verification deadline expired before a notebook could be submitted")
         record["status"] = "submitting"
+        record["verification_submit_started_at_utc"] = _stamp(now)
         self._save()
-        job_id, retry_after = self.client.start_job(mode, value, remaining, self.cfg["poll"])
+        job_id, retry_after, retry_source = self.client.start_job(mode, value, remaining, self.cfg["poll"])
+        accepted = self.clock()
         record.update({
             "status": "running",
             "job_id": _uuid(job_id, "verification job ID"),
-            "next_poll_utc": _stamp(self.clock() + timedelta(seconds=retry_after)),
+            "verification_job_accepted_at_utc": _stamp(accepted),
+            "verification_initial_retry_after_seconds": retry_after,
+            "verification_initial_retry_after_source": retry_source,
+            "next_poll_utc": _stamp(accepted + timedelta(seconds=retry_after)),
         })
         self._save()
 
@@ -722,11 +750,8 @@ class FabricClient:
             if missing and exc.code == 404:
                 return 404, {}, None
             if exc.code == 429 and method == "GET":
-                try:
-                    delay = max(1, int(exc.headers.get("Retry-After", self.cfg["poll"])))
-                except ValueError:
-                    delay = self.cfg["poll"]
-                raise RetryLater(delay) from exc
+                delay, source = self._retry_after(exc.headers)
+                raise RetryLater(delay, source) from exc
             raise MonitorError(f"{audience} {method} returned HTTP {exc.code}") from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise MonitorError(f"{audience} {method} could not be confirmed") from exc
@@ -816,14 +841,15 @@ class FabricClient:
         if status != 202 or not location.startswith(prefix):
             raise MonitorError("Verification job submission could not be reconciled")
         job_id = _uuid(location[len(prefix):], "verification job ID")
-        return job_id, self._retry_after(headers)
+        retry_after, source = self._retry_after(headers)
+        return job_id, retry_after, source
 
     def _retry_after(self, headers):
-        value = next((value for key, value in headers.items() if key.lower() == "retry-after"), self.cfg["poll"])
+        value = next((value for key, value in headers.items() if key.lower() == "retry-after"), None)
         try:
-            return max(1, int(value))
+            return max(1, int(value)), "header"
         except (TypeError, ValueError):
-            return self.cfg["poll"]
+            return self.cfg["poll"], "fallback"
 
     def job(self, job_id):
         job_id = _uuid(job_id, "verification job ID")
@@ -838,7 +864,8 @@ class FabricClient:
             raise MonitorError("Verification job readback is invalid") from exc
         if job.get("id", "").lower() != job_id or job.get("itemId", "").lower() != self.cfg["notebook_id"]:
             raise MonitorError("Verification job readback does not match its owned identity")
-        return job, self._retry_after(headers)
+        retry_after, source = self._retry_after(headers)
+        return job, retry_after, source
 
     def cancel_job(self, job_id):
         job_id = _uuid(job_id, "verification job ID")

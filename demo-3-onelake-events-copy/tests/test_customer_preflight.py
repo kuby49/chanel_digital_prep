@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import activator
@@ -121,6 +122,68 @@ class CustomerPreflightTests(unittest.TestCase):
         store.read.side_effect = RuntimeError("access denied")
         with self.assertRaisesRegex(RuntimeError, "access denied"):
             preflight._absent(store, preflight.LOCK_PATH)
+
+    def test_wabi_continuation_is_replayed_only_via_trusted_api(self):
+        collection = "/v1/workspaces/workspace/items/notebook/jobs/instances"
+        token = "opaque+/=token"
+        query = urlencode({"continuationToken": token})
+        api = mock.Mock()
+        api.get.side_effect = [
+            {"value": [{"status": "Completed"}], "continuationToken": token,
+             "continuationUri": f"https://wabi-west-us3-a-primary-redirect.analysis.windows.net{collection}?{query}"},
+            {"value": [{"status": "InProgress"}]},
+        ]
+        jobs = list(preflight._inventory(api, collection + "?jobType=RunNotebook"))
+        self.assertEqual([job["status"] for job in jobs], ["Completed", "InProgress"])
+        self.assertEqual(api.get.call_args_list, [
+            mock.call(collection + "?jobType=RunNotebook", skill="spark-cli"),
+            mock.call(collection + "?" + query, skill="spark-cli"),
+        ])
+
+    def test_untrusted_or_incomplete_wabi_continuation_blocks(self):
+        collection = "/v1/workspaces/workspace/items/notebook/jobs/instances"
+        host = "wabi-west-us3-a-primary-redirect.analysis.windows.net"
+        cases = [
+            (f"https://attacker.example{collection}?continuationToken=token", "token"),
+            (f"http://{host}{collection}?continuationToken=token", "token"),
+            (f"https://user@{host}{collection}?continuationToken=token", "token"),
+            (f"https://{host}{collection}/other?continuationToken=token", "token"),
+            (f"https://{host}{collection}?continuationToken=other", "token"),
+            (f"https://{host}{collection}?continuationToken=token&other=1", "token"),
+            (f"https://{host}{collection}?continuationToken=token&continuationToken=token", "token"),
+            (f"https://{host}{collection}?continuationToken=token#fragment", "token"),
+            (f"https://{host}{collection}?continuationToken=token", None),
+        ]
+        for uri, token in cases:
+            with self.subTest(uri=uri, token=token):
+                api = mock.Mock()
+                api.get.return_value = {"value": [], "continuationUri": uri, "continuationToken": token}
+                with self.assertRaisesRegex(deploy.CandidateBlocked, "Untrusted Fabric continuation"):
+                    list(preflight._inventory(api, collection))
+                api.get.assert_called_once_with(collection, skill="spark-cli")
+        api = mock.Mock()
+        api.get.return_value = {"value": [], "continuationToken": "token"}
+        with self.assertRaisesRegex(deploy.CandidateBlocked, "Incomplete Fabric pagination"):
+            list(preflight._inventory(api, collection))
+
+    def test_existing_api_continuation_and_pagination_cycle_handling(self):
+        collection = "/v1/workspaces/workspace/items"
+        continuation = f"https://api.fabric.microsoft.com{collection}?continuationToken=token"
+        api = mock.Mock()
+        api.get.side_effect = [
+            {"value": [{"id": "first"}], "continuationToken": "token", "continuationUri": continuation},
+            {"value": [{"id": "second"}]},
+        ]
+        self.assertEqual([item["id"] for item in preflight._inventory(api, collection)], ["first", "second"])
+        api.get.assert_called_with(continuation, skill="spark-cli")
+        wabi = (f"https://wabi-west-us3-a-primary-redirect.analysis.windows.net{collection}"
+                "?continuationToken=token")
+        api.get.side_effect = [
+            {"value": [], "continuationToken": "token", "continuationUri": wabi},
+            {"value": [], "continuationToken": "token", "continuationUri": wabi},
+        ]
+        with self.assertRaisesRegex(deploy.CandidateBlocked, "Incomplete Fabric inventory"):
+            list(preflight._inventory(api, collection))
 
     def test_storage_uses_bounded_shared_cli_and_preserves_tenant_check(self):
         credential = {"tenant": preflight.TENANT, "accessToken": "synthetic-storage"}

@@ -5,9 +5,11 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import guarded_notebook
 import guarded_pipeline
@@ -39,6 +41,7 @@ FRESH_RUN_ID = "customer_demo_20261124_dc2792654b5b"
 NATIVE_JOURNAL = "demo3-native-binding-state.json"
 TERMINAL = {"Completed", "Failed", "Cancelled", "Canceled", "Deduped"}
 LANDING = f"abfss://{WORKSPACE}@onelake.dfs.fabric.microsoft.com/{LAKEHOUSE}/Files/incoming/sales"
+_WABI_REDIRECT = re.compile(r"wabi-[a-z0-9-]+-redirect\.analysis\.windows\.net\Z")
 
 
 def _require(condition, message):
@@ -69,6 +72,7 @@ def binding_journal(config):
 
 def _inventory(api, path, skill="spark-cli"):
     visited = set()
+    collection_path = urlsplit(path).path
     while path:
         _require(path not in visited and len(visited) < 100, "Incomplete Fabric inventory.")
         visited.add(path)
@@ -77,6 +81,20 @@ def _inventory(api, path, skill="spark-cli"):
         yield from page["value"]
         path = page.get("continuationUri")
         _require(not page.get("continuationToken") or path, "Incomplete Fabric pagination.")
+        if path:
+            _require(isinstance(path, str), "Invalid Fabric continuation.")
+            parts = urlsplit(path)
+            if parts.hostname and parts.hostname != "api.fabric.microsoft.com":
+                token = page.get("continuationToken")
+                _require(
+                    parts.scheme == "https" and parts.netloc == parts.hostname
+                    and _WABI_REDIRECT.fullmatch(parts.hostname) is not None
+                    and parts.path == collection_path and not parts.fragment
+                    and isinstance(token, str) and bool(token)
+                    and parse_qsl(parts.query, keep_blank_values=True) == [("continuationToken", token)],
+                    "Untrusted Fabric continuation.",
+                )
+                path = collection_path + "?" + urlencode({"continuationToken": token})
 
 
 def _owned(api, path, name, item_id, skill="spark-cli"):

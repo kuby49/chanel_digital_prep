@@ -1,19 +1,21 @@
 # Demo 1: file-backed materialized lake views
 
-**Status: one-file admission verified; recurring admission is locally tested.**
-The read-only `validate-only` path checks the original owned journal, target,
-access, dimensions, existing outputs and native refresh state. The recurring
-10-file path additionally requires an owned bounded schedule and has not been
-verified on the fresh cloud target. Neither admission establishes new delivery
-or measured ten-file acceptance. Live validation created the isolated
+**Status: the bounded ten-file native demo was verified on the prepared target.**
+The 2026-11-25 presenter-profile run independently reconciled ten manifest
+batches, 10,000 rows and 1,502,033,495 minor units in both Bronze and Silver.
+This was on F32; the full run has not been tested after the capacity was
+scaled to F16. The read-only `validate-only` path checks the owned journal,
+target, access, dimensions, existing outputs and native refresh state; admission
+alone does not establish delivery for a future run.
+
+Earlier live validation created the isolated
 `chanel-demo1-mlv` workspace on the MCAP F8 capacity, a schema-enabled
 `ChanelDemo1Lakehouse`, Bronze/Silver schemas, and static dimensions. Spark
 readback confirmed 365 unique non-null date keys, 20 product keys, and 100
 customer keys. A separate header-only bootstrap CSV enabled creation of the
 Bronze and Silver MLVs; both initially read back zero rows. A later synthetic
 refresh produced three Bronze rows and two Silver facts totaling 3,000 minor
-units from two batches and a renamed identical replay. Full measured-run
-verification remains unimplemented.
+units from two batches and a renamed identical replay.
 
 ## Architecture and prerequisites
 
@@ -82,8 +84,8 @@ folder has not been tested.
 
 `silver-candidate.sql` proposes a fully qualified SQL MLV using casts,
 exact monetary values, left joins and failure constraints. The replay-aware
-definition passed a synthetic refresh on the fresh Lakehouse; it has not
-passed the measured producer run. It groups by `(BatchID, SalesLineID)`, collapses
+definition passed a synthetic refresh on the fresh Lakehouse and was used
+in independently reconciled measured runs. It groups by `(BatchID, SalesLineID)`, collapses
 identical copies from different files and exposes quality flags so the
 constraint fails on conflicting raw payloads, duplicate keys within a file,
 or missing source paths. Bronze retains the original files and rows. Silver
@@ -157,10 +159,11 @@ a global identity or deduplication key. Within each batch it must be unique;
 the producer emits `1..row_count` and reuses the same IDs on replay. The
 fact/replay key is `(BatchID, SalesLineID)`. The manifest validator rejects
 duplicate batch IDs within a manifest to avoid double accounting. The Silver
-candidate handles renamed identical copies in its query, but actual MLV
-refresh, constraint failure, replay and source reconciliation remain
-unverified. Runtime verification must enforce each batch's `1..row_count`
-range and detect incomplete or conflicting repeated payloads.
+candidate handled a renamed identical replay in a synthetic MLV refresh, and
+measured runs were reconciled against their source manifests. Actual
+refresh-time constraint failure remains unverified. Runtime verification must
+enforce each batch's `1..row_count` range and detect incomplete or conflicting
+repeated payloads.
 Record first and subsequent batch arrival-to-silver min/median/max separately,
 alongside refresh history and capacity contention. Repeat deployment to verify
 idempotency without destructive replacement.
@@ -463,7 +466,6 @@ runtime access, batch delivery and replay behavior. No global SalesLineID
 allocator, retained-key inventory, or exclusive-writer proof is required solely
 to make sales IDs globally unique.
 
-No presenter walkthrough can be executed until the blocker is resolved and
-artifacts are deployed. Once available, use Lakehouse lineage and refresh
-history for the walkthrough. Cleanup must target only recorded demo-owned
-resources after explicit approval and an implemented ownership check.
+The [presenter walkthrough](../README.md#presenter-walkthrough) describes the
+prepared bounded window and its expiry. Cleanup must target only recorded
+demo-owned resources after explicit approval and an implemented ownership check.

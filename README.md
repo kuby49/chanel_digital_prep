@@ -2,6 +2,8 @@
 
 The [specification](SPECIFICATION.md) defines three isolated comparisons using the same staged CSV bytes: [file-backed materialized lake views](demo-1-materialized-lake-views/), [Eventhouse and OneLake availability](demo-2-eventhouse/), and [OneLake events with Copy](demo-3-onelake-events-copy/). The [shared producer](demo-data-generator/) runs as a bounded Fabric notebook through a wrapper pipeline in its own workspace, not as a local presentation-time process.
 
+**Presenter:** [Run, observe and stop the prepared demos](#presenter-walkthrough).
+
 **Five native three-demo runs are verified, including two consecutive runs
 with the same profile.** On 2026-11-25 the linked pipeline
 and notebook completed with ten deterministic files, 10,000 rows and

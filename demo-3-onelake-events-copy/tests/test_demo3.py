@@ -326,6 +326,7 @@ class SetupNotebookTests(unittest.TestCase):
         parameters = "".join(notebook["cells"][0]["source"])
         self.assertIn("setup_start_date = '2026-01-01'", parameters)
         self.assertIn("setup_customer_count = 100", parameters)
+        self.assertIn("setup_allow_dimension_expansion = False", parameters)
         for cell in notebook["cells"]:
             compile("".join(cell["source"]), cell["id"], "exec")
         namespace = {}
@@ -334,6 +335,17 @@ class SetupNotebookTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, namespace["_setup_generator_name"], None)
         self.assertEqual(namespace["_setup_generator_path"].read_bytes(), self.generator.encode("utf-8"))
         self.assertEqual(namespace["dimensions"](namespace["RunConfig"]()), {})
+
+    def test_dimension_expansion_is_explicit_and_boolean(self):
+        notebook = setup.build_notebook(
+            self.generator, self.config, self.workspace_id, self.lakehouse_id, "DemoLakehouse",
+            allow_dimension_expansion=True)
+        self.assertIn("setup_allow_dimension_expansion = True", "".join(notebook["cells"][0]["source"]))
+        for invalid in ("yes", 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                setup.build_notebook(
+                    self.generator, self.config, self.workspace_id, self.lakehouse_id, "DemoLakehouse",
+                    allow_dimension_expansion=invalid)
 
     def test_invalid_dimension_inputs_are_rejected(self):
         for field, value in (("date_count", 0), ("product_count", True),
@@ -369,8 +381,22 @@ class SetupNotebookTests(unittest.TestCase):
 
     def test_incompatible_fact_protocol_is_rejected(self):
         view_validation.validate_copy_protocol({"minReaderVersion": 1, "minWriterVersion": 2})
-        for detail in ({"minReaderVersion": 3, "minWriterVersion": 7}, {},
-                       {"minReaderVersion": True, "minWriterVersion": 2}):
+        supported_features = {
+            "minReaderVersion": 3, "minWriterVersion": 7,
+            "tableFeatures": ["deletionVectors", "invariants"],
+            "properties": {"delta.enableDeletionVectors": "false"},
+        }
+        view_validation.validate_copy_protocol(supported_features)
+        for detail in (
+            {"minReaderVersion": 3, "minWriterVersion": 7},
+            {**supported_features, "tableFeatures": [["deletionVectors"], "invariants"]},
+            {**supported_features, "tableFeatures": ["deletionVectors", "invariants", "appendOnly"]},
+            {**supported_features, "tableFeatures": ["deletionVectors", "invariants", "columnMapping"]},
+            {**supported_features, "properties": {"delta.enableDeletionVectors": "true"}},
+            {**supported_features, "properties": {}},
+            {},
+            {"minReaderVersion": True, "minWriterVersion": 2},
+        ):
             with self.subTest(detail=detail), self.assertRaises(RuntimeError):
                 view_validation.validate_copy_protocol(detail)
 
@@ -573,6 +599,20 @@ class ReconciliationTests(unittest.TestCase):
         producer_spec.loader.exec_module(producer)
         config = producer.RunConfig("integration", date_count=4, products=3, customers=5,
                                     file_count=1, rows_per_file=12)
+        shared = {"contract_version": 1, "data": {
+            "run_id": "integration", "start_date": config.start_date, "seed": config.seed,
+            "date_count": 4, "product_count": 3, "customer_count": 5, "file_count": 1,
+            "rows_per_file": 12, "interval_seconds": config.interval_seconds,
+        }}
+        from dataclasses import asdict
+        self.assertEqual(guarded_notebook.run_config_from_shared(producer, shared), asdict(config))
+        for invalid in (
+            {"contract_version": 1, "data": {}},
+            {**shared, "data": {**shared["data"], "run_id": "../unsafe"}},
+            {**shared, "data": {**shared["data"], "file_count": True}},
+        ):
+            with self.subTest(config=invalid), self.assertRaises(ValueError):
+                guarded_notebook.run_config_from_shared(producer, invalid)
         notebook = setup.build_notebook(
             producer_path.read_text(encoding="utf-8"),
             {"contract_version": 1, "data": {"start_date": "2024-01-01", "date_count": 4,
@@ -600,6 +640,27 @@ class ReconciliationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "fingerprint"):
                 validate(document={**manifest, "generator_sha256": "0" * 64}, event_id="event-1")
+
+            import hashlib
+            from types import SimpleNamespace
+            lines = source_bytes.decode("utf-8").splitlines()
+            shifted = ("\n".join([lines[0]] + [
+                f"{int(line.split(',', 1)[0]) + 10},{line.split(',', 1)[1]}"
+                for line in lines[1:]
+            ]) + "\n").encode("utf-8")
+            generated, generated_metadata = producer.batch_bytes(config, 1)
+            self.assertEqual(generated, source_bytes)
+            shifted_metadata = {**generated_metadata, "sha256": hashlib.sha256(shifted).hexdigest()}
+            shifted_manifest = copy.deepcopy(manifest)
+            shifted_manifest["batches"]["1"].update(shifted_metadata)
+            shifted_producer = SimpleNamespace(
+                RunConfig=producer.RunConfig, HEADER=producer.HEADER,
+                strict_json_loads=producer.strict_json_loads,
+                generator_source_sha256=producer.generator_source_sha256,
+                batch_bytes=lambda _config, _number: (shifted, shifted_metadata))
+            with self.assertRaisesRegex(ValueError, "contiguous from 1"):
+                batch_gate.validate_batch(shifted_producer, config, json.dumps(shifted_manifest).encode(),
+                                          subject, shifted, event_id="event-1")
 
             for status in ("submitting", "submitted", "unknown", "verified"):
                 manifest["batches"]["1"]["deliveries"]["demo-3"]["status"] = status
@@ -733,6 +794,94 @@ class ReconciliationTests(unittest.TestCase):
             observed = {"duplicate_batch_sales_line_ids": duplicates, "orphan_rows": orphans,
                         "batches": {entry["batch_id"]: result}}
             self.assertEqual(reconcile.reconcile(manifest, observed), [])
+
+    @unittest.skipUnless(
+        os.environ.get("DEMO3_PRODUCER_PATH") or
+        (ROOT.parent / "demo-data-generator" / "generator.py").is_file(),
+        "producer fixture not supplied",
+    )
+    def test_two_batches_reuse_ids_and_late_event_does_not_copy_again(self):
+        import csv
+        import io
+        from collections import Counter, defaultdict
+        producer_path = Path(os.environ.get("DEMO3_PRODUCER_PATH") or
+                             ROOT.parent / "demo-data-generator" / "generator.py").resolve()
+        sys.path.insert(0, str(producer_path.parent))
+        self.addCleanup(sys.path.remove, str(producer_path.parent))
+        producer_spec = importlib.util.spec_from_file_location("producer_fixture_two_batches", producer_path)
+        producer = importlib.util.module_from_spec(producer_spec)
+        sys.modules[producer_spec.name] = producer
+        self.addCleanup(sys.modules.pop, producer_spec.name, None)
+        producer_spec.loader.exec_module(producer)
+        config = producer.RunConfig("two_batches", date_count=4, products=3, customers=5,
+                                    file_count=2, rows_per_file=3)
+        manifest = producer.new_manifest(config, ["demo-3"])
+        workspace, lakehouse = str(uuid.uuid4()), str(uuid.uuid4())
+        storage = ConditionalStore(workspace, lakehouse)
+        authority = ConditionalStore(str(uuid.uuid4()), str(uuid.uuid4()))
+        audit_store = audit.BatchAudit(storage, workspace, lakehouse)
+        guarded = delivery_runtime.GuardedDelivery(producer, config, authority, audit_store)
+        for number in (1, 2):
+            payload, entry = producer.batch_bytes(config, number)
+            manifest["batches"][str(number)] = {
+                **entry, "deliveries": {"demo-3": {"status": "submitted"}}}
+            storage.create(f"Files/incoming/sales/{entry['filename']}", payload)
+        authority.create(delivery_runtime.manifest_path(config), json.dumps(manifest).encode())
+        target, submissions = {}, []
+        dimensions = producer.dimensions(config)
+        products = {str(item["ProductID"]): item["ProductCategory"] for item in dimensions["DimProduct"]}
+        customers = {str(item["CustomerID"]): item["CustomerRegion"] for item in dimensions["DimCustomer"]}
+        dates = {item["Date"] for item in dimensions["DimDate"]}
+
+        def copy_batch(subject, event_id, origin, remaining):
+            job = str(uuid.uuid4())
+            prepared = guarded.prepare(job, subject, event_id or None, origin)
+            self.assertEqual(prepared["decision"], "copy-required")
+            submissions.append(subject)
+            payload, _ = storage.read(subject[1:])
+            rows = list(csv.DictReader(io.StringIO(payload.decode())))
+            for row in rows:
+                target[(row["BatchID"], int(row["SalesLineID"]))] = row
+
+            def read_target(batch_id):
+                actual = [row for (batch, _), row in target.items() if batch == batch_id]
+                ids = [int(row["SalesLineID"]) for row in actual]
+                groups = {name: defaultdict(int) for name in audit.GROUPS}
+                orphan_rows = 0
+                for row in actual:
+                    amount = int(row["SalesAmountMinorUnits"])
+                    if row["Date"] not in dates or row["ProductID"] not in products or row["CustomerID"] not in customers:
+                        orphan_rows += 1
+                        continue
+                    groups["amount_by_date"][row["Date"]] += amount
+                    groups["amount_by_product_category"][products[row["ProductID"]]] += amount
+                    groups["amount_by_customer_region"][customers[row["CustomerID"]]] += amount
+                expected_rows = Counter(tuple(row[name] for name in producer.HEADER) for row in rows)
+                actual_rows = Counter(tuple(row[name] for name in producer.HEADER) for row in actual)
+                return {
+                    "row_count": len(actual), "distinct_sales_line_ids": len(set(ids)),
+                    "first_sales_line_id": min(ids), "last_sales_line_id": max(ids),
+                    "sales_amount_minor_units": sum(int(row["SalesAmountMinorUnits"]) for row in actual),
+                    "orphan_rows": orphan_rows,
+                    "row_difference_count": sum((expected_rows - actual_rows).values())
+                                            + sum((actual_rows - expected_rows).values()),
+                    **{name: dict(value) for name, value in groups.items()},
+                }
+
+            guarded.finish(job, prepared, {
+                "status": "Succeeded", "pipeline_run_id": job, "activity_run_id": None,
+                "files_read": 1, "rows_read": len(rows), "rows_copied": len(rows),
+            }, read_target)
+
+        guarded.reconcile(copy_batch, timeout_seconds=5, poll_seconds=1, event_grace_seconds=0)
+        batch_ids = [manifest["batches"][str(n)]["batch_id"] for n in (1, 2)]
+        self.assertEqual(set(target), {(batch, key) for batch in batch_ids for key in (1, 2, 3)})
+        first = manifest["batches"]["1"]["filename"]
+        replay = guarded.prepare(str(uuid.uuid4()), f"/Files/incoming/sales/{first}", "late", "event")
+        self.assertEqual(replay["decision"], "already-completed")
+        guarded.reconcile(copy_batch, timeout_seconds=5, poll_seconds=1, event_grace_seconds=0)
+        self.assertEqual(len(submissions), 2)
+        self.assertEqual(len(target), 6)
 
 
 @unittest.skipUnless(

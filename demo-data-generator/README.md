@@ -124,19 +124,22 @@ fresh projected runtime document, not reused from the template.
 Demo 1's accepted scheduled MLV refresh cadence is five minutes; the
 60-second file cadence does not imply 60-second table visibility.
 
-**This is not yet a runnable all-demo launch.** Demo 1's read-only hook
+The prepared all-demo profile completed bounded native runs on F32, including
+the 2026-11-25 presenter-profile run described in the
+[presenter walkthrough](../README.md#presenter-walkthrough). A full run after
+the F16 resize has not been tested. Demo 1's read-only hook
 requires an approved one-time bounded control-plane schedule receipt;
 notebook-resident MLV schedule mutations are not bundled. The shared setup
 schedule intentionally remains enabled between runs, and its remaining
 coverage must include the fresh run's complete verification deadline.
 Demo 3's readiness, verification and cooperating-writer drain hooks require
 a confirmed deployment proof and enabled rule. Its publisher and corrected
-guard were read back with the rule stopped during publication, but live
-integration remains unverified. Missing or unsuccessful hooks fail before
+guard were read back with the rule stopped during publication, and the
+prepared binding was subsequently exercised in live runs. Missing or unsuccessful hooks fail before
 sales, rather than assuming a manually started monitor
 or accepting recorded readiness. Demo 2's native hook must establish and
 observe its exact owned monitor/verifier jobs automatically. No live result
-is implied by the local producer implementation.
+is implied by the local producer implementation alone.
 
 `native_lifecycle.py` expects track-owned flat modules `native_demo1`,
 `native_demo2` and `native_demo3`, each exposing `prepare(context)`,

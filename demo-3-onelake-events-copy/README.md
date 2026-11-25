@@ -1,18 +1,18 @@
 # Demo 3: OneLake events and Copy
 
-**Status: bounded customer-run admission verified; production ingestion remains blocked.**
-With `demo-3.customer_preflight: true`, read-only `validate-only` checks the
-original customer binding and the existing run-specific resources. It does not
-claim the new file was delivered or that the ten-file acceptance run passed.
-The reusable native binding and corrected guard were published and read back
-with the rule stopped during publication; an integrated recurring run remains
-unverified. The distinct-staging guard rebind was published and read back; its
-new rule proof and the live run remain in progress.
-An isolated MCAP preflight
-workspace, Lakehouse, OAuth2 connection, setup notebook, probe pipelines and a
-stopped probe Activator exist. They do not constitute a deployable production
-pipeline. The narrowly scoped customer preflight is read-only; `dry-run`
-only validates the local contract.
+**Status: the prepared bounded native demo was verified; general deployment remains blocked.**
+The 2026-11-25 presenter-profile run had ten completed event-origin Copy jobs
+matching the manifest. An independent Delta snapshot comparison matched all
+nine typed columns for 10,000 rows; dimension-orphan checks remain
+guard-reported. The run used F32, before the later F16 resize. These results do
+not prove event-queue drainage, external-writer exclusion, or production
+readiness. See the [presenter walkthrough](../README.md#presenter-walkthrough)
+for the prepared window and closure.
+
+The narrowly scoped customer and native preflights are read-only admission
+checks; neither proves delivery for a future run. `dry-run` only validates the
+local contract. A new operating window requires its own confirmed binding,
+schedule and rule proofs.
 
 ## User-directed event-delivery assumption
 
@@ -22,6 +22,7 @@ guarantee; implementing or proving missed-notification recovery is not a
 readiness prerequisite. Monitor the actual event-to-Copy run and report any
 visibly failed notification or Copy honestly. Retain normal Copy correctness,
 duplicate-retry safety, target-row validation and safe stopping.
+
 ## Contract
 
 `python deploy.py --mode {dry-run,validate-only,deploy,cleanup,resolve-target-candidate,provision-owned,verify-owned} --config <absolute JSON> --prefix <prefix> --state-dir <absolute directory> --result <absolute JSON>`. Cleanup and `provision-owned` require `--yes`. A v1 result reports `track: demo-3`. Deploy, general validation and cleanup return `blocked`; cleanup never deletes anything. Only an explicit customer or native binding preflight can return `ready:true`.
@@ -46,8 +47,8 @@ Azure configuration and existing tenant and principal checks are retained.
 file. Missing, invalid, pending, uncertain or conflicting ownership blocks the
 operation; a stale lock is never cleared automatically. A successful candidate is
 not proof of live ownership, access, inventory, exclusive writing or readiness.
-The current deployment stub does not create an ownership journal or adopt the
-preflight resources.
+`provision-owned` can create a separately journaled workspace and Lakehouse
+shell; it does not adopt the preflight resources or establish pipeline readiness.
 
 The journal must identify contract version, track, tenant, prefix, an owner ID
 and marker `<prefix>-demo3-<owner-id>`, plus empty `pending_operations` and
@@ -74,12 +75,15 @@ in coordinated-run totals; `bootstrap` and `negative-test` are separate.
 
 ## Verified capabilities and unresolved gates
 
+The following probe observations and gates predate the verified native run
+summarized above; they do not establish readiness in another environment.
+
 | Operation | Documented API or capability | Required proof before deployment |
 |---|---|---|
 | Connection | A Lakehouse OAuth2 connection was created in the Fabric UI, read back via API, and used by a two-row Copy probe. The public [create-connection request](https://learn.microsoft.com/en-us/rest/api/fabric/core/connections/create-connection) lists OAuth2 as a credential type but does not define OAuth2 in its create-credentials union. | Automate a supported connection path or explicitly require the UI-created connection; verify identity and access in each environment. Never store credentials. |
 | Pipeline | A non-sales probe used the event subject as a dynamic exact filename and Upserted two rows; its successful event-triggered job read one file. A top-level `keyColumns` property was accepted in a definition but failed at runtime; `upsertSettings.keys` worked for the probe. An earlier target Copy failed before writing because its Delta protocol's `appendOnly` writer feature was unsupported (`dataWritten=0`). A new isolated table with deletion vectors disabled passed the direct protocol gate. The first synthetic Copy read one file and reported three rows; VerifyCopy initially rejected an HTTPS-prefixed OneLake endpoint. Fix `dfc89b7c2431369c4e3116c743e920ddda1a3cfc` normalized the endpoint, and a verification-only continuation completed batch `recoveryprobea9bbae81_0001` and its audit without another Copy. A second manually supplied synthetic job (`13f2398f-7599-465a-b1c2-2fc8b8ef5b85`) completed guarded Copy and audit; this was not an Activator-delivery test. Duplicate batch 1 job `eb2f7cb3-d8e4-4093-a510-82e35ab60bb6` ran PrepareCopy only and did not run Copy. Independent target notebook `7be33833-f22c-4fbd-8d5f-92c47c324a32` verified six rows, six unique `(BatchID, SalesLineID)` pairs, IDs 1–3 per batch, exact regenerated contents and dimension totals. | Composite-key Upsert and duplicate replay are proven for the two isolated synthetic batches only. Actual Activator delivery, measured readiness, and actual Spark session reuse remain unverified; do not imply otherwise. The user's no-missed-notification assumption does not waive monitoring or safe-stop checks. Do not downgrade existing table protocols. |
 | Activator | A restricted non-sales `FileCreated` event invoked a parameter-only pipeline. `___subject` and `___id` matched source and activation history in that probe. A later event-triggered dynamic Copy captured the subject and ID after a six-minute warm-up. `activator.py` builds a disabled candidate. | Apply the user-directed no-missed-notification assumption for this demo only; do not require missed-notification recovery to be implemented or proven. Monitor actual event-to-Copy runs and report any visible failure honestly. The historical event with no activation/job within 300 seconds remains recorded; a single six-minute success is not readiness. Definition readback or a Running label alone is insufficient. |
-| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. The synthetic two-batch run completed per-file audits; its duplicate batch-1 job ran PrepareCopy only, and the independent target notebook verified both batches. `audit.py` is not installed in a pipeline. | Duplicate replay is verified only for this isolated two-batch run. Measured readiness still requires safe serialization/exclusive-writer evidence, bounded retries, uncertain-write recovery, safe stopping and data correctness. Retain monitoring of actual pipeline/Copy outcomes. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
+| Audit, recovery, serialization | Two wait-only jobs on one pipeline with `concurrency: 1` ran their activities sequentially. In the isolated Lakehouse, conditional create had one winner, ETag replacement worked, and stale replacement/deletion were rejected. The synthetic two-batch run completed per-file audits; its duplicate batch-1 job ran PrepareCopy only, and the independent target notebook verified both batches. The later native guard packages `audit.py`. | Duplicate replay was verified for the isolated two-batch run. Retain monitoring of actual pipeline/Copy outcomes, uncertain-write reconciliation, safe stopping and data correctness. Neither the single-pipeline observation nor a cooperative lock excludes outside writers or establishes an onboarding barrier. |
 | Query surface | Setup verified dimensions and the fact schema. A non-destructive SQL metadata refresh using actual lowercase Delta paths exposed all four tables; the Spark amount view is not exposed as a SQL view. A separate probe had stale SQL results for over 900 seconds until a targeted, non-recreating refresh. | Verify joined queries, DECIMAL(18,2) results, exact totals and visibility with valid sales data. The observed SQL endpoint is case-sensitive: use physical `dbo.factsales`, not `dbo.FactSales`. |
 
 The earlier incompatible fact table had deletion vectors enabled and Delta
@@ -143,7 +147,7 @@ creation as a course correction; do not silently substitute another connection.
 
 ## Binding a bounded shared run
 
-### Reusable native event path (not end-to-end verified)
+### Reusable native event path
 
 Use `activator.build_native_definition(...)` and
 `guarded_notebook.build_native_notebook(producer_dir, policy, workspace_id,
@@ -220,8 +224,8 @@ retaining the producer's lifecycle lock. The barrier does not establish that
 Fabric's event queue or jobs are drained, and it is not a complete native
 readiness or delivery-verification hook.
 
-`native_demo3.py` contains producer hooks. Before generating the
-reusable producer profile, a future authorized setup must pin
+`native_demo3.py` contains producer hooks. Before generating a
+reusable producer profile, each new authorized setup must pin
 `demo-3.native_proof`: version, owned workspace/Lakehouse/guard/pipeline/Reflex/
 connection IDs, owner marker, native policy and generator SHA-256, plus
 `guard_sha256`, `pipeline_sha256`, and `graph_disabled_sha256`. The hashes
@@ -233,8 +237,9 @@ Each native launch checks the pinned live definitions, enabled rule, connection,
 ownership, writer quiescence and deterministic dimensions before publishing.
 Verification requires matching producer bytes, completed event-origin audits,
 completed pipeline jobs, and fresh exact Delta/dimension readback for every
-batch. Failed or unavailable evidence blocks the run. The hooks and their
-profile integration have not been verified in Fabric.
+batch. Failed or unavailable evidence blocks the run. These hooks and the
+prepared profile were exercised by the verified F32 native runs; a new binding
+requires fresh proof and the full F16 workload has not been tested.
 
 `native_binding.py` is a publisher for this specific owned
 binding. It checks the stopped predecessor,
@@ -547,8 +552,9 @@ Run `python -m unittest discover -s demo-3-onelake-events-copy/tests -v` from th
 The synthetic events in these tests exercise local structure only. Set
 `DEMO3_PRODUCER_PATH` to the shared producer's `generator.py` to also test the
 actual producer manifest and notebook packaging when the shared producer is not
-present in the repository. No live presenter walkthrough
-or automated cleanup is available until deployment is implemented and approved.
+present in the repository. The root
+[presenter walkthrough](../README.md#presenter-walkthrough) covers the prepared
+live window; general resource cleanup remains blocked.
 
 `batch_gate.validate_batch` is a local evidence check, not an installed
 pipeline activity. Given an independently supplied shared-generator module and
@@ -564,7 +570,7 @@ manifest and generator provenance, runtime access, file immutability and writer
 exclusion; those and execution/target verification are not established by this
 check.
 
-`audit.BatchAudit` is an unintegrated candidate using the shared producer's
+`audit.BatchAudit` is used by the guard notebook with the shared producer's
 `OneLakeStore` interface in the target Lakehouse. Its conditional writer lock
 is bound to one pipeline run and batch; its per-batch record persists the event,
 Copy intent and result, and target-verification evidence. It refuses to release
@@ -572,8 +578,8 @@ an in-flight or unverified Copy, refuses automatic replay of an uncertain write,
 and recognizes a completed duplicate without a second Copy. Verification must
 come from an independent target query, including the symmetric multiset
 difference against all nine source columns, unique key range, orphan count, and
-grouped totals. The implementation does not perform that query, recover stale
-locks, or fence writers that ignore the lock. A lost response or crash requires
+grouped totals. `guard_spark.py` performs the target query; the guard does not
+recover stale locks or fence writers that ignore the lock. A lost response or crash requires
 reconciliation; never automatically remove a stale lock. Isolated journal
 probes used the interactive preflight principal, not the pipeline identity,
 and synthetic Copy and query evidence. A client wrapper simulated losing the

@@ -169,7 +169,7 @@ class NativeDemo1Test(unittest.TestCase):
 
     def test_full_lifecycle_is_read_only_and_shared_setup_is_reusable(self):
         settings = self.receipt["request"]["configuration"]
-        settings["endDateTime"] = (self.now + timedelta(minutes=179)).isoformat()
+        settings["endDateTime"] = (self.now + timedelta(hours=23, minutes=59)).isoformat()
         self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
         self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
         self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
@@ -199,6 +199,11 @@ class NativeDemo1Test(unittest.TestCase):
         self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
         self.context["expires_at_utc"] = (self.now + timedelta(minutes=120)).isoformat()
         self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
+        self.fabric.schedule["enabled"] = False
+        with self.assertRaisesRegex(RuntimeError, "enabled state"):
+            native_demo1.prepare(self.context)
+        self.assertEqual(len(self.store.data), 1)
+        self.fabric.schedule["enabled"] = True
         second = native_demo1.prepare(self.context)
         self.assertEqual(second["schedule_id"], prepared["schedule_id"])
         self.assertEqual(second["receipt_sha256"], prepared["receipt_sha256"])
@@ -237,7 +242,7 @@ class NativeDemo1Test(unittest.TestCase):
     def test_long_setup_respects_exact_bound_and_runtime_deadline(self):
         settings = self.receipt["request"]["configuration"]
         settings["startDateTime"] = (self.now - timedelta(minutes=1)).isoformat()
-        settings["endDateTime"] = (self.now + timedelta(minutes=179)).isoformat()
+        settings["endDateTime"] = (self.now + timedelta(hours=23, minutes=59)).isoformat()
         self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
         self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
         self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
@@ -248,7 +253,7 @@ class NativeDemo1Test(unittest.TestCase):
 
         self.setUp()
         settings = self.receipt["request"]["configuration"]
-        settings["endDateTime"] = (self.now + timedelta(minutes=179, microseconds=1)).isoformat()
+        settings["endDateTime"] = (self.now + timedelta(hours=23, minutes=59, microseconds=1)).isoformat()
         self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
         self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
         with self.assertRaisesRegex(ValueError, "invalid operating bounds"):
@@ -264,6 +269,30 @@ class NativeDemo1Test(unittest.TestCase):
         self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
         with self.assertRaisesRegex(RuntimeError, "coverage insufficient"):
             native_demo1.prepare(self.context)
+
+    def test_24_hour_setup_still_enforces_default_verification_cutoff(self):
+        for elapsed, admitted in (
+            (timedelta(hours=21, minutes=59), True),
+            (timedelta(hours=22, minutes=4), True),
+            (timedelta(hours=22, minutes=4, microseconds=1), False),
+        ):
+            with self.subTest(elapsed=elapsed):
+                self.setUp()
+                settings = self.receipt["request"]["configuration"]
+                settings["endDateTime"] = (self.now + timedelta(hours=23, minutes=59)).isoformat()
+                self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
+                self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
+                self.now += elapsed
+                self.context["preparation_deadline_utc"] = (self.now + timedelta(minutes=5)).isoformat()
+                self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
+                self.context["expires_at_utc"] = (self.now + timedelta(minutes=120)).isoformat()
+                self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
+                if admitted:
+                    self.assertEqual(native_demo1.prepare(self.context)["status"], "ready")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "coverage insufficient"):
+                        native_demo1.prepare(self.context)
+                    self.assertEqual(self.store.data, {})
 
     def test_exact_minimum_coverage_passes_but_one_microsecond_less_blocks(self):
         self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=19)).isoformat()

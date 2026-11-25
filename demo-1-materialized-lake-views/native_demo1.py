@@ -14,7 +14,7 @@ import uuid
 TERMINAL = {"Completed", "Failed", "Cancelled", "Deduped"}
 STOP_SCOPE = "run-specific; shared bounded setup schedule remains enabled"
 MINIMUM_COVERAGE = timedelta(minutes=19)
-MAX_WINDOW = timedelta(minutes=180)
+MAX_WINDOW = timedelta(hours=24)
 
 
 def _uuid(value):

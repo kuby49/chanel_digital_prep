@@ -176,7 +176,7 @@ through the external controller, once per approved presenter window.
 
 One-time setup, after approval, uses the existing controller and the immutable
 setup config with the original local ownership journal. Choose an explicitly
-bounded operating window (19-180 minutes); the native path can reuse that same
+bounded operating window (19-1,440 minutes); the native path can reuse that same
 schedule for different fresh run IDs while the window has sufficient coverage.
 After `start` confirms its receipt, the following **local-only** command exports
 the sanitized schedule receipt without acquiring tokens or calling Fabric:
@@ -248,16 +248,26 @@ clicks **Run** and waits for that run and cleanup to complete before clicking
 again. Each click allocates a fresh run ID. The prior run's stop hook leaves the
 pinned schedule enabled for the next run.
 
-With the default 120-minute run budget and a 180-minute schedule, allocate each
-run within the first **60 minutes** to leave its full budget inside the window.
+With the default 120-minute run budget and a 24-hour schedule, allocate each
+run within the first **22 hours** to leave its full budget inside the window.
 The Demo 1 hook itself checks the default allocation-plus-115-minute verification
-deadline, which fits through minute 65; follow the earlier cutoff for full
-allocation coverage. Two early, normally completing runs can share one window,
-but two worst-case 120-minute runs cannot. The prior run must release the writer
-lock, and the next run must still pass its own idle, deadline and coverage checks.
-Once the cutoff passes or the schedule is disabled or expires, **Run does not
-reprovision or renew it**. The operator must provision and export a new bounded
-schedule and republish its receipt in the template before another demo window.
+deadline, which fits through 22 hours and 5 minutes; follow the earlier cutoff
+for full allocation coverage. The prior run must release the writer lock, and
+the next run must still pass its own idle, deadline and coverage checks. Once
+the cutoff passes or the schedule expires, **Run does not reprovision or renew
+it**. The operator must provision and export a new bounded schedule and republish
+its receipt in the template before another demo window.
+
+Within the fixed window, the presenter can pause or resume the existing schedule
+using **Materialized lake views > Manage > Manage schedules** without editing its
+configuration. Resume is accepted only if the schedule's pinned ID, owner ID and
+type, cadence, scope and bounds remain unchanged and all live admission checks
+pass. Fabric identifies the owner as the creator or last modifier, so changing
+the schedule under another identity can block admission. A portal pause/resume
+has not yet been verified live. If re-enabling starts a refresh immediately,
+admission waits within its existing bounds for idle successful lineage. Pause
+only after the run and its cleanup have completed and active lineage jobs have
+become terminal; the fixed expiry is not extended by pausing.
 
 After durable producer delivery completes, `verify` accepts only the actual
 ten measured manifest BatchIDs, 1,000 distinct IDs `1..1000` per batch in both
@@ -308,7 +318,9 @@ blocks on inconsistent continuations. The setup journal retains the stop
 intent, response and disabled readback. Only a documented synchronous HTTP 200
 can confirm the PATCH; use read-only status to investigate an uncertain result,
 and never resubmit it blindly. There is no automatic job cancellation or
-schedule extension.
+schedule extension. A controller journal already marked `stopped` cannot be
+exported or reused for another controller stop after an external portal
+re-enable; that state requires operator reconciliation, not a fabricated journal.
 
 ## Entry point
 

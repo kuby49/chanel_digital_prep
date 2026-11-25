@@ -19,7 +19,7 @@ from provision_synthetic import FabricClient, _object_response, _verify_confirme
 
 TERMINAL = ("Completed", "Failed", "Cancelled", "Deduped")
 MARGIN_MINUTES = 5
-MAX_WINDOW_MINUTES = 180
+MAX_WINDOW_MINUTES = 24 * 60
 STOP_RECEIPT_HEADERS = {
     "activityid", "content-type", "date", "location", "requestid", "retry-after",
     "x-ms-activity-id", "x-ms-correlation-request-id", "x-ms-operation-id", "x-ms-request-id",

@@ -1,6 +1,6 @@
 import contextlib
 import copy
-from datetime import date
+from datetime import date, timedelta
 import io
 import json
 import os
@@ -365,12 +365,18 @@ class CustomerValidationTest(unittest.TestCase):
         self.assertEqual((managed_refresh._time(settings["endDateTime"])
                           - managed_refresh._time(settings["startDateTime"])).total_seconds(), 115 * 60)
         self.assertEqual(settings["interval"], 5)
-        long_payload = managed_refresh.plan(self.config, duration_minutes=180)
+        long_payload = managed_refresh.plan(self.config, duration_minutes=1440)
         settings = long_payload["configuration"]
         self.assertEqual((managed_refresh._time(settings["endDateTime"])
-                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 180 * 60)
+                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 1440 * 60)
         self.assertEqual(settings["interval"], 5)
-        for duration in (18, 181):
+        managed_refresh._check_payload(self.config, long_payload)
+        too_long = copy.deepcopy(long_payload)
+        too_long["configuration"]["endDateTime"] = (
+            managed_refresh._time(settings["endDateTime"]) + timedelta(microseconds=1)).isoformat()
+        with self.assertRaisesRegex(CandidateBlocked, "within 1440 minutes"):
+            managed_refresh._check_payload(self.config, too_long)
+        for duration in (18, 1441):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 managed_refresh.plan(self.config, duration_minutes=duration)
         self.config["data"]["rows_per_file"] = 999
@@ -382,12 +388,12 @@ class CustomerValidationTest(unittest.TestCase):
         self.recurring()
         client, _ = self.schedule_transport()
         started = managed_refresh.manage(self.config, "chanel", self.root, "start", yes=True,
-                                         duration_minutes=180)
+                                         duration_minutes=1440)
         receipt = managed_refresh.manage(self.config, "chanel", self.root, "export-native")["native_schedule"]
         self.assertEqual(receipt["request"], started["request"])
         settings = receipt["request"]["configuration"]
         self.assertEqual((managed_refresh._time(settings["endDateTime"])
-                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 180 * 60)
+                          - managed_refresh._time(settings["startDateTime"])).total_seconds(), 1440 * 60)
         self.assertEqual(settings["interval"], 5)
         self.assertEqual(managed_refresh.manage(self.config, "chanel", self.root, "stop", yes=True)["status"], "pass")
         self.assertEqual([call.args[0] for call in client.request.call_args_list], ["POST", "PATCH"])

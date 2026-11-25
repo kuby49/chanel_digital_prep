@@ -205,6 +205,19 @@ class CustomerPreflightTests(unittest.TestCase):
             ]), 1)
             self.assertEqual(journal.read_text(), '{"original":true}')
 
+    def test_result_cannot_overwrite_later_rule_cycle_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            config = folder / "config.json"
+            config.write_text(json.dumps(self.config))
+            journal = folder / "demo3-native-rule-cycle-42-state.json"
+            journal.write_text('{"original":true}')
+            self.assertEqual(deploy.main([
+                "--mode", "validate-only", "--config", str(config), "--prefix", "chanel",
+                "--state-dir", str(folder), "--result", str(journal),
+            ]), 1)
+            self.assertEqual(journal.read_text(), '{"original":true}')
+
     def test_fresh_run_requires_its_exact_distinct_journal_and_hash(self):
         config = copy.deepcopy(self.config)
         config["data"]["run_id"] = preflight.FRESH_RUN_ID

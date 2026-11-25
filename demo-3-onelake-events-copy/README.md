@@ -323,6 +323,14 @@ pins the untouched second journal and, through it, the first. An attempted
 cycle 3 cannot be relaunched or silently reused. Rule admission does not
 reconcile the producer's lock or authorize producer launch.
 
+For each separately authorized retry, select the next successive cycle in
+`demo-3.native_rule_cycle` and `--cycle`, after the previous cycle is stopped
+and the producer's launcher lock is reconciled. For example, after cycle 3
+use cycle 4 and the same rebound inputs and proof. Each cycle has its own
+`demo3-native-rule-cycle-<n>-state.json` journal, pins all predecessors, and
+uses the same one-shot enable, readback, reconcile, disable and drain checks.
+Do not overwrite existing journals or enable before coordination.
+
 ETags and hashes are point-in-time checks, not WORM guarantees. An outside
 writer can alter source bytes between guard validation and the Copy's later
 filename read. The checks do not prove external-writer exclusion, event-queue
@@ -369,7 +377,8 @@ same commands. Its separate journal pins the unchanged first journal, requires
 confirmed first-cycle enable and disable, and rechecks the stopped graph and
 fresh proof before re-enabling. This does not establish that the event queue
 has drained; do not reset either journal. The separately authorized third
-cycle described above is available only for the rebound deployment. On an
+and subsequent cycles described above are available only for the rebound
+deployment. On an
 interrupted update run `--mode reconcile @inputs` only: it uses the recorded
 operation ID and Location and never resubmits. If acceptance is unknown,
 stop and reconcile with the operator; neither a second submission nor a

@@ -831,7 +831,7 @@ class NativeBindingTests(unittest.TestCase):
         self.assertEqual(state["previous_journal_sha256"], native_binding._sha(second_bytes))
         self.assertEqual(rebound._proof_readback(
             rebound._published(), allow_running=True, rule_cycle=3), proof)
-        with self.assertRaisesRegex(CandidateBlocked, "third rule cycle has already"):
+        with self.assertRaisesRegex(CandidateBlocked, "Rule cycle 3 has already"):
             rebound._proof_readback(rebound._published(), allow_running=True)
         second.predecessor.write_bytes(first_bytes + b"\n")
         with self.assertRaisesRegex(CandidateBlocked, "pinned staging rebind input or predecessor changed"):
@@ -873,6 +873,74 @@ class NativeBindingTests(unittest.TestCase):
             rebound._proof_readback(rebound._published(), allow_running=True, rule_cycle=3)
         self.assertEqual(self.api.request.call_count, submissions)
         self.assertFalse(third.journal.exists())
+
+    def test_fourth_cycle_pins_stopped_third_and_preserves_lineage(self):
+        rebound, _, _, _, _, _ = self.rebound_setup()
+        self.finish_access(rebound)
+        rebound.update()
+        proof_path = self.root / "new-proof.json"
+        proof = rebound.proof(proof_path)
+        second = native_rule.NativeRule(rebound, cycle=2)
+        third = native_rule.NativeRule(rebound, cycle=3)
+        fourth = native_rule.NativeRule(rebound, cycle=4)
+        second.change("enable", proof_path)
+        second.change("disable")
+        third.change("enable", proof_path)
+        with self.assertRaisesRegex(CandidateBlocked, "Third rule cycle must have confirmed"):
+            fourth._predecessor(fourth._binding_hash())
+        third.change("disable")
+        previous = [second.predecessor, second.journal, third.journal]
+        original = {path: path.read_bytes() for path in previous}
+        with self.assertRaisesRegex(ValueError, "distinct absolute path"):
+            rebound.proof(fourth.journal)
+        self.assertEqual(rebound._proof_readback(
+            rebound._published(), allow_running=True, rule_cycle=4), proof)
+        state = fourth.change("enable", proof_path)
+        self.assertEqual(state["previous_journal"], third.journal.name)
+        self.assertEqual(state["previous_journal_sha256"], native_binding._sha(original[third.journal]))
+        self.assertEqual(rebound._proof_readback(
+            rebound._published(), allow_running=True, rule_cycle=4), proof)
+        with self.assertRaisesRegex(CandidateBlocked, "Rule cycle 4 has already"):
+            rebound._proof_readback(rebound._published(), allow_running=True, rule_cycle=3)
+        third.journal.write_bytes(original[third.journal] + b"\n")
+        with self.assertRaisesRegex(CandidateBlocked, "Third rule-cycle journal changed"):
+            fourth.change("disable")
+        third.journal.write_bytes(original[third.journal])
+        fourth.change("disable")
+        for path, data in original.items():
+            self.assertEqual(path.read_bytes(), data)
+        with self.assertRaisesRegex(CandidateBlocked, "cannot be admitted again"):
+            rebound._proof_readback(rebound._published(), allow_running=True, rule_cycle=4)
+        fifth = native_rule.NativeRule(rebound, cycle=5)
+        with self.assertRaisesRegex(ValueError, "distinct absolute path"):
+            rebound.proof(self.root / native_binding.rule_journal_name(42))
+        self.assertEqual(rebound._proof_readback(
+            rebound._published(), allow_running=True, rule_cycle=5), proof)
+        fifth.change("enable", proof_path)
+        fifth.change("disable")
+        for path, data in original.items():
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_fourth_cycle_does_not_resubmit_an_uncertain_enable(self):
+        rebound, _, _, _, _, _ = self.rebound_setup()
+        self.finish_access(rebound)
+        rebound.update()
+        proof_path = self.root / "new-proof.json"
+        rebound.proof(proof_path)
+        for cycle in (2, 3):
+            controller = native_rule.NativeRule(rebound, cycle=cycle)
+            controller.change("enable", proof_path)
+            controller.change("disable")
+        fourth = native_rule.NativeRule(rebound, cycle=4)
+        self.api.request.side_effect = RuntimeError("response lost")
+        submissions = self.api.request.call_count
+        with self.assertRaisesRegex(RuntimeError, "response lost"):
+            fourth.change("enable", proof_path)
+        with self.assertRaisesRegex(CandidateBlocked, "already attempted"):
+            fourth.change("enable", proof_path)
+        with self.assertRaisesRegex(CandidateBlocked, "acceptance is unknown"):
+            fourth.reconcile()
+        self.assertEqual(self.api.request.call_count, submissions + 1)
 
     def test_definition_parts_are_strict_and_unrelated_payloads_are_compared(self):
         _, live, _, _, _, _ = self.rebound_setup()

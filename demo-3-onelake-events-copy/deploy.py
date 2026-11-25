@@ -21,6 +21,14 @@ class CandidateBlocked(Exception):
     pass
 
 
+def _is_rule_journal_path(path, state_dir):
+    resolved = path.resolve()
+    return (resolved.parent == state_dir.resolve()
+            and (resolved.name.casefold() == "demo3-native-rule-state.json"
+                 or re.fullmatch(r"demo3-native-rule-cycle-[1-9][0-9]*-state\.json",
+                                 resolved.name.casefold()) is not None))
+
+
 def _unique_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -196,7 +204,8 @@ def main(argv=None):
                  args.state_dir / "demo3-native-staging-access-rebind-state.json",
                  args.state_dir / "demo3-native-staging-rebind-state.json",
                  args.state_dir / "demo3-staging-access-state.json")
-    if args.result.resolve() in {path.resolve() for path in protected}:
+    if (args.result.resolve() in {path.resolve() for path in protected}
+            or _is_rule_journal_path(args.result, args.state_dir)):
         print("Result path conflicts with input, state, or candidate", file=sys.stderr)
         return 1
     try:

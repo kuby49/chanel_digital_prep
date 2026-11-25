@@ -15,7 +15,7 @@ import guarded_notebook
 import native_binding as binding
 import native_guard
 import native_rule
-from deploy import CandidateBlocked, _guid, _load_json, _state_lock
+from deploy import CandidateBlocked, _guid, _is_rule_journal_path, _load_json, _state_lock
 from ownership import FabricControl
 
 
@@ -700,8 +700,9 @@ class NativeRebind:
             raise CandidateBlocked("New proof requires the exact stopped rule.")
         expected_proof_sha = None
         if allow_running:
-            if rule_cycle == 2 and (self.root / binding.RULE_THIRD_JOURNAL).exists():
-                raise CandidateBlocked("The third rule cycle has already been attempted.")
+            later = binding.later_rule_cycle(self.root, rule_cycle)
+            if later is not None:
+                raise CandidateBlocked(f"Rule cycle {later} has already been attempted.")
             controller = native_rule.NativeRule(self, cycle=rule_cycle)
             fingerprint = check.config_sha256(state)
             if running:
@@ -713,7 +714,7 @@ class NativeRebind:
                 expected_proof_sha = cycle["proof_sha256"]
             elif controller.journal.exists():
                 raise CandidateBlocked("A stopped selected rule cycle cannot be admitted again.")
-            elif rule_cycle == 3:
+            elif rule_cycle >= 3:
                 previous, _ = controller._predecessor(fingerprint)
                 controller._readback(False, previous["actions"]["disable"]["target"])
                 expected_proof_sha = previous["proof_sha256"]
@@ -747,7 +748,8 @@ class NativeRebind:
                      self.publisher.candidate_path,
                      self.publisher.native_config_path, self.publisher.previous_config_path,
                      self.root / binding._PREVIOUS, self.root / check.JOURNAL)
-        if not output.is_absolute() or any(output.resolve() == item.resolve() for item in protected):
+        if (not output.is_absolute() or _is_rule_journal_path(output, self.root)
+                or any(output.resolve() == item.resolve() for item in protected)):
             raise ValueError("Proof output must be a distinct absolute path.")
         with _state_lock(self.root):
             result = self._read_proof(self._published())
@@ -764,7 +766,7 @@ def validate_rebound(config, prefix, state_dir, *, api=None):
             or type(config.get("contract_version")) is not int or config["contract_version"] != 1
             or demo.get("native_preflight") is not True or demo.get("customer_preflight") is True
             or demo.get("native_binding_journal") != check.NATIVE_JOURNAL
-            or type(rule_cycle) is not int or rule_cycle not in (2, 3)
+            or type(rule_cycle) is not int or rule_cycle < 2
             or not isinstance(refs, dict) or set(refs) != fields
             or any(not isinstance(value, str) or not Path(value).is_absolute() for value in refs.values())):
         raise CandidateBlocked("Rebound native preflight inputs are incomplete or not absolute.")

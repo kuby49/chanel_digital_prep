@@ -27,9 +27,10 @@ Demo 3's event-origin Copy audits reported 1,000 rows per batch and zero
 differences or orphans. Each run had 10,000 rows and 1,502,033,495 minor units.
 The receipt lookup inspects bounded queue heads, not every possible receipt.
 Both pairs of shared-window invocations used the Jobs API with defaults, not UI
-clicks. The latest shared schedule and rule were stopped and read back with
-owned jobs terminal; the capacity was read back Active at F32.
-**Clicking Run again from the stopped state is not sufficient**:
+clicks. That shared schedule and rule were stopped and read back with
+owned jobs terminal. A separate 24-hour presenter window was subsequently
+prepared as described below. **Clicking Run from a stopped or expired state
+is not sufficient**:
 an operator must prepare and export a fresh bounded Demo 1 schedule, enable a
 new journaled Demo 3 rule cycle, and publish a profile containing the new
 schedule receipt before invoking the pipeline. The native hooks check these
@@ -126,6 +127,24 @@ Sign in to MCAP. Opening this pipeline, its **Home** toolbar and **Run**
 control has been observed in the signed-in browser; pressing that UI control
 has not been verified. The two unchanged-profile repeat tests used the Jobs API.
 
+**Prepared window, UTC:** 2026-11-25 07:42:33 through 2026-11-26 07:42:33.
+Allocate the final run no later than **2026-11-26 05:42:33 UTC** to preserve
+its full two-hour budget; click earlier to allow for queueing. At 07:59 UTC on
+November 25, the matching producer definitions had been published and read
+back, the five-minute schedule and Demo 3 rule cycle 7 had been enabled and
+independently read back, and checked owned work was terminal with relevant
+writer locks absent. The capacity was Active at F32. These observations are
+point-in-time; runtime admission is checked again for each Run. This newly
+published profile has not itself been exercised by a Run, and clicking Run in
+the UI remains unverified.
+
+The schedule generates recurring refresh workload, including between
+presentations, until it is stopped or its fixed end passes. It does not renew
+itself. The Demo 3 rule does **not** expire automatically: the window owner must
+stop new launches and explicitly disable and drain it, as well as close the
+schedule, after the last presentation or at expiry. Keep both enabled until
+any admitted run and its verification and cleanup have finished.
+
 ### What is prepared, and when
 
 Initial deployment creates the isolated resources, permissions, native runtime
@@ -190,6 +209,11 @@ journal-stop/read back the shared schedule and rule. Do this before leaving the
 setup unattended or at the operating-window expiry; the rule does not stop
 itself. Point-in-time drain checks do not prove Fabric event queues are empty
 or exclude external writers. Leave F32 running as requested.
+The owner uses the original schedule setup config and journal with Demo 1's
+`managed_refresh.py status` and `stop --yes`, and the retained rebound inputs
+and cycle-7 journal with Demo 3's `native_rule.py --mode disable --cycle 7`
+and `--mode drain --cycle 7`; see the respective demo READMEs for the guarded
+procedures. Do not retry an uncertain mutation or fabricate a journal.
 
 For an emergency, **Cancel** the parent through Fabric monitoring and contact
 the setup owner. Cancellation is not cleanup: notebook, monitor or admitted

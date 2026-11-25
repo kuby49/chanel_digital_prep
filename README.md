@@ -20,7 +20,7 @@ inspects bounded queue heads, not every possible receipt. Both shared-window
 invocations used the Jobs API with defaults, not UI clicks; two consecutive
 successful invocations remain unverified. The shared schedule and rule were
 stopped and read back, while the launcher lock remains retained for coordinated
-reconciliation.
+reconciliation; do not remove it or retry without resolving the failed run.
 **Clicking Run again from the stopped state is not sufficient**:
 an operator must prepare and export a fresh bounded Demo 1 schedule, enable a
 new journaled Demo 3 rule cycle, and publish a profile containing the new

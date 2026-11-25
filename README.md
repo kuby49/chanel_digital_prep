@@ -132,13 +132,21 @@ The default one-minute source cadence is not a downstream visibility guarantee. 
 
 The prepared recovery entry point is
 [producer_wrapper_recovery](https://app.fabric.microsoft.com/groups/68971aa2-f4bc-48a2-8962-98a4cb1e9fc2/pipelines/2f42bac0-ccc3-4efc-8ff3-787fc93f3827?experience=power-bi).
+**Do not run this pipeline while recovery is in progress.** The UI-started
+run on November 25 passed parameter binding but failed Demo 2 verification.
+Demo 3 Copy timed out. The parent and notebook were still InProgress at
+14:27 UTC; the last lifecycle status was `stopping`, and the last lock reads
+showed the launcher and Demo 3 writer locks retained. Preserve those locks and
+the failed run's evidence; an isolated replacement is being prepared. The
+Demo 2 ordering fix is local only and does not establish full-cadence readiness.
+
 Sign in to MCAP. Opening this pipeline, its **Home** toolbar and **Run**
-control has been observed in the signed-in browser. Reported UI Run attempts
-reached the pipeline but were rejected before notebook startup because JSON
-objects and arrays were forwarded as string parameters. The pipeline now
-explicitly serializes those JSON parameters at the notebook boundary.
-A successful UI Run has not been verified. The two unchanged-profile repeat
-tests used the Jobs API.
+control has been observed in the signed-in browser. Earlier UI attempts were
+rejected before notebook startup because JSON objects and arrays were forwarded
+as string parameters. The pipeline now explicitly serializes those parameters,
+and the later UI retry reached the notebook with valid strings. A successful
+UI Run has not been verified. The two unchanged-profile repeat tests used the
+Jobs API.
 
 **Prepared window, UTC:** 2026-11-25 07:42:33 through 2026-11-26 07:42:33.
 Allocate the final run no later than **2026-11-26 05:42:33 UTC** to preserve
@@ -181,9 +189,9 @@ verification deadline; that is not permission to abandon the two-hour budget.
 Click earlier to allow for Fabric queueing and notebook startup: click time is
 not allocation time. A five-minute schedule keeps generating refresh workload
 while enabled, including between presentations. The capacity was scaled to
-F16 and read back Active at 09:26 UTC on November 25, 2026. The verified demo
-run used F32; a full run has not been tested at F16, where less compute may
-increase queueing or duration.
+F16 and read back Active at 09:26 UTC on November 25, 2026; a later readback
+confirmed F32 Active after the user raised it again. The verified demo run used
+F32; the UI retry at F16 failed and does not establish F16 performance.
 The schedule expires without renewal; the Activator rule has **no automatic
 TTL** and needs an explicit owner stop. Keep both dependencies enabled and
 unchanged through the final run's verification and cleanup.
@@ -228,7 +236,7 @@ the owner must independently reconcile/drain owned jobs and locks, then
 journal-stop/read back the shared schedule and rule. Do this before leaving the
 setup unattended or at the operating-window expiry; the rule does not stop
 itself. Point-in-time drain checks do not prove Fabric event queues are empty
-or exclude external writers. Leave F16 running as requested.
+or exclude external writers. Leave the capacity running at its final size.
 The owner uses the original schedule setup config and journal with Demo 1's
 `managed_refresh.py status` and `stop --yes`, and the retained rebound inputs
 and cycle-7 journal with Demo 3's `native_rule.py --mode disable --cycle 7`

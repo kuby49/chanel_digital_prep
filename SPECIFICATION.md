@@ -360,10 +360,12 @@ Recheck preview status and prerequisites during deployment; documentation is not
 - The user requested the capacity size explicitly: "cale it up to F32". It
   was left running at F32 after testing; the later F16 decision supersedes it.
 - The user subsequently asked, "can we decrease the capacity size to F16".
-  Scale the existing MCAP demo capacity down to F16 and leave it running.
-  The coordinator directed preservation of the prepared schedule and rule and
-  no additional demo run for this resize. The previously verified run used
-  F32, so F16 execution and its performance remain unverified.
+  The existing MCAP demo capacity was scaled down to F16. The coordinator
+  directed preservation of the prepared schedule and rule and no additional
+  demo run for this resize. The previously verified run used F32.
+- The user later reported, "I raised  the capacity va;ue back to F32".
+  A subsequent readback confirmed the capacity Active at F32. The UI retry
+  begun at F16 failed; the replacement has not yet been verified at F32.
 - The user granted upfront approvals needed to test these demos live, including cross-workspace access. Limit permissions and changes to what the demos actually require, record them, and do not modify unrelated workloads. This approval does not establish feature availability or permit skipping readiness and runtime verification.
 - Course correction: the original specification required Demo 1 MLV creation against an empty folder and prohibited seed data. After the empty-folder fixed-schema attempt failed, the user directed a separately classified bootstrap CSV, initially header-only: "do the thing with the separate bootstrap CSV (try to use an empty file, headers only. Shoudl work as you know the sample data column types, isnt it ? )". The user then explicitly allowed a fallback: "if empty file not enough, than use a CSV with one row". These decisions supersede the earlier empty-folder hard blocker, not the measured-run, isolation, accounting or verification requirements.
 - The user further requested: "After that you can remove the one file with one row (if you needed it) and do a FULL reload, isnt it". Test this only if the one-row fallback was used; confirm actual full-refresh behavior and clean outputs, or retain separately classified bootstrap accounting when it fails.

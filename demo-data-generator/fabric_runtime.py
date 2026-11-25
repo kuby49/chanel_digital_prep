@@ -14,6 +14,7 @@ from generator import RunConfig, canonical_bytes, strict_json_loads
 
 STARTUP_HEADROOM_SECONDS = 900
 MAX_ACTIVITY_SECONDS = 7 * 24 * 60 * 60
+QUEUE_SDK_VERSION = "12.13.0"
 
 
 def _kusto_endpoint(value):

@@ -1202,10 +1202,12 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(part["path"], "Libraries/PublicLibraries/environment.yml")
         self.assertEqual(base64.b64decode(part["payload"]), deploy.ENVIRONMENT_YML.read_bytes())
         self.assertEqual(self.spec["pins"], {"azure-identity": "1.27.0", "azure-kusto-data": "6.0.4",
-                                             "azure-kusto-ingest": "6.0.4"})
+                                             "azure-kusto-ingest": "6.0.4", "azure-storage-queue": "12.13.0"})
         invalid = (
             b"dependencies:\n  - pip:\n      - azure-identity>=1.27.0\n",
             b"dependencies:\n  - pip:\n      - azure-identity==1.27.0\n",
+            self.spec["content"].replace(b"      - azure-storage-queue==12.13.0", b""),
+            self.spec["content"].replace(b"azure-storage-queue==12.13.0", b"azure-storage-queue==12.14.0"),
             self.spec["content"] + b"\n      - azure_identity==1.27.0\n",
             self.spec["content"] + b"\n      - --index-url=https://example.invalid\n",
         )

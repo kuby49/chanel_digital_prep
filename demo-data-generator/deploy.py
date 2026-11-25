@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from fabric_ledger import _validate_ingestion_outcome
-from fabric_runtime import (configured_notebook_catalog, _kusto_endpoint, _tenant, native_parameters,
+from fabric_runtime import (QUEUE_SDK_VERSION, configured_notebook_catalog, _kusto_endpoint, _tenant, native_parameters,
                             require_write_roles, run_config, validate_native_template)
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
@@ -79,7 +79,7 @@ DEFAULT_NAMES = {"staging_lakehouse": "producer_staging", "environment_item": "p
                  "notebook": "producer_notebook",
                  "pipeline": "producer_wrapper"}
 ENVIRONMENT_PART = "Libraries/PublicLibraries/environment.yml"
-REQUIRED_ENVIRONMENT_PACKAGES = {"azure-identity", "azure-kusto-data", "azure-kusto-ingest"}
+REQUIRED_ENVIRONMENT_PACKAGES = {"azure-identity", "azure-kusto-data", "azure-kusto-ingest", "azure-storage-queue"}
 ENVIRONMENT_ALIASES = {
     "producer_environment_id": ("environment_id", "environment_item_id"),
     "producer_environment_name": ("environment_name", "environment_item_name"),
@@ -254,10 +254,11 @@ def _environment_spec():
             if name in pins:
                 raise ValueError
             pins[name] = match.group(2)
-        if not REQUIRED_ENVIRONMENT_PACKAGES.issubset(pins):
+        if not REQUIRED_ENVIRONMENT_PACKAGES.issubset(pins) or pins["azure-storage-queue"] != QUEUE_SDK_VERSION:
             raise ValueError
     except (OSError, UnicodeError, ValueError):
-        raise Blocked("environment.yml must contain only explicitly pinned pip dependencies, including the required Azure SDKs.") from None
+        raise Blocked("environment.yml must contain only explicitly pinned pip dependencies, including the "
+                      f"required Azure SDKs and azure-storage-queue=={QUEUE_SDK_VERSION}.") from None
     return {"content": content, "pins": pins, "sha256": hashlib.sha256(content).hexdigest()}
 
 

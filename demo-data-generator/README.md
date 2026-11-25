@@ -416,7 +416,9 @@ using it as evidence. Never stage or ingest into an unverified target.
 `--state-dir`, and `--result` arguments. `dry-run` is a local plan. Deployment
 uses an owned-resource journal, verifies tenant and principal, publishes the
 pinned `environment.yml`, and refuses to adopt unknown resources or retry an
-ambiguous creation. A fresh Environment's successful empty initial version is
+ambiguous creation. The Eventhouse status lookup requires
+`azure-storage-queue==12.13.0`; runtime preflight checks that exact version.
+A fresh Environment's successful empty initial version is
 published only after its staged pins and compute baseline are verified; an
 ambiguous publish remains journaled and is never automatically retried.
 Host token acquisition has a 120-second timeout and no

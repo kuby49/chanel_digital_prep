@@ -93,7 +93,9 @@ Reset the landing data and the materialized outputs, preserving or recreating
 needed for fixed-schema creation and contributes no sales rows. Bronze is
 append-only: deleting CSV files alone is not a reset of materialized history.
 Use a supported same-target rebuild/reset so both outputs are empty before
-new sales arrive, then restore their definitions and dimensions as needed.
+new sales arrive, then restore their definitions and dimensions as needed. A
+pipeline or notebook may initiate or schedule a supported MLV refresh as part
+of reset; recurring refresh still uses the native Lakehouse scheduler.
 
 At Run startup, create or update and enable the native schedule using supported
 Fabric operations. Any API-required start/end dates are calculated internally

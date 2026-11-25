@@ -384,13 +384,29 @@ operation ID and Location and never resubmits. If acceptance is unknown,
 stop and reconcile with the operator; neither a second submission nor a
 graph snapshot can prove the first operation will not complete later.
 
+One enabled cycle may cover a separately authorized, bounded operating window
+with sequential distinct native runs. Keep the same cycle, deployment proof,
+rule and staging binding across the Run clicks. Each run stops its own manifest
+admission and executes the cooperating writer barrier through `native_demo3.stop`;
+that hook does not disable the shared rule. Preserve previous manifests and stop
+markers, use fresh run IDs, and require the existing owned-job/absent-lock
+preflight before the next run. A queued old event may still start a guard job,
+but its stopped admission cannot authorize a new Copy.
+
+Declare the window's absolute UTC expiry and require each run's admission and
+cleanup deadlines to fit within it. The Activator `shouldRun` setting has no
+automatic TTL: the window owner must reject later launches and perform the
+coordinated rule shutdown below. Expiry alone does not stop the rule or prove
+event-queue drainage.
+
 After confirming enable, launch the separately prepared native recurring
 producer. Do not manually Run
 `Demo3EventE2ePipelineA9bbae81` or `Demo3EventE2eGuardA9bbae81`; their parameters
 come from events. Observe Activator history, pipeline monitoring, exact
 manifest batch IDs, batch audits and any writer-wait tickets, then inspect
-`Demo3EventE2eA9bbae81` / `dbo.factsales` by those batch IDs. Stop the rule first,
-request the producer's cooperative stop, and check drain after admitted work
+`Demo3EventE2eA9bbae81` / `dbo.factsales` by those batch IDs. At coordinated
+window shutdown, stop the rule first, request the producer's cooperative stop,
+and check drain after admitted work
 has finished. Drain checks terminal owned jobs and the absent writer lock
 at that moment; it does not prove that the Fabric event queue has drained.
 If jobs or a lock remain, wait and repeat only the read-only drain check.

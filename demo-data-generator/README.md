@@ -432,6 +432,16 @@ pinned `environment.yml`, and refuses to adopt unknown resources or retry an
 ambiguous creation. The Eventhouse adapter requires `azure-kusto-data==6.0.4`,
 `azure-kusto-ingest==6.0.4`, and `azure-storage-queue==12.13.0`; environment
 validation and runtime preflight enforce all three exact versions.
+For an independent deployment that must not consult the checked-in legacy
+MCAP manifest, explicitly use `--mode deploy --fresh-owned-state`. This opt-in
+requires an absolute empty state directory and no configured producer resource
+IDs or descriptions (including Environment aliases). It creates a new ownership
+journal using the normal deployment lifecycle; name collision, principal,
+resource and definition checks remain unchanged. It neither adopts nor edits
+the legacy manifest. Once the journal exists, resume without the flag; repeating
+the opt-in against any nonempty directory is blocked. This does not authorize
+cloud deployment, data execution, or readiness. Direct `StateStore.write()`
+is not an absent-state initialization command: it can replace existing state.
 A fresh Environment's successful empty initial version is
 published only after its staged pins and compute baseline are verified; an
 ambiguous publish remains journaled and is never automatically retried.

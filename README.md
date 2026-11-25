@@ -38,17 +38,32 @@ bundle uses a literal timeout covering the native run window plus startup.
 After fresh admission, the replacement pipeline accepted one native run on
 2026-11-24. Its lifecycle entered stopping before production: Demo 1 preparation
 failed with Spark `REQUIRES_SINGLE_PART_NAMESPACE` for its three-part
-namespace. The parent and its linked notebook failed, and the launcher lock was
-retained for reconciliation. Demo 2's manifest had zero batches, its bootstrap
-and monitor jobs were terminal, and its writer lock was absent. Demo 3's owned
-jobs were terminal and its writer lock was absent; event-queue drainage remains
-unverified. No sales delivery is claimed.
+namespace. The parent and its linked notebook failed. Demo 2's manifest had
+zero batches, its bootstrap and monitor jobs were terminal, and its writer
+lock was absent. Demo 3's owned jobs were terminal and its writer lock was
+absent; event-queue drainage remains unverified. After fresh reconciliation,
+the replacement launcher's unchanged lock was conditionally deleted and its
+absence confirmed; the old producer's recovery fence remains in place. No sales
+delivery is claimed.
+The notebook was then rebound to a schema-enabled default catalog while
+retaining the original staging IDs. A linked no-sales probe passed the Demo 1
+catalog queries and conditional storage operations against the original staging
+Lakehouse; the probe sentinel was confirmed absent. A fresh schedule, rule
+cycle and launch profile were prepared for a measured retry. That retry entered
+stopping before production when Demo 1 observed an active or unknown lineage
+refresh. Its parent and linked notebook failed; the correlated manifest had
+zero batches and the owned track jobs drained. The retry's unchanged launcher
+lock was conditionally deleted after reconciliation and its absence confirmed.
+A bounded idle-wait fix has been integrated locally but not yet published or
+verified in a measured run. No successful delivery is claimed.
 The original bounded Demo 1 setup schedule was disabled and read back; a new
 bounded schedule and updated profile were subsequently confirmed. The new
-schedule was also disabled and read back after the failed run. The
+schedule was also disabled and read back after the failed run; the later retry
+schedule was likewise disabled and read back. The
 first-cycle Demo 3 rule was disabled and read back; its second cycle was
 enabled after rebinding the guard to the replacement staging Lakehouse and
-disabled again after the failed run. A requested
+disabled again after the failed run. The third cycle was also disabled and
+read back after the retry. A requested
 capacity restart was completed after the user accepted interruption of the
 shared capacity, and it was subsequently scaled to F32. The capacity was
 read back Active at F32; the requested live retry remains incomplete.

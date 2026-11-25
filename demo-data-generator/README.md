@@ -192,12 +192,14 @@ reserve 300 seconds; set `shared.native_run_window_seconds`,
 needed. The window must cover preparation, producer duration, downstream
 verification and cleanup. Expiry is fixed at run allocation, never extended.
 The default verification deadline is 115 minutes after allocation and must
-fall within Demo 1's active setup schedule. A 180-minute setup window, once
-supported and explicitly configured, covers the complete 120-minute lifecycle
-when allocation occurs within its first 60 minutes. Startup and actual run
-times reduce the opportunity for additional serialized runs. The read-only
-hook must reject insufficient remaining coverage rather than silently shorten
-verification or widen the schedule.
+fall within Demo 1's active setup schedule. A confirmed 24-hour setup window,
+when explicitly configured and accepted by Demo 1, covers the complete
+120-minute lifecycle when allocation occurs within its first 22 hours. Startup
+and actual run times reduce the opportunity for additional serialized runs.
+The read-only hook must reject insufficient remaining coverage rather than
+silently shorten verification or widen the schedule. The schedule continues
+to refresh while enabled until its fixed end and must be stopped separately;
+the Demo 3 rule has no automatic TTL.
 The pipeline activity timeout is a literal derived at publication: the
 configured measured duration or native run window plus 900 seconds of startup
 headroom. Although the service accepts timeout expressions in definitions, an

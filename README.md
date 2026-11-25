@@ -1,5 +1,11 @@
 # Chanel Fabric ingestion demonstrations
 
+**Approved simplification, implementation in progress:** [SPECIFICATION.md](SPECIFICATION.md)
+is authoritative for the parameter-free Fabric **Run**, automatic reset/start/stop,
+and fixed targets in [demo-settings.json](demo-settings.json). The recovery and
+presenter-window procedures below describe the older implementation; they are
+not additional requirements or evidence that the simplified Run is deployed.
+
 The [specification](SPECIFICATION.md) defines three isolated comparisons using the same staged CSV bytes: [file-backed materialized lake views](demo-1-materialized-lake-views/), [Eventhouse and OneLake availability](demo-2-eventhouse/), and [OneLake events with Copy](demo-3-onelake-events-copy/). The [shared producer](demo-data-generator/) runs as a bounded Fabric notebook through a wrapper pipeline in its own workspace, not as a local presentation-time process.
 
 **Presenter:** [Run, observe and stop the prepared demos](#presenter-walkthrough).

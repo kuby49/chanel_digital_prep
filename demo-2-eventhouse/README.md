@@ -172,12 +172,21 @@ storage and checks its SHA-256 before calling `EventhouseAdapter.submit`. This
 path was verified for the bounded synthetic run below, not for a measured run.
 The adapter uses the
 named CSV mapping, ignores the header, and uses matching `ingestIfNotExists`
-and `ingest-by` tags. `ingestion_status(source_id)` peeks at status queues
-without deleting messages; absence of a terminal message is not proof of
+and `ingest-by` tags. `ingestion_status(source_id)` non-destructively peeks at
+up to 32 messages in each success and failure queue. It avoids the SDK's
+aggregate peek, which may omit a queue's visible head when other queues are
+busy. This uses the Kusto SDK's queue-resource supplier, which is not a
+documented stable interface. The lookup checks for the tested Kusto ingestion
+and data SDKs at `6.0.4` and Storage Queue SDK at `12.13.0`; incompatible
+versions or unavailable queues fail closed as unknown. The adapter does not
+log or persist the queue URLs, which can contain credentials. If no receipt is
+found and any queue head is full, the outcome is unknown because a message
+may be beyond its first 32 visible entries; this specific outcome has error
+code `StatusQueueHeadSaturated`. No matching messages in the inspected heads
+does not rule out conflicting evidence beyond them. Absence is not proof of
 failure or permission to retry. Match the terminal source ID and then verify
-the KQL result. Unknown or in-flight submissions require reconciliation, not a
-blind retry. The SDK's bounded peeks can miss messages behind other queue
-entries, so an unavailable terminal result remains unresolved.
+the KQL result. Unknown or in-flight submissions require reconciliation, not
+a blind retry.
 
 Serialized replay was verified for the bootstrap below. This does not prove
 concurrent duplicate submissions are safe or exactly-once delivery in general:

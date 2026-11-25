@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from eventhouse_core import (
@@ -239,28 +240,79 @@ class EventhouseAdapter:
         try:
             from azure.core.exceptions import AzureError
             from azure.kusto.data.exceptions import KustoError
-            from azure.kusto.ingest.status import KustoIngestStatusQueues
+            from azure.kusto.ingest.status import FailureMessage, KustoIngestStatusQueues, SuccessMessage
+            from azure.storage.queue import QueueClient, TextBase64DecodePolicy
         except ImportError:
             return IngestionOutcome(
-                "unknown", _now(), source_id, diagnostic="The Kusto ingestion SDK is not installed"
+                "unknown", _now(), source_id,
+                diagnostic="The Kusto ingestion or Storage Queue SDK is not installed",
+            )
+
+        try:
+            versions = (
+                version("azure-kusto-ingest"),
+                version("azure-kusto-data"),
+                version("azure-storage-queue"),
+            )
+        except PackageNotFoundError:
+            return IngestionOutcome(
+                "unknown", _now(), source_id,
+                diagnostic="Status queue SDK versions cannot be verified; reconcile before retrying",
+            )
+        if versions != ("6.0.4", "6.0.4", "12.13.0"):
+            return IngestionOutcome(
+                "unknown", _now(), source_id,
+                diagnostic="Status queue SDK versions are not validated; reconcile before retrying",
             )
 
         try:
             queues = KustoIngestStatusQueues(self.ingest_client)
             matches = []
-            for status, queue in (("failed", queues.failure), ("succeeded", queues.success)):
-                for message in queue.peek(32):
-                    if str(message.IngestionSourceId).lower() == source_id:
-                        matches.append((status, message))
-        except (AzureError, KustoError, OSError, TimeoutError, ValueError, ZeroDivisionError) as exc:
+            full_head = False
+            for status, status_queue, message_type in (
+                ("failed", queues.failure, FailureMessage),
+                ("succeeded", queues.success, SuccessMessage),
+            ):
+                # The SDK's aggregate peek can omit a queue's head when other queues are busy.
+                get_resources = getattr(status_queue, "get_queues_func", None)
+                if not callable(get_resources):
+                    return IngestionOutcome(
+                        "unknown", _now(), source_id,
+                        diagnostic="The Kusto SDK cannot enumerate status queues; reconcile before retrying",
+                    )
+                resources = list(get_resources())
+                if not resources:
+                    return IngestionOutcome(
+                        "unknown", _now(), source_id,
+                        diagnostic="Kusto returned no status queues; reconcile before retrying",
+                    )
+                for resource in resources:
+                    with QueueClient.from_queue_url(
+                        str(resource), message_decode_policy=TextBase64DecodePolicy()
+                    ) as queue:
+                        entries = list(queue.peek_messages(max_messages=32))
+                        full_head = full_head or len(entries) == 32
+                        for entry in entries:
+                            message = message_type(entry.content)
+                            if str(message.IngestionSourceId).lower() == source_id:
+                                matches.append((status, message))
+        except (AzureError, KustoError, OSError, TimeoutError, ValueError, TypeError, AttributeError) as exc:
             return IngestionOutcome(
                 "unknown", _now(), source_id,
                 diagnostic=f"Ingestion status lookup failed ({type(exc).__name__})",
             )
         if not matches:
+            if full_head:
+                return IngestionOutcome(
+                    "unknown", _now(), source_id,
+                    error_code="StatusQueueHeadSaturated",
+                    diagnostic="A status queue head is full; a terminal receipt may be beyond "
+                               "the first 32 messages; reconcile before retrying",
+                )
             return IngestionOutcome(
                 "pending", _now(), source_id,
-                diagnostic="No terminal status is visible; reconcile before retrying",
+                diagnostic="No terminal status is visible in the first 32 messages of each queue; "
+                           "reconcile before retrying",
             )
         statuses = {status for status, _ in matches}
         if len(statuses) != 1:

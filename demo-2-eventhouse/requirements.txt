@@ -1,3 +1,4 @@
 azure-identity>=1.15,<2
-azure-kusto-data>=5,<7
-azure-kusto-ingest>=5,<7
+azure-kusto-data==6.0.4
+azure-kusto-ingest==6.0.4
+azure-storage-queue==12.13.0

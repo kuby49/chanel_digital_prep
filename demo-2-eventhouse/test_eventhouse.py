@@ -2,11 +2,13 @@ import csv
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,6 +67,54 @@ class FakeQueryClient:
     def execute_query(self, database, query):
         self.queries.append((database, query))
         return types.SimpleNamespace(primary_results=[self.rows])
+
+
+class FakeStatusQueueClient:
+    def __init__(self, messages):
+        self.messages = messages
+        self.requests = []
+        self.error = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def peek_messages(self, *, max_messages):
+        self.requests.append(max_messages)
+        if self.error:
+            raise self.error
+        if max_messages > 32:
+            raise ValueError("Azure Queue peeks are limited to 32 messages")
+        return self.messages[:max_messages]
+
+
+def status_message(source_id, operation_id, error_code=None):
+    return types.SimpleNamespace(content=json.dumps({
+        "IngestionSourceId": source_id, "OperationId": operation_id, "ErrorCode": error_code,
+    }))
+
+
+def fake_status_queues(success_groups, failure_groups):
+    from azure.kusto.ingest.status import FailureMessage, StatusQueue, SuccessMessage
+
+    clients = {}
+
+    def make_queue(name, groups, message_type):
+        resources = []
+        for index, messages in enumerate(groups):
+            url = f"https://example.test/{name}-{index}?sig=test"
+            resources.append(url)
+            clients[url] = FakeStatusQueueClient(messages)
+        queue = StatusQueue(lambda: resources, message_type)
+        queue._get_queues = lambda: [clients[url] for url in resources]
+        return queue
+
+    return types.SimpleNamespace(
+        success=make_queue("success", success_groups, SuccessMessage),
+        failure=make_queue("failure", failure_groups, FailureMessage),
+    ), clients
 
 
 class IngestionTests(unittest.TestCase):
@@ -151,40 +201,103 @@ class IngestionTests(unittest.TestCase):
     def test_ingestion_status_peeks_for_the_matching_terminal_source(self):
         source_id = "11111111-1111-4111-8111-111111111111"
         other_id = "22222222-2222-4222-8222-222222222222"
-        success = types.SimpleNamespace(
-            IngestionSourceId=source_id, OperationId="service-operation",
+        other = status_message(other_id, "other")
+        target = status_message(source_id, "service-operation")
+        queues, clients = fake_status_queues(
+            [[other] * 9 + [target], [other] * 8, [other] * 7, [other] * 8],
+            [[], [], [], []],
         )
-        failure = types.SimpleNamespace(
-            IngestionSourceId=other_id, OperationId="other", ErrorCode="Forbidden",
-        )
-
-        class FakeQueue:
-            def __init__(self, messages):
-                self.messages = messages
-                self.requests = []
-
-            def peek(self, count):
-                self.requests.append(count)
-                return self.messages
-
-        successes, failures = FakeQueue([success]), FakeQueue([failure])
-        queues = types.SimpleNamespace(success=successes, failure=failures)
-        with patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues):
+        with patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues), \
+             patch("azure.storage.queue.QueueClient.from_queue_url",
+                   side_effect=lambda url, **kwargs: clients[url]):
+            self.assertNotIn(source_id, [str(m.IngestionSourceId) for m in queues.success.peek(32)])
+            for client in clients.values():
+                client.requests.clear()
             outcome = self.adapter.ingestion_status(source_id)
             self.assertEqual(outcome.status, "succeeded")
             self.assertEqual(outcome.service_operation_id, "service-operation")
-            self.assertEqual(self.adapter.ingestion_status(other_id).error_code, "Forbidden")
-            self.assertEqual(
-                self.adapter.ingestion_status("33333333-3333-4333-8333-333333333333").status,
-                "pending",
-            )
-            failures.messages = [types.SimpleNamespace(
-                IngestionSourceId=source_id, OperationId="other", ErrorCode="private secret",
-            )]
-            self.assertEqual(self.adapter.ingestion_status(source_id).status, "unknown")
-        self.assertEqual(successes.requests, [32, 32, 32, 32])
-        self.assertEqual(failures.requests, [32, 32, 32, 32])
+        self.assertTrue(all(client.requests == [32] for client in clients.values()))
         self.assertEqual(self.adapter.ingestion_status("invalid").status, "unknown")
+
+    def test_ingestion_status_reports_unknown_beyond_the_queue_head(self):
+        source_id = "11111111-1111-4111-8111-111111111111"
+        other = status_message("22222222-2222-4222-8222-222222222222", "other")
+        target = status_message(source_id, "visible")
+        queues, clients = fake_status_queues(
+            [[other] * 31 + [target]], [[]],
+        )
+        with patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues), \
+             patch("azure.storage.queue.QueueClient.from_queue_url",
+                   side_effect=lambda url, **kwargs: clients[url]):
+            self.assertEqual(self.adapter.ingestion_status(source_id).status, "succeeded")
+            clients["https://example.test/success-0?sig=test"].messages.insert(0, other)
+            outcome = self.adapter.ingestion_status(source_id)
+            clients["https://example.test/success-0?sig=test"].messages = [other]
+            pending = self.adapter.ingestion_status(source_id)
+        self.assertEqual(outcome.status, "unknown")
+        self.assertEqual(outcome.error_code, "StatusQueueHeadSaturated")
+        self.assertIsNone(outcome.service_operation_id)
+        self.assertEqual(outcome.source_id, source_id)
+        self.assertIn("first 32 messages", outcome.diagnostic)
+        self.assertIn("reconcile before retrying", outcome.diagnostic)
+        self.assertEqual(pending.status, "pending")
+        self.assertIsNone(pending.error_code)
+        self.assertTrue(all(client.requests == [32, 32, 32] for client in clients.values()))
+
+    def test_ingestion_status_reports_failure_and_conflicting_receipts(self):
+        source_id = "11111111-1111-4111-8111-111111111111"
+        failure = status_message(source_id, "failed-operation", "Forbidden")
+        success = status_message(source_id, "successful-operation")
+        queues, clients = fake_status_queues([[success]], [[failure]])
+        with patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues), \
+             patch("azure.storage.queue.QueueClient.from_queue_url",
+                   side_effect=lambda url, **kwargs: clients[url]):
+            conflict = self.adapter.ingestion_status(source_id)
+            self.assertEqual(conflict.status, "unknown")
+            self.assertIsNone(conflict.error_code)
+            clients["https://example.test/success-0?sig=test"].messages = []
+            outcome = self.adapter.ingestion_status(source_id)
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.error_code, "Forbidden")
+        self.assertEqual(outcome.service_operation_id, "failed-operation")
+
+    def test_ingestion_status_fails_closed_when_queue_discovery_or_peek_fails(self):
+        source_id = "11111111-1111-4111-8111-111111111111"
+        queues, clients = fake_status_queues([[]], [[]])
+        with patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues), \
+             patch("azure.storage.queue.QueueClient.from_queue_url",
+                   side_effect=lambda url, **kwargs: clients[url]):
+            clients["https://example.test/failure-0?sig=test"].error = ValueError("private secret")
+            outcome = self.adapter.ingestion_status(source_id)
+            self.assertEqual(outcome.status, "unknown")
+            self.assertIsNone(outcome.error_code)
+            self.assertNotIn("private secret", outcome.diagnostic)
+            clients["https://example.test/failure-0?sig=test"].error = None
+            clients["https://example.test/failure-0?sig=test"].messages = [
+                status_message("22222222-2222-4222-8222-222222222222", "other")
+            ] * 32
+            clients["https://example.test/success-0?sig=test"].error = ValueError("private secret")
+            self.assertIsNone(self.adapter.ingestion_status(source_id).error_code)
+            queues.failure = types.SimpleNamespace()
+            self.assertEqual(self.adapter.ingestion_status(source_id).status, "unknown")
+            queues.failure = types.SimpleNamespace(get_queues_func=lambda: [])
+            self.assertEqual(self.adapter.ingestion_status(source_id).status, "unknown")
+
+    def test_ingestion_status_rejects_unvalidated_sdk_versions(self):
+        source_id = "11111111-1111-4111-8111-111111111111"
+        for versions in (
+            ["99.0", "6.0.4", "12.13.0"],
+            ["6.0.4", "99.0", "12.13.0"],
+            ["6.0.4", "6.0.4", "99.0"],
+            PackageNotFoundError("missing"),
+        ):
+            with self.subTest(versions=versions), patch("ingestion.version", side_effect=versions), \
+                 patch("azure.kusto.ingest.status.KustoIngestStatusQueues") as queues:
+                outcome = self.adapter.ingestion_status(source_id)
+                self.assertEqual(outcome.status, "unknown")
+                self.assertIsNone(outcome.error_code)
+                self.assertIn("version", outcome.diagnostic)
+                queues.assert_not_called()
 
     def test_reconciliation_requires_exact_count_total_and_unique_keys(self):
         digest = hashlib.sha256(csv_bytes([sample_row()])).hexdigest()

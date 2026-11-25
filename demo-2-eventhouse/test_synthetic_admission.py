@@ -403,21 +403,33 @@ class AdmissionTests(unittest.TestCase):
             self.skipTest("Azure identity and Kusto ingestion SDKs are unavailable.")
         fixture = Fixture()
         fixture.database["ingestion_uri"] = "https://ingest-example.kusto.fabric.microsoft.com"
-        message = SimpleNamespace(IngestionSourceId=fixture.proof["auth_source_id"],
-                                  OperationId=fixture.proof["auth_service_operation_id"], ErrorCode=None)
-        failure, success = mock.Mock(), mock.Mock()
-        failure.peek.return_value, success.peek.return_value = [], [message]
-        queues = SimpleNamespace(failure=failure, success=success)
+        message = SimpleNamespace(content=json.dumps({
+            "IngestionSourceId": fixture.proof["auth_source_id"],
+            "OperationId": fixture.proof["auth_service_operation_id"],
+        }))
+        failure_url, success_url = "https://example.test/failure", "https://example.test/success"
+        failure, success = mock.MagicMock(), mock.MagicMock()
+        failure.__enter__.return_value, success.__enter__.return_value = failure, success
+        failure.peek_messages.return_value, success.peek_messages.return_value = [], [message]
+        queues = SimpleNamespace(
+            failure=SimpleNamespace(get_queues_func=lambda: [failure_url]),
+            success=SimpleNamespace(get_queues_func=lambda: [success_url]),
+        )
+        storage_queues = {failure_url: failure, success_url: success}
         original_close = QueuedIngestClient.close
         credential_close = AzureCliCredential.close
         with mock.patch("azure.kusto.ingest.status.KustoIngestStatusQueues", return_value=queues), \
+             mock.patch("azure.storage.queue.QueueClient.from_queue_url",
+                        side_effect=lambda url, **kwargs: storage_queues[url]), \
              mock.patch.object(QueuedIngestClient, "close", autospec=True, side_effect=original_close) as close, \
              mock.patch.object(AzureCliCredential, "close", autospec=True, side_effect=credential_close) as cred_close, \
              mock.patch.object(AzureCliCredential, "get_token", side_effect=AssertionError("network token requested")), \
              mock.patch("requests.sessions.Session.request", side_effect=AssertionError("network request")):
             admission._queue(fixture.deployment, fixture.database, fixture.proof)
-        failure.peek.assert_called_once_with(32)
-        success.peek.assert_called_once_with(32)
+        failure.peek_messages.assert_called_once_with(max_messages=32)
+        success.peek_messages.assert_called_once_with(max_messages=32)
+        failure.__exit__.assert_called_once()
+        success.__exit__.assert_called_once()
         close.assert_called_once()
         cred_close.assert_called_once()
 

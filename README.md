@@ -2,7 +2,7 @@
 
 The [specification](SPECIFICATION.md) defines three isolated comparisons using the same staged CSV bytes: [file-backed materialized lake views](demo-1-materialized-lake-views/), [Eventhouse and OneLake availability](demo-2-eventhouse/), and [OneLake events with Copy](demo-3-onelake-events-copy/). The [shared producer](demo-data-generator/) runs as a bounded Fabric notebook through a wrapper pipeline in its own workspace, not as a local presentation-time process.
 
-**Four native three-demo runs are verified, including two consecutive runs
+**Five native three-demo runs are verified, including two consecutive runs
 with the same profile.** On 2026-11-25 the linked pipeline
 and notebook completed with ten deterministic files, 10,000 rows and
 1,502,033,495 USD minor units. All three native verification and stop hooks
@@ -29,7 +29,13 @@ The receipt lookup inspects bounded queue heads, not every possible receipt.
 Both pairs of shared-window invocations used the Jobs API with defaults, not UI
 clicks. That shared schedule and rule were stopped and read back with
 owned jobs terminal. A separate 24-hour presenter window was subsequently
-prepared as described below. **Clicking Run from a stopped or expired state
+prepared and its default profile completed a further API run: its manifest
+contained ten batches, 10,000 rows and 1,502,033,495 minor units with all 30
+deliveries verified. Independent Demo 1 Delta and Demo 2 KQL/shortcut checks
+matched; Demo 3's ten event-origin Copy audits matched the manifest and their
+guard-reported target comparisons, but did not independently reread Delta rows.
+Afterward the producer was idle, owned locks were absent and the shared schedule
+and rule remained enabled. **Clicking Run from a stopped or expired state
 is not sufficient**:
 an operator must prepare and export a fresh bounded Demo 1 schedule, enable a
 new journaled Demo 3 rule cycle, and publish a profile containing the new
@@ -133,10 +139,11 @@ its full two-hour budget; click earlier to allow for queueing. At 07:59 UTC on
 November 25, the matching producer definitions had been published and read
 back, the five-minute schedule and Demo 3 rule cycle 7 had been enabled and
 independently read back, and checked owned work was terminal with relevant
-writer locks absent. The capacity was Active at F32. These observations are
-point-in-time; runtime admission is checked again for each Run. This newly
-published profile has not itself been exercised by a Run, and clicking Run in
-the UI remains unverified.
+writer locks absent. The capacity was Active at F32. The new profile then
+completed the API default run described above; a post-run readback at 08:56 UTC
+confirmed both dependencies remained enabled and the launcher was idle.
+These observations are point-in-time; runtime admission is checked again for
+each Run. Clicking Run in the UI remains unverified.
 
 The schedule generates recurring refresh workload, including between
 presentations, until it is stopped or its fixed end passes. It does not renew
@@ -144,6 +151,9 @@ itself. The Demo 3 rule does **not** expire automatically: the window owner must
 stop new launches and explicitly disable and drain it, as well as close the
 schedule, after the last presentation or at expiry. Keep both enabled until
 any admitted run and its verification and cleanup have finished.
+A one-time session check is scheduled for 2026-11-26 07:42:33 UTC to
+coordinate closure; it is not an Activator TTL or a guarantee that cleanup
+will succeed. The owner must resolve any blocker and verify the stopped state.
 
 ### What is prepared, and when
 

@@ -258,16 +258,15 @@ the cutoff passes or the schedule expires, **Run does not reprovision or renew
 it**. The operator must provision and export a new bounded schedule and republish
 its receipt in the template before another demo window.
 
-Within the fixed window, the presenter can pause or resume the existing schedule
-using **Materialized lake views > Manage > Manage schedules** without editing its
-configuration. Resume is accepted only if the schedule's pinned ID, owner ID and
+Fabric documents an On/Off control under **Materialized lake views > Manage >
+Manage schedules**, but portal pause/resume has not been verified live for this
+setup and is not the supported presenter-window lifecycle. Runtime would accept
+the same receipt after a resume only if the schedule's pinned ID, owner ID and
 type, cadence, scope and bounds remain unchanged and all live admission checks
 pass. Fabric identifies the owner as the creator or last modifier, so changing
-the schedule under another identity can block admission. A portal pause/resume
-has not yet been verified live. If re-enabling starts a refresh immediately,
-admission waits within its existing bounds for idle successful lineage. Pause
-only after the run and its cleanup have completed and active lineage jobs have
-become terminal; the fixed expiry is not extended by pausing.
+the schedule under another identity can block admission. If re-enabling starts a
+refresh immediately, admission waits within its existing bounds for idle
+successful lineage. The fixed expiry would not be extended by pausing.
 
 After durable producer delivery completes, `verify` accepts only the actual
 ten measured manifest BatchIDs, 1,000 distinct IDs `1..1000` per batch in both
@@ -310,7 +309,7 @@ changed schedule or active/unknown jobs block cleanup and retain the producer's
 global lock for reconciliation. Forced notebook termination cannot promise
 finally/cleanup; the shared schedule remains under its explicit bound.
 
-At the end of the operating window, use `managed_refresh.py status/stop --yes`
+At the end of the operating window, the owner uses `managed_refresh.py status/stop --yes`
 with the **original setup config and journal**, not a fresh native run ID.
 Confirm disabled readback and wait for any active lineage refresh to become
 terminal. MLV schedule and job pagination stays on the public Fabric API and

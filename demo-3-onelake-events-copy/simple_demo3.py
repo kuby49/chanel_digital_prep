@@ -328,10 +328,11 @@ def copy_pipeline(config, existing):
             or sink["type"] != "LakehouseTableSink"
             or sink["datasetSettings"]["typeProperties"].get("schema") != "dbo"
             or sink["datasetSettings"]["typeProperties"].get("table") != "factsales"
-            or props.get("enableStaging") is not False
-            or sink["tableActionOption"] != "Upsert"
-            or sink["upsertSettings"]["keys"] != ["BatchID", "SalesLineID"]):
-        raise ValueError("Expected exact-file native Lakehouse Copy with the existing FactSales Upsert")
+            or props.get("enableStaging") is not False):
+        raise ValueError("Expected exact-file native Lakehouse Copy into dbo.factsales")
+    sink["tableActionOption"] = "Append"
+    sink.pop("upsertSettings", None)
+    sink.pop("keyColumns", None)
     location["fileName"] = {
         "type": "Expression", "value": "@last(split(pipeline().parameters.sourceSubject, '/'))",
     }

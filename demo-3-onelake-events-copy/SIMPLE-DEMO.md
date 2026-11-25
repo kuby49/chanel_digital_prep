@@ -5,7 +5,7 @@ uses `simple_demo3.py` to stop the fixed Activator and any active runs of its
 Copy pipeline, clear `Files/incoming/sales`, and recreate `dbo.factsales` and
 the sample dimensions in the configured Lakehouse. It enables the Activator
 before publishing sales. Each native `FileCreated` event passes `___subject`
-to a single Copy activity, which reads that exact CSV and Upserts into the
+to a single Copy activity, which reads that exact CSV and appends to the
 Delta fact table. There is no guard notebook, audit store or replay step.
 
 On normal completion the helper waits for the final numbered batch to appear
@@ -27,7 +27,8 @@ reset and start over.
    in `demo-settings.json`. Pass that JSON object to
    `simple_demo3.copy_pipeline(config, existing)` and publish the returned
    `pipeline-content.json` to the **same pipeline**. This retains the existing
-   Lakehouse connection, connector settings and column mappings. Leave the
+   Lakehouse connection and column mappings and selects Append without key
+   settings. Leave the
    existing Reflex linked to that pipeline; `start()` retains the event
    subject binding and removes the obsolete event ID argument.
 3. Bundle `simple_demo3.py` and the producer's `simple_data.py` in the

@@ -9,7 +9,7 @@ import simple_demo3
 
 
 class SimpleDemo3Tests(unittest.TestCase):
-    def test_pipeline_uses_only_native_copy_and_the_event_filename(self):
+    def test_pipeline_migrates_legacy_upsert_to_exact_file_append(self):
         config = {"demo-3": {
             "workspace_id": "workspace", "lakehouse_id": "lakehouse", "connection_id": "connection",
             "landing_path": "Files/incoming/sales", "destination_table": "dbo.factsales",
@@ -40,6 +40,10 @@ class SimpleDemo3Tests(unittest.TestCase):
         self.assertEqual([item["type"] for item in properties["activities"]], ["Copy"])
         copy = properties["activities"][0]
         self.assertEqual(copy["dependsOn"], [])
+        sink = copy["typeProperties"]["sink"]
+        self.assertEqual(sink["tableActionOption"], "Append")
+        self.assertNotIn("upsertSettings", sink)
+        self.assertNotIn("keyColumns", sink)
         self.assertEqual(
             copy["typeProperties"]["source"]["datasetSettings"]["typeProperties"]["location"]["fileName"],
             {"type": "Expression", "value": "@last(split(pipeline().parameters.sourceSubject, '/'))"},

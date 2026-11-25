@@ -2,7 +2,8 @@
 
 The [specification](SPECIFICATION.md) defines three isolated comparisons using the same staged CSV bytes: [file-backed materialized lake views](demo-1-materialized-lake-views/), [Eventhouse and OneLake availability](demo-2-eventhouse/), and [OneLake events with Copy](demo-3-onelake-events-copy/). The [shared producer](demo-data-generator/) runs as a bounded Fabric notebook through a wrapper pipeline in its own workspace, not as a local presentation-time process.
 
-**Two native three-demo runs are verified; a subsequent repeat failed.** On 2026-11-25 the linked pipeline
+**Four native three-demo runs are verified, including two consecutive runs
+with the same profile.** On 2026-11-25 the linked pipeline
 and notebook completed with ten deterministic files, 10,000 rows and
 1,502,033,495 USD minor units. All three native verification and stop hooks
 passed. Independent checks reconciled Demo 1 Delta and Demo 2 data; Demo 3's
@@ -14,13 +15,20 @@ that unchanged profile failed: the Demo 2 monitor did not observe a source
 receipt by its deadline, leaving the producer launcher lock retained. Independent
 readback subsequently found success receipts and matching KQL totals for all
 ten provisionally attributed candidate batches; that does not change the failed
-controller result or establish successful parent attribution. The local receipt
-lookup fix has not been published or verified in a fresh end-to-end run. It
-inspects bounded queue heads, not every possible receipt. Both shared-window
-invocations used the Jobs API with defaults, not UI clicks; two consecutive
-successful invocations remain unverified. The shared schedule and rule were
-stopped and read back, while the launcher lock remains retained for coordinated
-reconciliation; do not remove it or retry without resolving the failed run.
+controller result or establish successful parent attribution. Its unchanged
+owned launcher lock was removed after coordinated terminal-work reconciliation;
+the failed records and old-producer fence were preserved.
+
+After publishing the receipt lookup fix and pinned SDKs, two consecutive runs
+with one unchanged shared-window profile completed with all 30 deliveries and
+all native verification and stop hooks passing in each run. Independent checks
+reconciled both Demo 1 Delta snapshots and Demo 2 KQL totals and receipts;
+Demo 3's event-origin Copy audits reported 1,000 rows per batch and zero
+differences or orphans. Each run had 10,000 rows and 1,502,033,495 minor units.
+The receipt lookup inspects bounded queue heads, not every possible receipt.
+Both pairs of shared-window invocations used the Jobs API with defaults, not UI
+clicks. The latest shared schedule and rule were stopped and read back with
+owned jobs terminal; the capacity was read back Active at F32.
 **Clicking Run again from the stopped state is not sufficient**:
 an operator must prepare and export a fresh bounded Demo 1 schedule, enable a
 new journaled Demo 3 rule cycle, and publish a profile containing the new

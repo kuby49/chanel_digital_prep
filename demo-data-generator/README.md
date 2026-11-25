@@ -57,6 +57,26 @@ or `failed`), `started_at_utc`, the run bound and batch start times; on normal
 termination it records `finished_at_utc` and `result`. A missing terminal
 marker is not evidence that the remote job stopped.
 
+For schema-qualified cross-workspace Spark queries, the producer notebook may
+use a schema-enabled default catalog without moving its staging data. Set
+`shared.notebook_default_lakehouse` to an object containing `workspace_id`,
+`lakehouse_id` and `lakehouse_name` for the existing schema-enabled Lakehouse.
+When omitted, the owned staging Lakehouse remains the default. Deployment
+checks the configured catalog's exact identity and `defaultSchema` before
+publication and validation; runtime checks the published catalog and original
+staging bindings separately. All producer manifests, locks and preflight files
+remain in `shared.workspace_id` / `shared.staging_lakehouse_id`. Updating an
+existing notebook permits this change only from the exact owned staging binding
+and still requires the approved definition digest, idle jobs and readback.
+For a no-sales diagnostic, invoke the notebook's `preflight` operation with
+`probe_storage: true` and `schema_catalog_probe` in `run_config_json`.
+The probe object contains `workspace_id`, `workspace_name`, `lakehouse_id` and
+`lakehouse_name` for the published default catalog. It checks matching runtime
+identities and live schema-enabled metadata, then runs the same read-only
+Demo 1 dimension and MLV-column queries used before production. It also checks
+conditional storage against the original staging Lakehouse; the probe result
+and any failure are recorded under its explicit `Files/preflight` path.
+
 The Eventhouse adapter receives a checked driver-local CSV. A delivery becomes
 `verified` only after a matching source ID has terminal SDK success and KQL
 returns the exact row count, distinct keys and total. The observed

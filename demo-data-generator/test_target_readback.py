@@ -317,10 +317,12 @@ class MeasuredRuntimeTests(unittest.TestCase):
                              for workspace in (WORKSPACE, LANDING_WORKSPACE)}
         self.clients = {name: self.client for name in self.selected}
         self.table_client = TableClient()
+        self.published_binding = None
 
     def prepare(self):
         return prepare_measured(self.document, self.selected, self.nonce, self.binding, self.context,
-                                self.identities, self.clients, self.table_client)
+                                self.identities, self.clients, self.table_client,
+                                published_binding=self.published_binding)
 
     def test_requires_matching_live_targets_identity_and_destination_write_roles(self):
         run, duration, targets, producer = self.prepare()
@@ -341,6 +343,27 @@ class MeasuredRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "token identities"):
             self.prepare()
         self.assertEqual(self.client.calls, [])
+
+    def test_schema_catalog_keeps_the_published_staging_binding(self):
+        catalog = {"workspace_id": LANDING_WORKSPACE, "lakehouse_id": LANDING_LAKEHOUSE,
+                   "lakehouse_name": "schema_lakehouse"}
+        self.document["shared"]["notebook_default_lakehouse"] = catalog
+        self.binding["config_sha256"] = hashlib.sha256(canonical_bytes(self.document)).hexdigest()
+        self.context.update(defaultLakehouseId=LANDING_LAKEHOUSE, defaultLakehouseWorkspaceId=LANDING_WORKSPACE)
+        published = {"workspace_id": WORKSPACE, "staging_lakehouse_id": LAKEHOUSE,
+                     "default_lakehouse_workspace_id": LANDING_WORKSPACE, "default_lakehouse_id": LANDING_LAKEHOUSE}
+        with self.assertRaisesRegex(ValueError, "bound producer notebook"):
+            self.prepare()
+        self.published_binding = dict(published, staging_lakehouse_id=LANDING_LAKEHOUSE)
+        with self.assertRaisesRegex(ValueError, "bound producer notebook"):
+            self.prepare()
+        self.published_binding = published
+        self.context["defaultLakehouseWorkspaceId"] = WORKSPACE
+        with self.assertRaisesRegex(ValueError, "bound producer notebook"):
+            self.prepare()
+        self.assertEqual(self.client.calls, [])
+        self.context["defaultLakehouseWorkspaceId"] = LANDING_WORKSPACE
+        self.assertEqual(self.prepare()[3], self.binding["producer"])
 
     def test_changed_config_and_missing_direct_write_role_are_blocked(self):
         self.document["data"]["seed"] += 1

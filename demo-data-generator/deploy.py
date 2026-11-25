@@ -39,8 +39,8 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from fabric_ledger import _validate_ingestion_outcome
-from fabric_runtime import (_kusto_endpoint, _tenant, native_parameters, require_write_roles,
-                            run_config, validate_native_template)
+from fabric_runtime import (configured_notebook_catalog, _kusto_endpoint, _tenant, native_parameters,
+                            require_write_roles, run_config, validate_native_template)
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
                        strict_json_loads, validate_run_manifest)
@@ -189,6 +189,10 @@ def parse_config(config, prefix):
     shared = config.get("shared", {})
     if not isinstance(common, dict) or not isinstance(shared, dict):
         raise ContractError("common and shared must be configuration objects.")
+    try:
+        configured_notebook_catalog(shared)
+    except ValueError as exc:
+        raise ContractError(str(exc)) from None
     for configured in (config.get("prefix"), common.get("prefix")):
         if configured is not None and configured != prefix:
             raise ContractError("config prefix does not match --prefix.")
@@ -1198,6 +1202,9 @@ def _native_profile(config, resources):
                         "rows_per_file": run.rows_per_file, "file_count": run.file_count,
                         "interval_seconds": run.interval_seconds, "max_duration_seconds": duration,
                         "currency": "USD"}}
+    catalog = configured_notebook_catalog(shared)
+    if catalog is not None:
+        runtime["shared"]["notebook_default_lakehouse"] = catalog
     for name in selected:
         keys = ("ingestion_endpoint", "query_endpoint", "kql_database_name", "sales_table", "csv_mapping") \
             if name == "demo-2" else ("landing_uri",)
@@ -1248,9 +1255,11 @@ def _definition(state, kind, config=None):
         resources = state["resources"]
         workspace_id = resources["workspace"]["id"]
         if kind == "notebook":
+            catalog = configured_notebook_catalog((config or {}).get("shared", {}))
             return fabric_assets.notebook_definition(workspace_id, resources["staging_lakehouse"]["id"],
                                                      resources["staging_lakehouse"]["name"],
-                                                     resources["environment_item"]["id"])
+                                                     resources["environment_item"]["id"],
+                                                     default_lakehouse=catalog)
         profile = _native_profile(config or {}, resources)
         duration = None
         if profile is None:
@@ -1298,7 +1307,7 @@ def _read_definition(client, state, kind):
     return definition, _parts(definition)
 
 
-def _merge_notebook_content(expected, live, *, allow_missing_trident):
+def _merge_notebook_content(expected, live, *, allow_missing_trident, previous_binding=None):
     try:
         if not isinstance(expected, dict) or not isinstance(live, dict):
             raise ValueError
@@ -1314,7 +1323,8 @@ def _merge_notebook_content(expected, live, *, allow_missing_trident):
         live_dependencies = live_metadata["dependencies"]
         if not isinstance(target_dependencies, dict) or not isinstance(live_dependencies, dict):
             raise ValueError
-        if any(live_dependencies.get(key) != value for key, value in target_dependencies.items()):
+        if any(live_dependencies.get(key) != value for key, value in target_dependencies.items()
+               if key != "lakehouse"):
             raise ValueError
         binding = target_metadata["trident"]["lakehouse"]
         if target_dependencies.get("lakehouse") != binding:
@@ -1325,7 +1335,12 @@ def _merge_notebook_content(expected, live, *, allow_missing_trident):
         if isinstance(trident, dict) and "lakehouse" in trident and trident["lakehouse"] is None:
             raise ValueError
         existing_binding = trident.get("lakehouse") if trident is not None else None
-        if existing_binding != binding and not (allow_missing_trident and existing_binding is None):
+        dependency_binding = live_dependencies.get("lakehouse")
+        if dependency_binding == binding:
+            if existing_binding != binding and not (allow_missing_trident and existing_binding is None):
+                raise ValueError
+        elif (previous_binding is None or dependency_binding != previous_binding
+              or existing_binding != previous_binding):
             raise ValueError
         if "trident" in live_metadata and trident is None:
             raise ValueError
@@ -1335,6 +1350,7 @@ def _merge_notebook_content(expected, live, *, allow_missing_trident):
             raise ValueError
         merged = copy.deepcopy(live)
         merged["metadata"].setdefault("trident", {})["lakehouse"] = copy.deepcopy(binding)
+        merged["metadata"]["dependencies"]["lakehouse"] = copy.deepcopy(binding)
         for target_cell, live_cell, result_cell in zip(expected_cells, live_cells, merged["cells"]):
             if not isinstance(target_cell, dict) or not isinstance(live_cell, dict):
                 raise ValueError
@@ -1357,7 +1373,22 @@ def _merge_notebook_content(expected, live, *, allow_missing_trident):
                       "no overwrite was attempted.") from None
 
 
+def _verify_schema_catalog(client, config):
+    catalog = configured_notebook_catalog((config or {}).get("shared", {}))
+    if catalog is None:
+        return
+    _, live = client.get(f"/v1/workspaces/{catalog['workspace_id']}/lakehouses/{catalog['lakehouse_id']}")
+    properties = live.get("properties") if isinstance(live, dict) else None
+    if (not isinstance(live, dict) or live.get("id") != catalog["lakehouse_id"]
+            or live.get("workspaceId") != catalog["workspace_id"] or live.get("type") != "Lakehouse"
+            or live.get("displayName") != catalog["lakehouse_name"] or not isinstance(properties, dict)
+            or not isinstance(properties.get("defaultSchema"), str) or not properties["defaultSchema"].strip()):
+        raise Blocked("Configured notebook default Lakehouse is not the exact schema-enabled catalog.")
+
+
 def _verify_definition(client, state, kind, config=None):
+    if kind == "notebook":
+        _verify_schema_catalog(client, config)
     expected_definition = _definition(state, kind, config)
     expected = _parts(expected_definition)
     if kind == "notebook" and expected_definition.get("format") != "ipynb":
@@ -1466,14 +1497,23 @@ def _update_producer_definition(config, plan, state_dir, kind, before_sha256):
         principal_type = _workspace_principal(client, state, plan)
         for owned_kind in ITEM_TYPES:
             _verify_item(client, state, plan, owned_kind, principal_type)
+        if kind == "notebook":
+            _verify_schema_catalog(client, config)
         if kind == "pipeline":
             _verify_definition(client, state, "notebook", config)
         live, actual = _read_definition(client, state, kind)
         if kind == "notebook":
             if set(target_parts) != {"notebook-content.ipynb"} or "notebook-content.ipynb" not in actual:
                 raise Blocked("Live notebook definition differs from the supported layout; no overwrite was attempted.")
+            previous_binding = None
+            if configured_notebook_catalog(config.get("shared", {})) is not None:
+                staging = state["resources"]["staging_lakehouse"]
+                previous_binding = {"default_lakehouse": staging["id"], "default_lakehouse_name": staging["name"],
+                                    "default_lakehouse_workspace_id": state["resources"]["workspace"]["id"],
+                                    "known_lakehouses": [{"id": staging["id"]}]}
             merged = _merge_notebook_content(target_parts["notebook-content.ipynb"],
-                                             actual["notebook-content.ipynb"], allow_missing_trident=True)
+                                             actual["notebook-content.ipynb"], allow_missing_trident=True,
+                                             previous_binding=previous_binding)
             target["parts"][0]["payload"] = base64.b64encode(canonical_bytes(merged)).decode("ascii")
             target_parts = _parts(target)
         if set(actual) - {".platform"} != set(target_parts):
@@ -1615,6 +1655,8 @@ def _create_resource(client, store, state, plan, kind, spec=None, config=None):
             del payload["type"]
             payload["definition"] = _environment_definition(spec or _environment_spec())
         elif kind in ("notebook", "pipeline"):
+            if kind == "notebook":
+                _verify_schema_catalog(client, config)
             payload["definition"] = _definition(state, kind, config)
     if any(isinstance(item, dict) and isinstance(item.get("displayName"), str)
            and item["displayName"].casefold() == plan["names"][kind].casefold() for item in existing):

@@ -315,7 +315,10 @@ class MeasuredSubmissionTests(unittest.TestCase):
                                    "landing_uri": (f"abfss://{target['workspace_id']}@onelake.dfs.fabric.microsoft.com/"
                                                    f"{target['item_id']}/Files/raw")}
         self.document["shared"].update(native_launch=True, native_reusable=True, native_selected_demos="demo-1",
-                                       producer_notebook_id=NOTEBOOK)
+                                       producer_notebook_id=NOTEBOOK,
+                                       notebook_default_lakehouse={"workspace_id": target["workspace_id"],
+                                                                   "lakehouse_id": target["item_id"],
+                                                                   "lakehouse_name": "demo_lakehouse"})
         self.document["data"]["run_id"] = None
         first = deploy._parts(deploy._definition(self.state, "pipeline", self.document))["pipeline-content.json"]
         self.assertIsNone(self.document["data"]["run_id"])
@@ -338,6 +341,8 @@ class MeasuredSubmissionTests(unittest.TestCase):
         self.assertNotIn("expires_at_utc", profile)
         self.assertEqual(profile["document"]["data"]["run_id"], "native_template")
         self.assertEqual(profile["document"]["demo-1"]["lakehouse_name"], "demo_lakehouse")
+        self.assertEqual(profile["document"]["shared"]["notebook_default_lakehouse"],
+                         self.document["shared"]["notebook_default_lakehouse"])
         now = datetime(2030, 1, 1, tzinfo=timezone.utc)
         first_run = fabric_runtime.native_parameters(profile, now=now)
         next_run = fabric_runtime.native_parameters(profile, now=now + timedelta(days=1))

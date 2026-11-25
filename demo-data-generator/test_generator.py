@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
@@ -22,6 +22,11 @@ from fabric_files import materialize_staged
 import fabric_assets
 from fabric_assets import notebook_definition, pipeline_definition
 from runner import Submission, run_batches
+
+
+PREFLIGHT_BINDING = {"workspace_id": "workspace", "staging_lakehouse_id": "lakehouse",
+                     "default_lakehouse_workspace_id": "workspace", "default_lakehouse_id": "lakehouse"}
+PREFLIGHT_ROOT = "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse/Files/preflight"
 
 
 class GeneratorTests(unittest.TestCase):
@@ -181,6 +186,31 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pipeline_definition("not-an-id", notebook_id)
 
+    def test_schema_catalog_binding_keeps_staging_and_environment_explicit(self):
+        workspace = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        staging = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        catalog_workspace = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        catalog_lakehouse = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        environment = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        catalog = {"workspace_id": catalog_workspace, "lakehouse_id": catalog_lakehouse,
+                   "lakehouse_name": "schema_lakehouse"}
+        definition = notebook_definition(workspace, staging, "producer_staging", environment,
+                                         default_lakehouse=catalog)
+        notebook = json.loads(base64.b64decode(definition["parts"][0]["payload"]))
+        expected = {"default_lakehouse": catalog_lakehouse, "default_lakehouse_name": "schema_lakehouse",
+                    "default_lakehouse_workspace_id": catalog_workspace,
+                    "known_lakehouses": [{"id": catalog_lakehouse}, {"id": staging}]}
+        self.assertEqual(notebook["metadata"]["trident"]["lakehouse"], expected)
+        self.assertEqual(notebook["metadata"]["dependencies"]["lakehouse"], expected)
+        self.assertEqual(notebook["metadata"]["dependencies"]["environment"]["workspaceId"], workspace)
+        source = "".join(notebook["cells"][1]["source"])
+        self.assertIn(repr({"workspace_id": workspace, "staging_lakehouse_id": staging,
+                            "default_lakehouse_workspace_id": catalog_workspace,
+                            "default_lakehouse_id": catalog_lakehouse}), source)
+        with self.assertRaises(ValueError):
+            notebook_definition(workspace, staging, "producer_staging", environment,
+                                default_lakehouse=dict(catalog, lakehouse_id=staging))
+
     def test_notebook_bundle_loads_the_exact_generator(self):
         definition = notebook_definition("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                                          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -288,9 +318,10 @@ class GeneratorTests(unittest.TestCase):
         )
         scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
                  "notebookutils": utils, "operation": "preflight", "probe_id": "probe-1",
-                 "runtime_evidence_json": "{}", "run_config_json": '{"probe_marker":"unique"}', "selected_demos_json": "[]"}
+                 "runtime_evidence_json": "{}", "run_config_json": '{"probe_marker":"unique"}', "selected_demos_json": "[]",
+                 "_producer_runtime_binding": dict(PREFLIGHT_BINDING)}
         exec("".join(notebook["cells"][1]["source"]), scope)
-        stored = files["Files/preflight/probe-1.json"]
+        stored = files[PREFLIGHT_ROOT + "/probe-1.json"]
         self.assertNotIn(token, stored)
         evidence = json.loads(stored)
         self.assertEqual(evidence["storage_principal_oid"], "test-object")
@@ -309,7 +340,7 @@ class GeneratorTests(unittest.TestCase):
         with patch("builtins.__import__", side_effect=missing_kusto):
             with self.assertRaisesRegex(RuntimeError, "Kusto SDK imports"):
                 exec("".join(notebook["cells"][1]["source"]), scope)
-        evidence = json.loads(files["Files/preflight/probe-missing-sdk.json"])
+        evidence = json.loads(files[PREFLIGHT_ROOT + "/probe-missing-sdk.json"])
         self.assertFalse(evidence["kusto_sdk_available"])
         self.assertEqual(evidence["kusto_principal_oid"], "test-object")
 
@@ -464,20 +495,32 @@ class GeneratorTests(unittest.TestCase):
 
         utils = SimpleNamespace(
             runtime=SimpleNamespace(context={"isForPipeline": True, "currentWorkspaceId": "workspace",
-                                             "defaultLakehouseId": "lakehouse"}),
+                                             "defaultLakehouseId": "catalog",
+                                             "defaultLakehouseWorkspaceId": "catalog-workspace"}),
             credentials=SimpleNamespace(getToken=lambda audience: token), fs=FakeFs(),
         )
         scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
                  "notebookutils": utils, "operation": "preflight", "probe_id": "storage-probe",
-                 "runtime_evidence_json": "{}", "run_config_json": '{"probe_storage":true}', "selected_demos_json": "[]"}
+                 "runtime_evidence_json": "{}", "run_config_json": '{"probe_storage":true}', "selected_demos_json": "[]",
+                 "_producer_runtime_binding": dict(PREFLIGHT_BINDING, default_lakehouse_id="catalog",
+                                                   default_lakehouse_workspace_id="catalog-workspace")}
         store = MemoryStore()
-        with patch("fabric_storage.OneLakeStore", return_value=store):
+        with patch("fabric_storage.OneLakeStore", return_value=store) as create_store:
             exec("".join(notebook["cells"][1]["source"]), scope)
-        evidence = json.loads(files["Files/preflight/storage-probe.json"])["conditional_storage_probe"]
+        self.assertEqual(create_store.call_args.args[:2], ("workspace", "lakehouse"))
+        evidence = json.loads(files[PREFLIGHT_ROOT + "/storage-probe.json"])["conditional_storage_probe"]
         self.assertTrue(all(evidence[key] for key in ("duplicate_create_rejected", "stale_update_rejected",
                                                       "update_readback_verified", "stale_delete_rejected",
                                                       "deleted")))
         self.assertEqual(store.files, {})
+        utils.runtime.context["defaultLakehouseWorkspaceId"] = "wrong-workspace"
+        scope["probe_id"] = "wrong-catalog"
+        with patch("fabric_storage.OneLakeStore") as create_store:
+            with self.assertRaisesRegex(RuntimeError, "binding differs"):
+                exec("".join(notebook["cells"][1]["source"]), scope)
+        create_store.assert_not_called()
+        self.assertNotIn(PREFLIGHT_ROOT + "/wrong-catalog.json", files)
+        utils.runtime.context["defaultLakehouseWorkspaceId"] = "catalog-workspace"
 
         class UnguardedDeleteStore(MemoryStore):
             def delete(self, path, etag):
@@ -487,10 +530,70 @@ class GeneratorTests(unittest.TestCase):
         with patch("fabric_storage.OneLakeStore", return_value=UnguardedDeleteStore()):
             with self.assertRaisesRegex(RuntimeError, "Conditional storage probe"):
                 exec("".join(notebook["cells"][1]["source"]), scope)
-        evidence = json.loads(files["Files/preflight/unguarded-delete.json"])["conditional_storage_probe"]
+        evidence = json.loads(files[PREFLIGHT_ROOT + "/unguarded-delete.json"])["conditional_storage_probe"]
         self.assertEqual(evidence["step"], "stale-delete")
         self.assertFalse(evidence.get("stale_delete_rejected", False))
         self.assertFalse(evidence["deleted"])
+
+    def test_preflight_schema_catalog_probe_reads_exact_target_without_sales(self):
+        notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
+        workspace, staging = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        catalog_workspace, catalog_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        probe = {"workspace_id": catalog_workspace, "workspace_name": "demo-workspace",
+                 "lakehouse_id": catalog_id, "lakehouse_name": "DemoLakehouse"}
+        binding = {"workspace_id": workspace, "staging_lakehouse_id": staging,
+                   "default_lakehouse_workspace_id": catalog_workspace, "default_lakehouse_id": catalog_id}
+        claims = base64.urlsafe_b64encode(json.dumps({"oid": "identity", "tid": "tenant"}).encode()).decode().rstrip("=")
+        files, calls, queries = {}, [], []
+
+        class FakeFs:
+            def exists(self, path):
+                return path in files
+
+            def mkdirs(self, path):
+                files[path] = None
+                return True
+
+            def put(self, path, value, overwrite):
+                files[path] = value
+                return True
+
+            def head(self, path, size):
+                return files[path][:size]
+
+        class FakeClient:
+            def __init__(self, token_provider):
+                self.token_provider = token_provider
+
+            def get(self, path):
+                calls.append(path)
+                if path == f"/v1/workspaces/{catalog_workspace}":
+                    return {}, {"id": catalog_workspace, "displayName": "demo-workspace", "type": "Workspace"}
+                return {}, {"id": catalog_id, "workspaceId": catalog_workspace, "type": "Lakehouse",
+                            "displayName": "DemoLakehouse", "properties": {"defaultSchema": "dbo"}}
+
+        companion = ModuleType("native_demo1")
+        companion._dimensions = lambda context, base: queries.append((context["spark"], base))
+        spark = SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None))
+        utils = SimpleNamespace(runtime=SimpleNamespace(context={"isForPipeline": True, "currentWorkspaceId": workspace,
+                                "defaultLakehouseId": catalog_id, "defaultLakehouseWorkspaceId": catalog_workspace}),
+                                credentials=SimpleNamespace(getToken=lambda audience: f"header.{claims}.signature"),
+                                fs=FakeFs())
+        scope = {"spark": spark, "notebookutils": utils, "operation": "preflight", "probe_id": "catalog-probe",
+                 "runtime_evidence_json": "{}", "run_config_json": json.dumps({"schema_catalog_probe": probe}),
+                 "selected_demos_json": "[]", "_producer_runtime_binding": binding}
+        with patch.dict(sys.modules, {"native_demo1": companion}), patch("fabric_runtime.RuntimeFabricClient", FakeClient):
+            exec("".join(notebook["cells"][1]["source"]), scope)
+            self.assertEqual(queries, [(spark, "`demo-workspace`.`DemoLakehouse`")])
+            self.assertEqual(len(calls), 2)
+            path = f"abfss://{workspace}@onelake.dfs.fabric.microsoft.com/{staging}/Files/preflight/catalog-probe.json"
+            self.assertEqual(json.loads(files[path])["schema_catalog_probe"]["status"], "passed")
+            scope.update(probe_id="bad-catalog", run_config_json=json.dumps(
+                {"schema_catalog_probe": dict(probe, workspace_name="bad`;DROP TABLE x")}))
+            with self.assertRaisesRegex(RuntimeError, "Schema catalog probe"):
+                exec("".join(notebook["cells"][1]["source"]), scope)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(queries), 1)
 
     def test_preflight_verifies_and_cleans_only_unique_destination_sentinel(self):
         notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
@@ -534,9 +637,10 @@ class GeneratorTests(unittest.TestCase):
                   "destination_access_probe": {"workspace_id": workspace, "lakehouse_id": lakehouse}}
         scope = {"spark": SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
                  "notebookutils": utils, "operation": "preflight", "probe_id": "probe-2",
-                 "runtime_evidence_json": "{}", "run_config_json": json.dumps(config), "selected_demos_json": "[]"}
+                 "runtime_evidence_json": "{}", "run_config_json": json.dumps(config), "selected_demos_json": "[]",
+                 "_producer_runtime_binding": dict(PREFLIGHT_BINDING)}
         exec("".join(notebook["cells"][1]["source"]), scope)
-        evidence = json.loads(files["Files/preflight/probe-2.json"])
+        evidence = json.loads(files[PREFLIGHT_ROOT + "/probe-2.json"])
         self.assertNotIn(token, json.dumps(evidence))
         access = evidence["destination_access_probe"]
         self.assertEqual(access["path"], probe_dir + "/identity-probe.txt")
@@ -544,13 +648,13 @@ class GeneratorTests(unittest.TestCase):
         self.assertNotIn(probe_dir, files)
         self.assertEqual(files["untouched"], "existing")
 
-        files.pop("Files/preflight/probe-2.json")
+        files.pop(PREFLIGHT_ROOT + "/probe-2.json")
         files[probe_dir] = None
         files[probe_dir + "/identity-probe.txt"] = "existing sentinel"
         with self.assertRaisesRegex(RuntimeError, "Destination access probe"):
             exec("".join(notebook["cells"][1]["source"]), scope)
         self.assertEqual(files[probe_dir + "/identity-probe.txt"], "existing sentinel")
-        evidence = json.loads(files["Files/preflight/probe-2.json"])
+        evidence = json.loads(files[PREFLIGHT_ROOT + "/probe-2.json"])
         self.assertFalse(evidence["destination_access_probe"]["readback_verified"])
 
     def test_runner_spaces_batches_and_isolates_failures_on_resume(self):

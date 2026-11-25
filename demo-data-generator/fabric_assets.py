@@ -6,6 +6,7 @@ import json
 import uuid
 from pathlib import Path
 
+from fabric_runtime import configured_notebook_catalog
 from job_lifecycle import activity_timeout
 
 
@@ -38,7 +39,7 @@ def _definition(content, part_path, format_name=None):
     return definition
 
 
-def _bundle_cell():
+def _bundle_cell(published_binding=None):
     files = {name: (HERE / name).read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
              for name in PRODUCER_MODULES}
 
@@ -82,23 +83,36 @@ def _bundle_cell():
         "    (_producer_dir / _name).write_bytes(_bundle_base64.b64decode(_content))\n",
         "_bundle_sys.path.insert(0, str(_producer_dir))\n",
     ]
+    if published_binding is not None:
+        source.append(f"_producer_runtime_binding = {published_binding!r}\n")
     return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": source}
 
 
-def notebook_definition(workspace_id, lakehouse_id, lakehouse_name, environment_id=None):
+def notebook_definition(workspace_id, lakehouse_id, lakehouse_name, environment_id=None, *, default_lakehouse=None):
     workspace_id, lakehouse_id = _guid(workspace_id), _guid(lakehouse_id)
     if not isinstance(lakehouse_name, str) or not lakehouse_name:
         raise ValueError("Lakehouse name is required")
+    catalog = (configured_notebook_catalog({"notebook_default_lakehouse": default_lakehouse})
+               if default_lakehouse is not None else
+               {"workspace_id": workspace_id, "lakehouse_id": lakehouse_id, "lakehouse_name": lakehouse_name})
+    if catalog["lakehouse_id"] == lakehouse_id and catalog["workspace_id"] != workspace_id:
+        raise ValueError("The staging Lakehouse cannot belong to a different workspace")
+    known = [{"id": catalog["lakehouse_id"]}]
+    if catalog["lakehouse_id"] != lakehouse_id:
+        known.append({"id": lakehouse_id})
     notebook = json.loads((HERE / "notebook.ipynb").read_text(encoding="utf-8"))
-    binding = {"default_lakehouse": lakehouse_id, "default_lakehouse_name": lakehouse_name,
-               "default_lakehouse_workspace_id": workspace_id, "known_lakehouses": [{"id": lakehouse_id}]}
+    binding = {"default_lakehouse": catalog["lakehouse_id"], "default_lakehouse_name": catalog["lakehouse_name"],
+               "default_lakehouse_workspace_id": catalog["workspace_id"], "known_lakehouses": known}
     notebook["metadata"].setdefault("trident", {})["lakehouse"] = binding
     notebook["metadata"].setdefault("dependencies", {})["lakehouse"] = binding
     if environment_id is not None:
         notebook["metadata"]["dependencies"]["environment"] = {
             "environmentId": _guid(environment_id), "workspaceId": workspace_id,
         }
-    notebook["cells"].insert(1, _bundle_cell())
+    published_binding = {"workspace_id": workspace_id, "staging_lakehouse_id": lakehouse_id,
+                         "default_lakehouse_workspace_id": catalog["workspace_id"],
+                         "default_lakehouse_id": catalog["lakehouse_id"]}
+    notebook["cells"].insert(1, _bundle_cell(published_binding))
     return _definition(notebook, "notebook-content.ipynb", "ipynb")
 
 

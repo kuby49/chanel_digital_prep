@@ -356,6 +356,57 @@ class DefinitionUpdateTests(unittest.TestCase):
         self.update("pipeline")
         self.assertEqual(self.calls, ["notebook", "pipeline"])
 
+    def test_schema_catalog_migration_requires_exact_owned_previous_binding(self):
+        catalog = {"workspace_id": "99999999-9999-4999-8999-999999999999",
+                   "lakehouse_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "lakehouse_name": "schema_catalog"}
+        self.config["shared"]["notebook_default_lakehouse"] = catalog
+        self.client.get.return_value = ({}, {"id": catalog["lakehouse_id"], "workspaceId": catalog["workspace_id"],
+                                             "displayName": catalog["lakehouse_name"], "type": "Lakehouse",
+                                             "properties": {"defaultSchema": "dbo"}})
+        desired = {"default_lakehouse": catalog["lakehouse_id"], "default_lakehouse_name": catalog["lakehouse_name"],
+                   "default_lakehouse_workspace_id": catalog["workspace_id"],
+                   "known_lakehouses": [{"id": catalog["lakehouse_id"]}, {"id": LAKEHOUSE}]}
+        target = deploy._parts(self.targets["notebook"])["notebook-content.ipynb"]
+        target["metadata"]["dependencies"]["lakehouse"] = copy.deepcopy(desired)
+        target["metadata"]["trident"]["lakehouse"] = copy.deepcopy(desired)
+        self.targets["notebook"]["parts"][0] = definition(target)["parts"][0]
+        original = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+        for field in ("dependencies", "trident"):
+            drift = copy.deepcopy(original)
+            drift["metadata"][field]["lakehouse"] = dict(
+                drift["metadata"][field]["lakehouse"], default_lakehouse=NOTEBOOK)
+            self.live["notebook"]["parts"][0] = definition(drift)["parts"][0]
+            with self.assertRaisesRegex(deploy.Blocked, "cannot be preserved safely"):
+                self.update("notebook")
+        drift = copy.deepcopy(original)
+        del drift["metadata"]["trident"]
+        self.live["notebook"]["parts"][0] = definition(drift)["parts"][0]
+        with self.assertRaisesRegex(deploy.Blocked, "cannot be preserved safely"):
+            self.update("notebook")
+        self.live["notebook"]["parts"][0] = definition(original)["parts"][0]
+        self.update("notebook")
+        actual = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
+        self.assertEqual(actual["metadata"]["dependencies"]["lakehouse"], desired)
+        self.assertEqual(actual["metadata"]["trident"]["lakehouse"], desired)
+        self.assertEqual(self.live["notebook"]["parts"][-1], self.platform)
+        self.assertEqual(self.calls, ["notebook"])
+
+    def test_schema_catalog_must_be_verified_before_definition_update(self):
+        catalog = {"workspace_id": "99999999-9999-4999-8999-999999999999",
+                   "lakehouse_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "lakehouse_name": "schema_catalog"}
+        self.config["shared"]["notebook_default_lakehouse"] = catalog
+        valid = {"id": catalog["lakehouse_id"], "workspaceId": catalog["workspace_id"],
+                 "displayName": catalog["lakehouse_name"], "type": "Lakehouse",
+                 "properties": {"defaultSchema": "dbo"}}
+        invalid = [dict(valid, properties=value) for value in ({}, {"defaultSchema": ""}, {"defaultSchema": None})]
+        invalid.extend(dict(valid, **{key: "different"}) for key in ("id", "workspaceId", "displayName", "type"))
+        for live in invalid:
+            self.client.get.return_value = ({}, live)
+            with self.assertRaisesRegex(deploy.Blocked, "schema-enabled"):
+                self.update("notebook")
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(deploy._definition_update_record(self.store))
+
     def test_update_rejects_unsafe_layout_or_conflicting_bindings(self):
         original = deploy._parts(self.live["notebook"])["notebook-content.ipynb"]
         mutations = (
@@ -563,6 +614,18 @@ class ReadbackClient:
 
 
 class ContractTests(unittest.TestCase):
+    def test_notebook_catalog_requires_complete_canonical_binding(self):
+        catalog = {"workspace_id": WORKSPACE, "lakehouse_id": LAKEHOUSE, "lakehouse_name": "schema_catalog"}
+        for value in (None, {}, dict(catalog, workspace_id="invalid"),
+                      dict(catalog, lakehouse_name=" "), dict(catalog, extra=True)):
+            document = config()
+            document["shared"]["notebook_default_lakehouse"] = value
+            with self.subTest(value=value), self.assertRaises(deploy.ContractError):
+                deploy.parse_config(document, "sample")
+        document = config()
+        document["shared"]["notebook_default_lakehouse"] = catalog
+        deploy.parse_config(document, "sample")
+
     def args(self, mode, extra=()):
         root = Path.cwd().resolve()
         return ["--mode", mode, "--config", str(root / "config-input.json"), "--prefix", "sample",

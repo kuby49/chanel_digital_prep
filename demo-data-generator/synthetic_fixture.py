@@ -26,7 +26,7 @@ def _uuid(value):
 
 
 def prepare_fixture(document, selected, probe_id, request, context, identities, *,
-                    kind="demo2-synthetic-stage-v1"):
+                    kind="demo2-synthetic-stage-v1", published_binding=None):
     """Bind the fixture to one runtime and one separately provisioned target."""
     expected_fields = {"kind", "nonce", "config_sha256", "tenant_id",
                        "identity_id", "producer", "target"}
@@ -101,10 +101,9 @@ def prepare_fixture(document, selected, probe_id, request, context, identities, 
             or not isinstance(document.get("common"), dict)
             or document["common"].get("tenant_id") != tenant):
         raise ValueError("Synthetic fixture differs from configured producer identities")
-    if (not isinstance(context, dict) or context.get("isForPipeline") is not True
-            or context.get("currentWorkspaceId") != producer["workspace_id"]
-            or context.get("defaultLakehouseId") != producer["staging_lakehouse_id"]
-            or context.get("currentNotebookId") != producer["notebook_id"]):
+    from fabric_runtime import notebook_context_matches
+
+    if not notebook_context_matches(shared, producer, context, published_binding):
         raise ValueError("Synthetic fixture is not running in the bound producer notebook")
     if identities != {"storage": (tenant, identity), "kusto": (tenant, identity)}:
         raise ValueError("Synthetic runtime identities do not match the bound principal")

@@ -105,6 +105,25 @@ class FixtureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_fixture(document, ["demo-2"], "other-probe-123456789", request, context, identities)
 
+    def test_schema_catalog_synthetic_fixture_is_still_bound_to_original_staging(self):
+        document, request, context, identities = fixture()
+        catalog_workspace = "11111111-1111-4111-8111-111111111111"
+        catalog_id = "22222222-2222-4222-8222-222222222222"
+        document["shared"]["notebook_default_lakehouse"] = {
+            "workspace_id": catalog_workspace, "lakehouse_id": catalog_id, "lakehouse_name": "schema_catalog"}
+        request["config_sha256"] = hashlib.sha256(canonical_bytes(document)).hexdigest()
+        context.update(defaultLakehouseId=catalog_id, defaultLakehouseWorkspaceId=catalog_workspace)
+        published = {"workspace_id": WORKSPACE, "staging_lakehouse_id": LAKEHOUSE,
+                     "default_lakehouse_workspace_id": catalog_workspace, "default_lakehouse_id": catalog_id}
+        with self.assertRaisesRegex(ValueError, "bound producer notebook"):
+            prepare_fixture(document, ["demo-2"], PROBE, request, context, identities)
+        _, _, producer = prepare_fixture(document, ["demo-2"], PROBE, request, context, identities,
+                                          published_binding=published)
+        self.assertEqual(producer["staging_lakehouse_id"], LAKEHOUSE)
+        with self.assertRaisesRegex(ValueError, "bound producer notebook"):
+            prepare_fixture(document, ["demo-2"], PROBE, request, context, identities,
+                            published_binding=dict(published, staging_lakehouse_id=catalog_id))
+
     def test_queue_peek_is_non_destructive_and_does_not_return_message_contents(self):
         calls = []
 

@@ -159,6 +159,45 @@ def _uuid(value):
     return str(parsed)
 
 
+def configured_notebook_catalog(shared):
+    if not isinstance(shared, dict):
+        raise ValueError("Shared notebook configuration must be an object")
+    if "notebook_default_lakehouse" not in shared:
+        return None
+    catalog = shared["notebook_default_lakehouse"]
+    if not isinstance(catalog, dict) or set(catalog) != {"workspace_id", "lakehouse_id", "lakehouse_name"}:
+        raise ValueError("Notebook default Lakehouse requires workspace, Lakehouse ID and name")
+    for key in ("workspace_id", "lakehouse_id"):
+        if _uuid(catalog[key]) != catalog[key]:
+            raise ValueError("Notebook default Lakehouse IDs must be canonical")
+    name = catalog["lakehouse_name"]
+    if (not isinstance(name, str) or not name or name != name.strip() or len(name) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        raise ValueError("Notebook default Lakehouse name is invalid")
+    return dict(catalog)
+
+
+def notebook_context_matches(shared, producer, context, published_binding=None):
+    catalog = configured_notebook_catalog(shared)
+    if not isinstance(context, dict) or not isinstance(producer, dict):
+        return False
+    workspace, staging = producer.get("workspace_id"), producer.get("staging_lakehouse_id")
+    default_workspace = catalog["workspace_id"] if catalog else workspace
+    default_lakehouse = catalog["lakehouse_id"] if catalog else staging
+    expected = {"workspace_id": workspace, "staging_lakehouse_id": staging,
+                "default_lakehouse_workspace_id": default_workspace, "default_lakehouse_id": default_lakehouse}
+    if published_binding is None:
+        if catalog is not None:
+            return False
+    elif published_binding != expected:
+        return False
+    return (context.get("isForPipeline") is True
+            and context.get("currentWorkspaceId") == workspace
+            and context.get("defaultLakehouseId") == default_lakehouse
+            and (catalog is None or context.get("defaultLakehouseWorkspaceId") == default_workspace)
+            and context.get("currentNotebookId") == producer.get("notebook_id"))
+
+
 def _tenant(document):
     common = document.get("common", {})
     if not isinstance(common, dict):
@@ -271,6 +310,7 @@ def validate_native_template(profile):
             or shared.get("staging_lakehouse_id") != producer["staging_lakehouse_id"]
             or shared.get("producer_notebook_id") != producer["notebook_id"]):
         raise ValueError("Reusable native producer IDs differ from runtime template")
+    configured_notebook_catalog(shared)
     _uuid(shared.get("identity_id"))
     _tenant(profile["document"])
     bounds = ("run_window_seconds", "preparation_timeout_seconds", "cleanup_timeout_seconds")
@@ -281,7 +321,8 @@ def validate_native_template(profile):
         raise ValueError("Native window must cover bounded preparation, source, verification and cleanup")
 
 
-def prepare_measured(document, selected, probe_id, binding, context, identities, clients, table_client=None):
+def prepare_measured(document, selected, probe_id, binding, context, identities, clients, table_client=None, *,
+                     published_binding=None):
     """Check actual notebook identity, selected targets and write roles before staging."""
     from target_readback import read_selected_targets, selected_candidates
 
@@ -309,10 +350,7 @@ def prepare_measured(document, selected, probe_id, binding, context, identities,
             or (shared.get("producer_notebook_id") is not None
                 and _uuid(shared["producer_notebook_id"]) != producer["notebook_id"])):
         raise ValueError("Measured producer identities differ from the effective configuration")
-    if (not isinstance(context, dict) or context.get("isForPipeline") is not True
-            or context.get("currentWorkspaceId") != producer["workspace_id"]
-            or context.get("defaultLakehouseId") != producer["staging_lakehouse_id"]
-            or context.get("currentNotebookId") != producer["notebook_id"]):
+    if not notebook_context_matches(shared, producer, context, published_binding):
         raise ValueError("Measured run is not executing in the bound producer notebook")
     audiences = {"pbi", "storage"} | ({"kusto"} if "demo-2" in selected else set())
     if (not isinstance(identities, dict) or set(identities) != audiences

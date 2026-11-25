@@ -849,15 +849,15 @@ class OrchestrationTests(unittest.TestCase):
     def test_monitor_uses_default_timeout_when_demo_override_is_null(self):
         self.config["demo-2"] = {"verification_timeout_seconds": None}
         _, duration = deploy.monitor_config(self.config)
-        self.assertEqual(duration, 1115)
+        self.assertEqual(duration, 1235)
         self.config["demo-2"]["verification_timeout_seconds"] = 30
         _, duration = deploy.monitor_config(self.config)
-        self.assertEqual(duration, 1130)
+        self.assertEqual(duration, 1250)
 
     def test_producer_timeout_includes_validators_and_wrapper_headroom(self):
         self.config["demo-2"] = {"verification_timeout_seconds": 30}
-        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1"], 10), 1070)
-        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1", "demo-2"], 10), 1080)
+        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1"], 10), 1190)
+        self.assertEqual(deploy.producer_timeout(self.config, ["demo-1", "demo-2"], 10), 1200)
 
     def test_partial_cleanup_excludes_shared(self):
         code, _, events = self.run_cli("demo-2", "--cleanup", "--yes")

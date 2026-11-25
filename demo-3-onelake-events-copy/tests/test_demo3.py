@@ -792,16 +792,23 @@ class NativeGuardTests(unittest.TestCase):
                 "first_sales_line_id": 1, "last_sales_line_id": entry["row_count"],
                 **{key: entry[key] for key in (*audit.GROUPS, "sales_amount_minor_units")}}
 
-    def test_reuses_one_policy_for_two_fresh_runs_ten_files_each_and_idempotent_replays(self):
-        from dataclasses import replace
+    def test_reuses_one_policy_for_two_sequential_stopped_runs_and_idempotent_replays(self):
+        from dataclasses import asdict, replace
+        import native_stop
 
         copies = []
+        previous = None
         for run_id in ("native_alpha_20261124", "native_fresh_beta"):
             self.config = replace(self.config, run_id=run_id)
             self.manifest["run_id"] = run_id
-            from dataclasses import asdict
             self.manifest["config"] = asdict(self.config)
-            self.manifest["demo3_admission"]["config_sha256"] = self.native.config_sha256(asdict(self.config))
+            document = {"data": {"run_id": run_id}, "shared": {"target_bindings": {
+                "demo-3": {"workspace_id": self.target.workspace_id,
+                           "item_id": self.target.lakehouse_id, "fact": "dbo.factsales"}}}}
+            digest = self.native.config_sha256(document)
+            self.manifest["demo3_admission"].update(
+                state="open", config_sha256=self.native.config_sha256(asdict(self.config)),
+                stop_config_sha256=digest)
             self.manifest["batches"] = {}
             for number in range(1, 11):
                 source, entry = self.generator.batch_bytes(self.config, number)
@@ -809,6 +816,14 @@ class NativeGuardTests(unittest.TestCase):
                     **entry, "deliveries": {"demo-3": {"status": "submitted"}}}
                 self.target.create("Files/incoming/sales/" + entry["filename"], source)
             self.publish()
+            if previous is not None:
+                subject, manifest_path, stopped_manifest, marker_path, stopped_marker = previous
+                self.assertEqual(self.authority.read(manifest_path), stopped_manifest)
+                self.assertEqual(self.authority.read(marker_path), stopped_marker)
+                with self.assertRaisesRegex(ValueError, "stopped, expired"):
+                    self.native.resolve_config(
+                        self.generator, self.settings, subject, self.authority, now=self.now)
+                self.assertNotIn(audit.LOCK_PATH, self.target.objects)
             for number in range(1, 11):
                 self.subject = f"/Files/incoming/sales/sales_{run_id}_{number:04d}.csv"
                 config = self.resolve()
@@ -825,6 +840,32 @@ class NativeGuardTests(unittest.TestCase):
                 }, lambda _: self.proof(entry))
                 replay = guard.prepare(str(uuid.uuid4()), self.subject, "replay-" + job, "event")
                 self.assertEqual(replay["decision"], "already-completed")
+            self.manifest["demo3_admission"]["state"] = "stopped"
+            self.publish()
+            binding = {"run_id": run_id, "config_sha256": digest, "nonce": "native-" + digest[:32],
+                       "producer": {"workspace_id": self.authority.workspace_id,
+                                    "staging_lakehouse_id": self.authority.lakehouse_id}}
+            marker_path = f"Files/producer/runs/{run_id}/stop.json"
+            self.authority.create(marker_path, json.dumps({
+                "version": 1, "run_id": run_id, "config_sha256": digest,
+                "nonce": binding["nonce"],
+            }).encode())
+            fabric_factory = mock.Mock(side_effect=AssertionError("per-run stop must not toggle the rule"))
+            context = {"document": document, "binding": binding, "store": self.authority,
+                       "store_factory": lambda ws, lh: self.target, "fabric_factory": fabric_factory,
+                       "cleanup_deadline_utc": (self.now + timedelta(seconds=20)).isoformat(),
+                       "clock": lambda: self.now, "sleep": mock.Mock()}
+            with mock.patch.dict(sys.modules, {
+                "generator": self.generator,
+                "fabric_storage": types.SimpleNamespace(StorageConflict=ConditionalStore.Conflict),
+            }):
+                self.assertEqual(native_stop.stop(context, None), {
+                    "status": "stopped", "scope": "cooperating guarded Copy intents"})
+            fabric_factory.assert_not_called()
+            self.assertNotIn(audit.LOCK_PATH, self.target.objects)
+            previous = (self.subject, delivery_runtime.manifest_path(self.config),
+                        self.authority.read(delivery_runtime.manifest_path(self.config)),
+                        marker_path, self.authority.read(marker_path))
         self.assertEqual(len(set(copies)), 20)
         self.assertNotIn(audit.LOCK_PATH, self.target.objects)
         self.assertEqual(sum(json.loads(body)["batch"]["row_count"]

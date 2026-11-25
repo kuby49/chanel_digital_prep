@@ -1,32 +1,11 @@
 {
   "properties": {
-    "parameters": {
-      "operation": {"type": "string", "defaultValue": "blocked"},
-      "probe_id": {"type": "string", "defaultValue": ""},
-      "runtime_evidence_json": {"type": "string", "defaultValue": "{}"},
-      "run_config_json": {"type": "string"},
-      "selected_demos_json": {"type": "string"},
-      "activity_timeout": {"type": "string", "defaultValue": "0.00:15:00"}
-    },
     "activities": [
       {
         "name": "RunProducer",
         "type": "TridentNotebook",
-        "policy": {
-          "timeout": "0.00:15:00",
-          "retry": 0,
-          "retryIntervalInSeconds": 30
-        },
-        "typeProperties": {
-          "notebookId": "<producer-notebook-id>",
-          "parameters": {
-            "operation": {"value": {"value": "@pipeline().parameters.operation", "type": "Expression"}, "type": "string"},
-            "probe_id": {"value": {"value": "@pipeline().parameters.probe_id", "type": "Expression"}, "type": "string"},
-            "runtime_evidence_json": {"value": {"value": "@string(pipeline().parameters.runtime_evidence_json)", "type": "Expression"}, "type": "string"},
-            "run_config_json": {"value": {"value": "@string(pipeline().parameters.run_config_json)", "type": "Expression"}, "type": "string"},
-            "selected_demos_json": {"value": {"value": "@string(pipeline().parameters.selected_demos_json)", "type": "Expression"}, "type": "string"}
-          }
-        }
+        "policy": {"timeout": "0.02:00:00", "retry": 0},
+        "typeProperties": {"notebookId": "<producer-notebook-id>"}
       }
     ]
   }

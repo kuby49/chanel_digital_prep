@@ -1,5 +1,13 @@
 # Shared data producer
 
+**Reset-and-run implementation:** `simple_run.py` runs the three
+`simple_demo*.py` helpers, publishes the same CSV bytes to each demo and stops
+their native activity. The generated wrapper has no presenter parameters.
+After the demo helpers are integrated, `python demo-data-generator\publish_simple.py`
+publishes the fixed notebook and pipeline definitions; it does not start a run.
+This publication and the simplified Run have not yet been verified in Fabric.
+The older recovery and manifest procedures below are legacy.
+
 The pipeline explicitly serializes `runtime_evidence_json`, `run_config_json`
 and `selected_demos_json` with Fabric's `string(...)` expression before passing
 them to the notebook. The UI can supply `{}` and `[]` as objects and arrays

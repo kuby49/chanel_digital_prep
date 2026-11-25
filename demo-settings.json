@@ -34,6 +34,7 @@
     "bronze_view": "sales_files",
     "silver_schema": "silver",
     "silver_view": "sales_joined",
+    "refresh_schedule_id": "866f29cc-ae60-4aea-8b36-c8f6c1180f22",
     "refresh_interval_minutes": 5
   },
   "demo-2": {

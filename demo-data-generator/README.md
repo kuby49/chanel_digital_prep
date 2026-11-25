@@ -82,8 +82,12 @@ The Eventhouse adapter receives a checked driver-local CSV. A delivery becomes
 returns the exact row count, distinct keys and total. The observed
 `Skipped_IngestByTagAlreadyExists` terminal code requires manual
 reconciliation: matching KQL alone does not prove a prior successful source
-or serialized replay. Other failures remain failures and missing queue
-messages are not success. The separate Demo 2 verifier must also check joins
+or serialized replay. A bounded queue scan with no matching receipt does not
+prove success or rule out an unseen conflict. A `pending` observation or an
+`unknown` with `StatusQueueHeadSaturated` can preserve prior source-matched
+success while KQL catches up; visible failures, other unknowns and invalid
+observations cannot be used to pass verification. Unresolved status is polled
+without resubmitting. The separate Demo 2 verifier must also check joins
 and grouped totals. Serialized duplicate replay was demonstrated for a
 separately accounted bootstrap, not for concurrent submissions.
 

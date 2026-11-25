@@ -263,9 +263,18 @@ class FabricLedger:
         delivery = updated["batches"][str(batch_number)]["deliveries"][destination]
         if delivery["status"] not in ("submitted", "unknown", "submitting"):
             raise RuntimeError("delivery has no submitted or uncertain operation to reconcile")
-        _validate_ingestion_outcome(outcome, delivery.get("operation_id"))
+        operation_id = delivery.get("operation_id")
+        _validate_ingestion_outcome(outcome, operation_id)
+        previous = delivery.get("ingestion_outcome")
+        status, code = outcome["status"], outcome["error_code"]
+        no_match = (outcome["service_operation_id"] is None
+                    and (status, code) in (("pending", None), ("unknown", "StatusQueueHeadSaturated")))
+        if no_match and isinstance(previous, dict) and previous.get("status") == "succeeded":
+            _validate_ingestion_outcome(previous, operation_id)
+            return previous
         delivery["ingestion_outcome"] = copy.deepcopy(outcome)
         self._save(updated)
+        return outcome
 
     def record_observation(self, batch_number, destination, status, diagnostic=None):
         if status not in ("pending", "unknown", "failed"):

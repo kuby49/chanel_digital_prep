@@ -171,12 +171,8 @@ def run_fabric_batches(store, config, adapters, max_duration_seconds, max_attemp
                 except AttributeError:
                     ledger.record_observation(number, destination, "unknown", "Ingestion status outcome unknown")
                     return
-                previous = delivery.get("ingestion_outcome")
-                if (evidence["status"] == "pending" and isinstance(previous, dict)
-                        and previous.get("status") == "succeeded"):
-                    evidence = previous
                 try:
-                    ledger.record_ingestion_outcome(number, destination, evidence)
+                    evidence = ledger.record_ingestion_outcome(number, destination, evidence)
                 except (TypeError, ValueError):
                     ledger.record_observation(number, destination, "unknown", "Invalid ingestion status evidence")
                     return

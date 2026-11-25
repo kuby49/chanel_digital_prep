@@ -275,6 +275,7 @@ class FabricRunnerTests(unittest.TestCase):
         cases = [
             ("pending", None, True, False, "submitted", 0),
             ("unknown", None, True, False, "submitted", 0),
+            ("unknown", "StatusQueueHeadSaturated", True, False, "submitted", 0),
             ("succeeded", None, True, True, "verified", 1),
             ("failed", "Skipped_IngestByTagAlreadyExists", True, False, "verification_failed", 0),
             ("failed", "Skipped_IngestByTagAlreadyExists", False, False, "verification_failed", 0),
@@ -306,16 +307,19 @@ class FabricRunnerTests(unittest.TestCase):
         self.assertEqual(adapter.verifications, 0)
         self.assertEqual(len(adapter.calls), 1)
 
-    def test_terminal_status_survives_queue_message_expiry_while_kql_catches_up(self):
-        class ExpiringStatus(EventhouseAdapter):
-            def __init__(self, clock):
+    def test_reuses_terminal_success_only_after_valid_no_match_while_kql_catches_up(self):
+        class ChangingStatus(EventhouseAdapter):
+            def __init__(self, clock, later):
                 super().__init__(clock, "succeeded")
                 self.status_reads = 0
+                self.later = later
 
             def ingestion_status(self, operation_id):
                 self.status_reads += 1
-                self.status = "succeeded" if self.status_reads == 1 else "pending"
-                return super().ingestion_status(operation_id)
+                outcome = super().ingestion_status(operation_id)
+                if self.status_reads > 1:
+                    vars(outcome).update(self.later)
+                return outcome
 
             def verify(self, batch_id, sha256, row_count, total, operation_id):
                 self.verifications += 1
@@ -324,19 +328,39 @@ class FabricRunnerTests(unittest.TestCase):
                 return SimpleNamespace(status="verified", row_count=row_count, total_minor_units=total,
                                        distinct_sales_line_ids=row_count, diagnostic=None)
 
-        store, clock = MemoryStore(), FakeClock()
-        adapter = ExpiringStatus(clock)
-        config = RunConfig("expiring", file_count=1, rows_per_file=1)
-        result = run_with_scope(store, config, {"demo-2": adapter}, 10, 1,
-                                clock=clock.clock, sleep=clock.sleep)
-        self.assertTrue(result["verified"])
-        self.assertEqual((len(adapter.calls), adapter.status_reads, adapter.verifications), (1, 2, 2))
-        raw, _ = store.read("Files/producer/runs/expiring/manifest.json")
-        delivery = json.loads(raw)["batches"]["1"]["deliveries"]["demo-2"]
-        self.assertEqual(delivery["ingestion_outcome"]["status"], "succeeded")
-        self.assertEqual(delivery["last_verification_status"], "verified")
-        self.assertEqual(delivery["last_verification_at_utc"], delivery["verified_at_utc"])
-        self.assertIsNone(delivery["verification_diagnostic"])
+        saturated = {"status": "unknown", "error_code": "StatusQueueHeadSaturated"}
+        cases = [
+            ("expired", {"status": "pending"}, "verified"),
+            ("saturated", saturated, "verified"),
+            ("conflicting-receipts", {"status": "unknown", "diagnostic": "Conflicting ingestion statuses"}, "unknown"),
+            ("terminal-failure", {"status": "failed", "error_code": "OtherIngestionFailure"}, "failed"),
+            ("wrong-source", {**saturated, "source_id": "9eebc93c-a700-4f87-91b7-a1471c389aa2"}, "unknown"),
+            ("bad-time", {**saturated, "timestamp_utc": "2024-01-01T00:00:00"}, "unknown"),
+            ("unexpected-operation", {**saturated, "service_operation_id": "operation"}, "unknown"),
+            ("wrong-pending-source", {"status": "pending", "source_id": "9eebc93c-a700-4f87-91b7-a1471c389aa2"},
+             "unknown"),
+        ]
+        for name, later, verification in cases:
+            with self.subTest(name=name):
+                store, clock = MemoryStore(), FakeClock()
+                adapter = ChangingStatus(clock, later)
+                config = RunConfig(name, file_count=1, rows_per_file=1)
+                result = run_with_scope(store, config, {"demo-2": adapter}, 10, 3,
+                                        clock=clock.clock, sleep=clock.sleep)
+                verified = verification == "verified"
+                self.assertEqual(result["verified"], verified)
+                self.assertEqual((len(adapter.calls), adapter.status_reads, adapter.verifications),
+                                 (1, 2, 2 if verified else 1))
+                raw, _ = store.read(f"Files/producer/runs/{name}/manifest.json")
+                delivery = json.loads(raw)["batches"]["1"]["deliveries"]["demo-2"]
+                self.assertEqual(delivery["last_verification_status"], verification)
+                if verified:
+                    self.assertEqual(delivery["ingestion_outcome"]["status"], "succeeded")
+                    self.assertEqual(delivery["last_verification_at_utc"], delivery["verified_at_utc"])
+                    self.assertIsNone(delivery["verification_diagnostic"])
+                else:
+                    self.assertEqual(delivery["status"], "verification_failed" if verification == "failed"
+                                     else "submitted")
 
     def test_eventhouse_adapter_without_status_readback_is_rejected(self):
         class NoStatus:

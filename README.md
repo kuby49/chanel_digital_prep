@@ -14,10 +14,13 @@ unverified. **Clicking Run again from this stopped state is not sufficient**:
 an operator must prepare and export a fresh bounded Demo 1 schedule, enable a
 new journaled Demo 3 rule cycle, and publish a profile containing the new
 schedule receipt before invoking the pipeline. The native hooks check these
-prerequisites; they do not restart them. Demo 1's SQL endpoint was stale even
-though direct Spark and Delta checks passed, so its SQL endpoint cannot yet be
-relied on for the intended live presentation. Demo 3 event-queue drainage and
-exclusion of external writers remain unverified.
+prerequisites; they do not restart them. Demo 1's SQL endpoint was initially
+stale even though direct Spark and Delta checks passed. It later caught up
+without intervention: at 02:40:44 UTC both layers matched the ten measured
+batches, including row counts, distinct IDs and exact totals. SQL visibility
+lag has no established SLA, so the endpoint cannot be relied on for immediate
+live presentation. Demo 3 event-queue drainage and exclusion of external
+writers remain unverified.
 
 For Demo 3, manifest `verified_at_utc` records landing CSV verification, not
 Copy completion or target visibility. The measured Copy activity completions

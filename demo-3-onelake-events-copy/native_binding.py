@@ -21,7 +21,7 @@ import customer_preflight as check
 import guarded_notebook
 import guarded_pipeline
 import native_guard
-from deploy import CandidateBlocked, _guid, _load_json, _state_lock, _unique_pairs
+from deploy import CandidateBlocked, _guid, _is_rule_journal_path, _load_json, _state_lock, _unique_pairs
 from ownership import FabricControl
 
 
@@ -35,6 +35,20 @@ HC_JOURNAL = "demo3-native-guard-hc-state.json"
 ACCESS_REBIND_JOURNAL = "demo3-native-staging-access-rebind-state.json"
 REBIND_JOURNAL = "demo3-native-staging-rebind-state.json"
 HC_FLAG = 'spark.conf.set("spark.fabric.session.highConcurrency.enabled", "true")\n'
+
+
+def rule_journal_name(cycle):
+    if type(cycle) is not int or cycle < 1:
+        raise ValueError("rule cycle must be a positive integer")
+    return RULE_JOURNAL if cycle == 1 else f"demo3-native-rule-cycle-{cycle}-state.json"
+
+
+def later_rule_cycle(root, cycle):
+    for path in root.glob("demo3-native-rule-cycle-*-state.json"):
+        match = re.fullmatch(r"demo3-native-rule-cycle-([1-9][0-9]*)-state\.json", path.name)
+        if match and int(match.group(1)) > cycle:
+            return int(match.group(1))
+    return None
 
 
 def _utc():
@@ -642,7 +656,8 @@ class NativeBinding:
                      self.root / HC_JOURNAL, self.root / ACCESS_REBIND_JOURNAL,
                      self.root / REBIND_JOURNAL,
                      self.root / _PREVIOUS, self.root / check.JOURNAL)
-        if not output.is_absolute() or any(output.resolve() == path.resolve() for path in protected):
+        if (not output.is_absolute() or _is_rule_journal_path(output, self.root)
+                or any(output.resolve() == path.resolve() for path in protected)):
             raise ValueError("proof output must be a distinct absolute path")
         with _state_lock(self.root):
             proof = self._read_proof(self._published())

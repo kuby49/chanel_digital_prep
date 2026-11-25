@@ -169,11 +169,10 @@ idempotency without destructive replacement.
 
 `native_demo1.py` supplies standalone `prepare`, `check_ready`, `verify` and
 `stop` hooks for the native producer orchestrator. It imports only the Python
-standard library. **Notebook code never creates, updates, disables or cancels
-an MLV schedule or refresh job.** Scheduling remains on the supported external
-control plane. These hooks are locally tested; fresh-target managed scheduling,
-the integrated notebook identity and cross-workspace Spark reads still require
-coordinated live verification. They are not measured customer-run acceptance.
+standard library. **Neither the notebook nor its pipeline creates, updates,
+disables or cancels an MLV schedule or refresh job.** Use the [native MLV
+schedule API](https://learn.microsoft.com/en-us/fabric/data-engineering/materialized-lake-views/materialized-lake-views-public-api)
+through the external controller, once per approved presenter window.
 
 One-time setup, after approval, uses the existing controller and the immutable
 setup config with the original local ownership journal. Choose an explicitly
@@ -244,17 +243,21 @@ preparation_deadline < verification_deadline < cleanup_deadline <= expires_at
 The 19-minute minimum is nine source intervals plus one five-minute refresh
 interval and five minutes of processing margin; it is not a freshness SLA.
 The schedule can already be running within its bounded operating window; it
-does not need a new future start for each click. Late clicks fail closed.
-**The producer's default two-hour native window and allocation+6,900-second
-verification deadline cannot fit an already-active 115-minute setup
-schedule.** An explicitly selected 180-minute schedule allows the default
-120-minute run plus 60 minutes from schedule start to run allocation. No
-extension is automatic, and later starts still fail if the fixed verification
-deadline does not fit within the remaining schedule window. Configure approved
-native budgets once in the template if needed. The hook rejects
-the incompatible default rather than guessing shorter budgets or widening the
-approved schedule. Each subsequent fresh run must independently satisfy the
-same checks; repeated clicks are not promised beyond the operating window.
+does not need a new future start for each click. After setup, the presenter
+clicks **Run** and waits for that run and cleanup to complete before clicking
+again. Each click allocates a fresh run ID. The prior run's stop hook leaves the
+pinned schedule enabled for the next run.
+
+With the default 120-minute run budget and a 180-minute schedule, allocate each
+run within the first **60 minutes** to leave its full budget inside the window.
+The Demo 1 hook itself checks the default allocation-plus-115-minute verification
+deadline, which fits through minute 65; follow the earlier cutoff for full
+allocation coverage. Two early, normally completing runs can share one window,
+but two worst-case 120-minute runs cannot. The prior run must release the writer
+lock, and the next run must still pass its own idle, deadline and coverage checks.
+Once the cutoff passes or the schedule is disabled or expires, **Run does not
+reprovision or renew it**. The operator must provision and export a new bounded
+schedule and republish its receipt in the template before another demo window.
 
 After durable producer delivery completes, `verify` accepts only the actual
 ten measured manifest BatchIDs, 1,000 distinct IDs `1..1000` per batch in both
@@ -276,6 +279,16 @@ These are latency upper bounds, not the first actual Silver visibility:
 earlier batches may already have appeared while the producer was running.
 Sixty seconds remains source cadence; managed downstream cadence is five
 minutes plus queueing/processing.
+
+Use Spark/Delta as the acceptance source. The SQL analytics endpoint can lag
+behind committed MLV data even after the lineage job completes. In the measured
+run, legacy (V1) metadata sync caught up without intervention: a later SQL
+read showed 10 measured batches with 1,000 distinct IDs each and exact totals
+in both layers. This is not a SQL freshness guarantee. For persistent lag,
+check the endpoint's [metadata sync version and upgrade readiness](https://learn.microsoft.com/en-us/fabric/data-engineering/sql-analytics-endpoint-metadata-sync).
+On V2, Microsoft documents a table-scoped procedure for data-only refreshes;
+the REST metadata refresh is for schema changes. Treat any V1-to-V2 upgrade as
+separately approved maintenance, not part of **Run**.
 
 `stop` returns `status: stopped` with
 `scope: "run-specific; shared bounded setup schedule remains enabled"`.

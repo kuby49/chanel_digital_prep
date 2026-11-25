@@ -168,6 +168,13 @@ class NativeDemo1Test(unittest.TestCase):
                                  "endTimeUtc": self.now.isoformat()})
 
     def test_full_lifecycle_is_read_only_and_shared_setup_is_reusable(self):
+        settings = self.receipt["request"]["configuration"]
+        settings["endDateTime"] = (self.now + timedelta(minutes=179)).isoformat()
+        self.receipt["create_response"]["configuration"] = copy.deepcopy(settings)
+        self.fabric.schedule = copy.deepcopy(self.receipt["create_response"])
+        self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
+        self.context["expires_at_utc"] = (self.now + timedelta(minutes=120)).isoformat()
+        self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
         prepared = native_demo1.prepare(self.context)
         self.assertEqual(prepared["status"], "ready")
         self.assertEqual(native_demo1.check_ready(self.context, prepared)["status"], "ready")
@@ -185,13 +192,22 @@ class NativeDemo1Test(unittest.TestCase):
         self.assertEqual((stopped["status"], stopped["scope"]), ("stopped", native_demo1.STOP_SCOPE))
         self.assertTrue(self.fabric.schedule["enabled"])
         self.stopped = False
+        self.now += timedelta(minutes=20)
         self.document["data"]["run_id"] = "native_demo_002"
         self.manifest = {"contract_version": 1, "run_id": "native_demo_002", "batches": {}}
         self.context["preparation_deadline_utc"] = (self.now + timedelta(minutes=5)).isoformat()
-        self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=25)).isoformat()
-        self.context["expires_at_utc"] = (self.now + timedelta(minutes=30)).isoformat()
+        self.context["verification_deadline_utc"] = (self.now + timedelta(minutes=115)).isoformat()
+        self.context["expires_at_utc"] = (self.now + timedelta(minutes=120)).isoformat()
         self.context["cleanup_deadline_utc"] = self.context["expires_at_utc"]
-        self.assertEqual(native_demo1.prepare(self.context)["status"], "ready")
+        second = native_demo1.prepare(self.context)
+        self.assertEqual(second["schedule_id"], prepared["schedule_id"])
+        self.assertEqual(second["receipt_sha256"], prepared["receipt_sha256"])
+        self.assertEqual(native_demo1.check_ready(self.context, second)["status"], "ready")
+        self.complete_manifest()
+        result = native_demo1.verify(self.context, second)
+        self.assertEqual((result["status"], result["run_id"], result["row_count"], result["sales_amount_minor_units"]),
+                         ("verified", "native_demo_002", 10000, 55000))
+        self.assertTrue(native_demo1.stop(self.context, second)["shared_schedule_enabled"])
         self.assertEqual(len(self.store.data), 2)
 
     def test_receipt_identity_scope_and_binding_fail_before_reads(self):

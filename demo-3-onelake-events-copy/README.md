@@ -63,14 +63,20 @@ not be fabricated from the preflight observations.
 
 ### Isolated replacement candidate
 
-`isolated_candidate.build_candidate(spec, producer_dir, copy_activity, source_sample)`
-builds definitions in memory only, with `ready: false`. It does not create,
-publish, authorize or verify anything. Supply canonical IDs for `tenant_id`,
+`isolated_candidate.build_candidate(spec, producer_dir, copy_activity, source_sample,
+producer_config_path=..., producer_prefix=..., producer_state_dir=...)`
+builds definitions in memory only, with `ready: false`. It does not create
+cloud resources, publish, authorize or establish live readiness. Supply canonical IDs for `tenant_id`,
 `owner_id`, `workspace_id`, `lakehouse_id`, `notebook_id`, `pipeline_id`,
 `reflex_id`, `connection_id`, `producer_workspace_id`, and
 `producer_lakehouse_id`, plus `prefix`, `lakehouse_name` and `native_policy`.
-It rejects the original target items and owner marker, different
-producer staging, inconsistent Copy endpoints and an event from another source.
+It resolves producer staging candidates using the frozen producer's
+`resolve-candidate-ids` helper and its separate ownership journal. The helper
+does not check live ownership or access. The old staging Lakehouse, original
+target items and owner marker, inconsistent Copy endpoints, and an event from
+another source are rejected. The existing generic OAuth2 connection can be a
+candidate; its live type, path and identity, connection sharing and target
+access must be independently checked. No Copy runtime success is implied.
 The supplied Copy template must satisfy the exact-file, mappings and Upsert
 requirements of `guarded_pipeline.build_pipeline`. The rule is disabled.
 Returned hashes identify the generated definitions and producer files; they do
@@ -78,9 +84,23 @@ not attest to their ownership, validity or observed deployment. Generated
 Activator entity IDs vary between builds, so retain the reviewed candidate.
 An invented test event is useful only for local tests, not source validation.
 
+`isolated_setup.prepare(config, prefix, state_dir, api, producer_dir)` freshly
+reads the owned target shell through `ownership.provision(..., create=False)`
+and builds an unexecuted setup notebook for it. It rejects the original
+Lakehouse and marker and checks the runtime workspace and default Lakehouse
+before setup code executes. It does not publish or run the notebook, and
+neither the ownership read nor notebook creation proves setup or readiness.
+`isolated_preflight.original_parent(api)` freshly checks both exact incident
+jobs and their activity link; missing, active or ambiguous evidence blocks it.
+Even terminal jobs do not prove all writers drained. `isolated_preflight.connection`
+checks generic OAuth2 connection metadata and the caller's connection role;
+it explicitly leaves runtime identity and target access unverified.
+
 A separate Lakehouse isolates its Delta data and cooperative lock; it is a
 fresh demonstration, **not recovery of the original run**. Shared capacity is
-not compute isolation. Before any future deployment, in order:
+not compute isolation. There is currently no journaled new-target publisher
+or reconciler: the existing publishers must not be pointed at the new IDs.
+Before any future deployment, in order:
 
 1. Reconcile the original parent and any possible writers; preserve the old
    lock and incident evidence. Obtain explicit coordinated authorization.

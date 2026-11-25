@@ -118,6 +118,83 @@ bounded operating window is permitted; see the
 
 The default one-minute source cadence is not a downstream visibility guarantee. Demo 1 uses managed MLV refresh (document the actual supported interval); Demo 2's five-minute OneLake target is not an SLA and its propagation latency is not reported; Demo 3 requires a real event and Copy run. See the specification for acceptance criteria and feature-specific blockers.
 
+## Presenter walkthrough
+
+The prepared recovery entry point is
+[producer_wrapper_recovery](https://app.fabric.microsoft.com/groups/68971aa2-f4bc-48a2-8962-98a4cb1e9fc2/pipelines/2f42bac0-ccc3-4efc-8ff3-787fc93f3827?experience=power-bi).
+Sign in to MCAP. Opening this pipeline, its **Home** toolbar and **Run**
+control has been observed in the signed-in browser; pressing that UI control
+has not been verified. The two unchanged-profile repeat tests used the Jobs API.
+
+### What is prepared, and when
+
+Initial deployment creates the isolated resources, permissions, native runtime
+and data targets. Before each new operating window, an owner must confirm
+terminal prior work and absent owned writer locks, create/read back the bounded
+five-minute Lakehouse schedule, export its exact receipt, publish the matching
+producer notebook/profile and enable/read back a fresh journaled Demo 3 rule
+cycle. These are operator setup steps, not presenter steps. Changing the schedule
+ID, owner or dates requires a new receipt and guarded publication; an expired
+or stopped setup does not repair itself when **Run** is pressed.
+
+The chosen policy allows one fixed 24-hour schedule, not an indefinitely
+renewable service. Each **Run** allocates a fresh identity and a fixed two-hour
+lifecycle; therefore its latest allocation is the schedule end minus two hours.
+Click earlier to allow for Fabric queueing and notebook startup: click time is
+not allocation time. A five-minute schedule keeps generating refresh workload
+while enabled, including between presentations. Capacity remains running at F32.
+The schedule expires without renewal; the Activator rule has **no automatic
+TTL** and needs an explicit owner stop. Keep both dependencies enabled and
+unchanged through the final run's verification and cleanup.
+
+### Run and observe
+
+1. Open the recovery pipeline above. On **Home**, choose **Run**. If a
+   parameter pane appears, retain the published defaults, including
+   `operation=run-native`; do not edit definitions or supply a profile. No CLI,
+   JSON editing, manual monitor startup or per-run rebinding is required inside
+   an already prepared, sufficiently covered window.
+2. Open **Output**, or use the pipeline's workspace **... > View run history >
+   Go to monitor**. Open the new run, then its **RunProducer** activity. Follow
+   the notebook-run/snapshot link in its output to inspect progress and the
+   newly allocated run identity. Do not separately run the notebook.
+3. Use the links below to watch each destination. Refresh or reselect previews
+   as needed. Historic data remains present: the current run's `BatchID` values
+   distinguish its rows. Previews may be sampled or stale and are not an exact
+   reconciliation. The automated run performs batch-specific checks.
+4. Wait for the parent, linked notebook and native result to report successful
+   verification and completion. A parent status, a few visible rows or an old
+   successful run alone is insufficient. Start the next run only after the prior
+   lifecycle and owned work have finished; do not use failed-activity reruns or
+   launch overlapping producers.
+
+| Demo | Open and inspect |
+|---|---|
+| 1: file-backed MLVs | [ChanelDemo1Lakehouse](https://app.fabric.microsoft.com/groups/af865b3c-f088-44ad-8816-a5e495b1fbf5/lakehouses/646c26d7-7df8-4962-acaa-4e1386bcba08?experience=power-bi): **Tables > bronze > sales_files**, then **silver > sales_joined > Data preview**. Use **Materialized lake views > Manage > Schedules** to inspect, not change, the schedule. The [SQL endpoint](https://app.fabric.microsoft.com/groups/af865b3c-f088-44ad-8816-a5e495b1fbf5/sqlanalyticsendpoints/cfe319b4-9c44-4510-ad5e-ca3a1bc171ce?experience=power-bi) may lag independently. |
+| 2: Eventhouse and OneLake | [SalesDatabase](https://app.fabric.microsoft.com/groups/0a0499fe-51b5-42b1-bc99-31c121cc74a6/databases/25159007-a6dd-4020-8afc-01d393378727?experience=power-bi): **Tables > SyntheticFactSales**. Then [SalesLakehouse](https://app.fabric.microsoft.com/groups/0a0499fe-51b5-42b1-bc99-31c121cc74a6/lakehouses/f565aeac-f321-46f2-8262-076e06490707?experience=power-bi): **Tables > EventhouseFactSales**. Five minutes is the configured mirroring target, not a visibility guarantee. |
+| 3: event-triggered Copy | [Activator](https://app.fabric.microsoft.com/groups/744223de-ceab-4c4f-82ba-f811bcb5c7d7/reflexes/195d1691-08f6-4140-a6d5-18c332696fef?experience=power-bi): **Events > Sales file events > Sales file event > Copy sales file**, with **Live feed** and **Analytics**. Inspect event-origin runs in the [guarded Copy pipeline](https://app.fabric.microsoft.com/groups/744223de-ceab-4c4f-82ba-f811bcb5c7d7/pipelines/bab19f65-b5ab-4edd-8066-89b4fc00f120?experience=power-bi), then [target Lakehouse](https://app.fabric.microsoft.com/groups/744223de-ceab-4c4f-82ba-f811bcb5c7d7/lakehouses/6bba6989-5cfd-4192-8e75-00274afb66c1?experience=power-bi), **Tables > dbo > factsales** and **Files > demo3-audit**. Do **not** manually Run this Copy pipeline or its guard: they require event parameters. |
+
+The [producer notebook](https://app.fabric.microsoft.com/groups/68971aa2-f4bc-48a2-8962-98a4cb1e9fc2/synapsenotebooks/7d7f2229-4caf-409b-bee0-296d061e14ec?experience=power-bi)
+and [staging Lakehouse](https://app.fabric.microsoft.com/groups/68971aa2-f4bc-48a2-8962-98a4cb1e9fc2/lakehouses/95a05004-09b1-4a3f-b8b3-2af9e68dd935?experience=power-bi)
+are troubleshooting references, not additional launch steps. Run receipts are
+retained under **Files > producer > runs**; viewing them is optional.
+
+### Finish or stop
+
+For a normal presentation, let the bounded producer finish; it produces ten
+files and completes its verification/cleanup lifecycle. After the last run,
+the owner must independently reconcile/drain owned jobs and locks, then
+journal-stop/read back the shared schedule and rule. Do this before leaving the
+setup unattended or at the operating-window expiry; the rule does not stop
+itself. Point-in-time drain checks do not prove Fabric event queues are empty
+or exclude external writers. Leave F32 running as requested.
+
+For an emergency, **Cancel** the parent through Fabric monitoring and contact
+the setup owner. Cancellation is not cleanup: notebook, monitor or admitted
+Copy work may continue and the launcher lock may remain. Do not blindly retry,
+delete locks or toggle rules/schedules. There is no verified presenter-only
+cooperative early-stop action or journal-consistent portal-toggle workflow.
+
 ## Configuration and prerequisites
 
 Copy `config.example.json` to a private, untracked location and fill in the resolved IDs, names, feature settings and bounded run parameters. The `workspace_name` defaults contain `{prefix}`; each track expands it using the effective `--prefix`. The config is version 1 and consists of shared `environment`, `tenant_id`, `subscription_id`, `capacity`, `authentication`, `execution`, and `data` objects and `demo-1`, `demo-2`, `demo-3`, and `shared` track objects. Each demo's `verification_timeout_seconds` applies per batch and takes precedence over `execution.verification_timeout_seconds`; `execution.poll_interval_seconds` controls validation polling. Null IDs must be resolved and recorded by each track before it reports readiness. Configuration may contain secret **references**, never tokens or secret values. State files and logs must contain only sanitized data.

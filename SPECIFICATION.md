@@ -335,6 +335,22 @@ Recheck preview status and prerequisites during deployment; documentation is not
   minutes". Use the documented five-minute scheduled refresh, not the
   event-triggered MLV preview. This supersedes the earlier 2.5- and
   three-minute requests; do not claim a shorter effective interval.
+- Coordinated presenter-window implementation of the longer-window
+  authorization: use a fixed 24-hour native five-minute MLV schedule, subject
+  to service acceptance, and publish its exact confirmed receipt with the
+  reusable producer profile. Retain the fixed two-hour per-run lifecycle,
+  yielding a latest allocation at the schedule end minus two hours; queueing
+  reduces the usable click period. Leave the prepared schedule and a fresh
+  journaled Demo 3 rule cycle enabled for presenter runs inside this window,
+  rather than stopping them immediately after setup. This is a bounded
+  presentation exception, not permission to leave triggers unattended
+  indefinitely. Document recurring refresh cost, no automatic window renewal,
+  and the Activator rule's lack of automatic TTL. An owner must explicitly
+  stop/read back and reconcile/drain after the final presentation or expiry.
+  Renewing dates requires new owner setup, receipt and guarded publication;
+  no per-run CLI, JSON editing, definition rebinding, new orchestration service
+  or notebook/pipeline-driven MLV scheduling is introduced. Distinguish
+  verified UI navigation from an actually verified UI Run click.
 - Simplified implementation focus: after the user asked, "can we pivot  now in our approach, or too late ?", prioritize the shortest safe path to runnable demonstrations, reusing verified work rather than adding new hardening or ownership-proof frameworks. Retain the specified correctness checks, protection against writing to the wrong target, and stopping owned jobs. Report unsupported or unverified behavior honestly; this focus does not silently waive other explicit requirements.
 - Use the signed-in MCAP identity where the relevant operation supports it.
 - The user permits starting and stopping resources needed for the demonstrations and scaling the approved capacity up to F64. Isolation, least-privilege and verification requirements remain in effect.

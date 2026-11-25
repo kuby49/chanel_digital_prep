@@ -351,6 +351,10 @@ delete the intent or use another state directory to force a retry. Preserve the
 old lifecycle, journals, lock, and profile; pin the verified new hash only in the
 new immutable profile. Publication does not establish full-cadence readiness.
 
+The builder uses a fixed order for the reused target's fields, so JSON key order
+does not change the executable hash. A monitor previously built with another
+order may fail the existing definition-drift check; it is not updated automatically.
+
 ## OneLake semantics and troubleshooting
 
 OneLake availability is a **read-only managed Delta representation**, not the

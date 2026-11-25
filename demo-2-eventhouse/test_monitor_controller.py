@@ -4,6 +4,7 @@ import json
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from itertools import permutations
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
@@ -236,6 +237,20 @@ class MonitorControllerTests(unittest.TestCase):
                 workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
                 reused_synthetic_target={**target, "workspace_id": PRODUCER_WORKSPACE},
             )
+
+    def test_measured_monitor_definition_is_independent_of_target_key_order(self):
+        target = {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"}
+        expected = build_monitor_notebook(
+            workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
+            reused_synthetic_target=target,
+        )
+        for keys in permutations(target):
+            with self.subTest(keys=keys):
+                actual = build_monitor_notebook(
+                    workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
+                    reused_synthetic_target={key: target[key] for key in keys},
+                )
+                self.assertEqual(actual, expected)
 
     def test_synthetic_monitor_reconciles_bootstrap_without_accepting_measured_data(self):
         run = "demo2synthetic_123456abcdef"

@@ -416,8 +416,9 @@ using it as evidence. Never stage or ingest into an unverified target.
 `--state-dir`, and `--result` arguments. `dry-run` is a local plan. Deployment
 uses an owned-resource journal, verifies tenant and principal, publishes the
 pinned `environment.yml`, and refuses to adopt unknown resources or retry an
-ambiguous creation. The Eventhouse status lookup requires
-`azure-storage-queue==12.13.0`; runtime preflight checks that exact version.
+ambiguous creation. The Eventhouse adapter requires `azure-kusto-data==6.0.4`,
+`azure-kusto-ingest==6.0.4`, and `azure-storage-queue==12.13.0`; environment
+validation and runtime preflight enforce all three exact versions.
 A fresh Environment's successful empty initial version is
 published only after its staged pins and compute baseline are verified; an
 ambiguous publish remains journaled and is never automatically retried.

@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib import error, parse, request
 
 from fabric_ledger import _validate_ingestion_outcome
-from fabric_runtime import (QUEUE_SDK_VERSION, configured_notebook_catalog, _kusto_endpoint, _tenant, native_parameters,
+from fabric_runtime import (EVENTHOUSE_SDK_VERSIONS, configured_notebook_catalog, _kusto_endpoint, _tenant, native_parameters,
                             require_write_roles, run_config, validate_native_template)
 from fabric_storage import OneLakeStore, StorageConflict, StorageError, StorageOutcomeUnknown
 from generator import (RunConfig, batch_bytes, batch_metadata_matches, canonical_bytes, new_manifest,
@@ -254,11 +254,13 @@ def _environment_spec():
             if name in pins:
                 raise ValueError
             pins[name] = match.group(2)
-        if not REQUIRED_ENVIRONMENT_PACKAGES.issubset(pins) or pins["azure-storage-queue"] != QUEUE_SDK_VERSION:
+        if (not REQUIRED_ENVIRONMENT_PACKAGES.issubset(pins)
+                or any(pins.get(name) != version for name, version in EVENTHOUSE_SDK_VERSIONS.items())):
             raise ValueError
     except (OSError, UnicodeError, ValueError):
+        required = ", ".join(f"{name}=={version}" for name, version in EVENTHOUSE_SDK_VERSIONS.items())
         raise Blocked("environment.yml must contain only explicitly pinned pip dependencies, including the "
-                      f"required Azure SDKs and azure-storage-queue=={QUEUE_SDK_VERSION}.") from None
+                      f"required Azure SDKs: {required}.") from None
     return {"content": content, "pins": pins, "sha256": hashlib.sha256(content).hexdigest()}
 
 

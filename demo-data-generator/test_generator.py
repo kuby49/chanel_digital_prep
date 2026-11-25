@@ -439,10 +439,10 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(next(x for x in third["targets"]["demo-2"]["checks"]
                               if x["capability"] == "conditional-storage")["result"], "failed")
 
-    def test_runtime_preflight_requires_exact_storage_queue_sdk(self):
+    def test_runtime_preflight_requires_exact_eventhouse_sdks(self):
         import importlib.metadata
         import re
-        from fabric_runtime import QUEUE_SDK_VERSION
+        from fabric_runtime import EVENTHOUSE_SDK_VERSIONS
 
         notebook = json.loads((Path(__file__).parent / "notebook.ipynb").read_text(encoding="utf-8"))
         source = "".join(notebook["cells"][1]["source"])
@@ -455,12 +455,14 @@ class GeneratorTests(unittest.TestCase):
         for parent in ("azure", "azure.kusto", "azure.storage"):
             modules[parent].__path__ = []
         modules["ingestion"].EventhouseAdapter = SimpleNamespace(ingestion_status=lambda: None)
-        cases = (("12.13.0", True, "passed"), ("12.14.0", True, "failed"),
-                 (None, True, "failed"), ("12.13.0", False, "failed"))
-        for queue_version, import_available, expected in cases:
-            with self.subTest(queue_version=queue_version, import_available=import_available):
+        cases = [({}, True, "passed"), ({}, False, "failed")]
+        for name in ("azure-kusto-data", "azure-kusto-ingest", "azure-storage-queue"):
+            cases.extend((({name: "99.0.0"}, True, "failed"), ({name: None}, True, "failed")))
+        for overrides, import_available, expected in cases:
+            with self.subTest(overrides=overrides, import_available=import_available):
                 versions = {"azure-identity": "1.27.0", "azure-kusto-data": "6.0.4",
-                            "azure-kusto-ingest": "6.0.4", "azure-storage-queue": queue_version}
+                            "azure-kusto-ingest": "6.0.4", "azure-storage-queue": "12.13.0"}
+                versions.update(overrides)
                 def version(name):
                     if versions[name] is None:
                         raise importlib.metadata.PackageNotFoundError(name)
@@ -470,13 +472,13 @@ class GeneratorTests(unittest.TestCase):
                 if not import_available:
                     current["azure.storage.queue"] = None
                 checks, evidence = [], {}
-                scope = {"QUEUE_SDK_VERSION": QUEUE_SDK_VERSION, "re": re, "evidence": evidence,
+                scope = {"EVENTHOUSE_SDK_VERSIONS": EVENTHOUSE_SDK_VERSIONS, "re": re, "evidence": evidence,
                          "producer": {"environment_id": "environment"},
                          "check": lambda capability, resource, method, result: checks.append(result)}
                 with patch.dict(sys.modules, current), patch("importlib.metadata.version", side_effect=version):
                     exec(code, scope)
                 self.assertEqual(checks, [expected])
-                if import_available and queue_version is not None:
+                if import_available and all(value is not None for value in versions.values()):
                     self.assertEqual(evidence["runtime_packages"], versions)
                 else:
                     self.assertNotIn("runtime_packages", evidence)

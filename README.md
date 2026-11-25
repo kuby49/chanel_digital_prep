@@ -32,8 +32,9 @@ owned jobs terminal. A separate 24-hour presenter window was subsequently
 prepared and its default profile completed a further API run: its manifest
 contained ten batches, 10,000 rows and 1,502,033,495 minor units with all 30
 deliveries verified. Independent Demo 1 Delta and Demo 2 KQL/shortcut checks
-matched; Demo 3's ten event-origin Copy audits matched the manifest and their
-guard-reported target comparisons, but did not independently reread Delta rows.
+matched; Demo 3's ten event-origin Copy audits matched the manifest, and an
+independent Delta snapshot comparison matched all nine columns in all ten
+batches. Its dimension-orphan results remain guard-reported.
 Afterward the producer was idle, owned locks were absent and the shared schedule
 and rule remained enabled. **Clicking Run from a stopped or expired state
 is not sufficient**:

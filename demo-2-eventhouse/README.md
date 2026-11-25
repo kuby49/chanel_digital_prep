@@ -122,7 +122,10 @@ selected destination. `submitted` means queued, not ingested.
 3. Run the producer for the selected, ready demos. The monitor independently
    reads its durable manifest and launches bounded shortcut-verification jobs;
    Spark waiting does not block the one-minute generator. Each batch deadline
-   is based on the recorded delivery, not when verification starts.
+   is based on the recorded delivery, not when verification starts. Queued
+   verifiers are admitted by earliest deadline, with numeric batch order for
+   ties, independently of manifest JSON key order. This does not extend any
+   deadline or guarantee sufficient Spark throughput for the producer cadence.
 4. Confirm the monitor's terminal completion and per-batch outcomes. Each
    measured batch must have matching terminal ingestion evidence, KQL
    reconciliation, all three dimension joins, exact decimals and grouped

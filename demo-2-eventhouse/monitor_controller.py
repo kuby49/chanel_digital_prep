@@ -570,12 +570,21 @@ class Controller:
             record.get("status") in ("submitting", "running")
             for record in self.state["batches"].values()
         )
-        for batch in batches:
-            record = self.state["batches"].get(batch["batch_id"])
-            if record and record.get("status") == "queued" and active < self.cfg["concurrency"]:
-                deadline = _utc(record["deadline_utc"], "batch deadline")
-                self._launch(record, "verify_batch", batch, deadline, self.clock())
-                active += 1
+        queued = [
+            batch for batch in batches
+            if self.state["batches"].get(batch["batch_id"], {}).get("status") == "queued"
+        ]
+        queued.sort(key=lambda batch: (
+            _utc(self.state["batches"][batch["batch_id"]]["deadline_utc"], "batch deadline"),
+            batch["batch_number"],
+        ))
+        for batch in queued:
+            if active >= self.cfg["concurrency"]:
+                break
+            record = self.state["batches"][batch["batch_id"]]
+            deadline = _utc(record["deadline_utc"], "batch deadline")
+            self._launch(record, "verify_batch", batch, deadline, self.clock())
+            active += 1
 
         if scheduler and scheduler.get("status") == "completed":
             if all(self.state["batches"].get(batch["batch_id"], {}).get("status") == "verified"

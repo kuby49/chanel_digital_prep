@@ -468,6 +468,49 @@ class MonitorControllerTests(unittest.TestCase):
         self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
         self.assertEqual(self.client.started[0][2], 20)
 
+    def test_canonical_manifest_does_not_admit_batch_ten_before_batch_two(self):
+        cfg = settings(parameters(count=10, concurrency=1), lakehouse_id=LAKEHOUSE)
+        client = FakeClient(cfg)
+        controller = Controller(cfg, client, clock=self.clock, sleep=self.clock.advance)
+        entries = [batch(number, NOW + timedelta(seconds=number - 1))
+                   for number in range(1, 11)]
+        client.manifest = json.loads(json.dumps(manifest(*entries), sort_keys=True))
+        self.clock.advance(9)
+        controller._begin()
+        controller._tick()
+        self.assertEqual(client.started[0][1]["batch_number"], 1)
+        self.clock.advance(1)
+        verified_delivery(client.manifest["batches"]["1"], self.clock())
+        client.results[client.started[0][3]] = {
+            "status": "Completed",
+            "properties": {"exitValue": json.dumps({
+                "mode": "verify_batch", "status": "verified",
+                "batch": {key: entries[0][key]
+                          for key in ("batch_id", "row_count", "sales_amount_minor_units")},
+            })},
+        }
+        controller._tick()
+        self.assertEqual([entry[1]["batch_number"] for entry in client.started], [1, 2])
+        self.assertEqual(client.started[1][2], 21)
+        for entry in entries:
+            self.assertEqual(controller.state["batches"][entry["batch_id"]]["deadline_utc"],
+                             stamp(NOW + timedelta(seconds=entry["batch_number"] - 1 + 30)))
+
+    def test_admission_uses_deadline_before_batch_number_and_breaks_ties_numerically(self):
+        for accepted, expected in (
+            (NOW - timedelta(seconds=1), 10),
+            (NOW, 2),
+        ):
+            with self.subTest(accepted=accepted):
+                cfg = settings(parameters(count=10, concurrency=1), lakehouse_id=LAKEHOUSE)
+                client = FakeClient(cfg)
+                controller = Controller(cfg, client, clock=self.clock, sleep=self.clock.advance)
+                client.manifest = manifest(batch(10, accepted), batch(2), count=10)
+                controller._begin()
+                controller._tick()
+                self.assertEqual(client.started[0][1]["batch_number"], expected)
+                self.assertEqual(client.started[0][2], 29 if expected == 10 else 30)
+
     def test_concurrency_queue_does_not_extend_delivery_deadlines(self):
         self.params = parameters(count=2, concurrency=1)
         self.cfg = settings(self.params, lakehouse_id=LAKEHOUSE)

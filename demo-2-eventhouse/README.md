@@ -306,6 +306,51 @@ inventory is needed. The batch manifest and stable ingestion tag still bind
 replay to its original batch, and ambiguous or concurrent submissions require
 the delivery ledger and reconciliation described above.
 
+### Definition-only measured monitor publication
+
+`publish_monitor.py` is a recovery tool for an **existing, confirmed, demo-owned**
+measured monitor. It does not create items, run notebooks, or write OneLake state.
+Use it from the integrated checkout with the original compatible shared generator;
+it reconstructs the original run binding rather than substituting the replacement
+run's configuration. Use the original ownership state directory, not a copied
+ledger, and run in the correct tenant.
+
+The separate approval JSON must specify these fields:
+
+| Fields | Required evidence |
+|---|---|
+| `parent_pipeline_id`, `parent_job_id` | Exact wrapper pipeline item and scheduler run IDs. |
+| `producer_workspace_id`, `producer_lakehouse_id`, `producer_notebook_id`, `producer_job_id` | Original staging workspace/Lakehouse, and notebook item and scheduler run IDs. |
+| `run_id`, `old_config_sha256` | Native RunID and the full frozen lifecycle configuration hash. Do not use the Demo 2 projection hash. |
+| `monitor_notebook_id`, `old_definition_sha256`, `new_definition_sha256` | Owned measured monitor item plus the exact baseline and reviewed replacement **executable** definition hashes. |
+| `producer_run_evidence` | Reference to independently reviewed evidence linking the exact producer job to the native RunID and frozen lifecycle. The publisher checks the parent-to-notebook activity link live; it does not dereference this operator attestation. |
+| `exclusive_window_confirmed` | JSON `true` only after confirming no competing launcher or notebook editor for the publication window. |
+
+After separate authorization to publish, use absolute paths:
+
+```powershell
+python .\demo-2-eventhouse\publish_monitor.py --config $config --prefix $prefix --state-dir $stateDir --approval $approval --publish
+```
+
+The tool checks the original parent, producer, monitor, bootstrap and recorded
+verifiers by exact job ID. It fails closed when terminality or child submission
+cannot be established, the original run evidence changes, or the owned item,
+binding or definition differs. Final preflight must finish within two minutes.
+Before the only `updateDefinition` request it
+atomically creates `demo-2-monitor-definition-before.json` and a separate
+`demo-2-monitor-publication.json` intent in the state directory. Keep both records.
+The deployment mutex is local; Fabric definition updates here have no established
+compare-and-swap protection against an external writer.
+
+After an interruption or uncertain response, use the same command with
+`--reconcile` in place of `--publish`. Reconciliation cannot reissue the update:
+it polls a recorded operation when available, respects its `Retry-After`, and
+requires exact definition and owned-item readback. A verified outcome without an
+operation ID is recorded as readback-only, not as service acknowledgement. Do not
+delete the intent or use another state directory to force a retry. Preserve the
+old lifecycle, journals, lock, and profile; pin the verified new hash only in the
+new immutable profile. Publication does not establish full-cadence readiness.
+
 ## OneLake semantics and troubleshooting
 
 OneLake availability is a **read-only managed Delta representation**, not the

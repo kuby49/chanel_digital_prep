@@ -190,8 +190,10 @@ Click earlier to allow for Fabric queueing and notebook startup: click time is
 not allocation time. A five-minute schedule keeps generating refresh workload
 while enabled, including between presentations. The capacity was scaled to
 F16 and read back Active at 09:26 UTC on November 25, 2026; a later readback
-confirmed F32 Active after the user raised it again. The verified demo run used
-F32; the UI retry at F16 failed and does not establish F16 performance.
+confirmed F32 Active after the user raised it again. The user requires this
+capacity to remain running at F32 indefinitely, not just during recovery.
+The verified demo run used F32; the UI retry at F16 failed and does not establish
+F16 performance.
 The schedule expires without renewal; the Activator rule has **no automatic
 TTL** and needs an explicit owner stop. Keep both dependencies enabled and
 unchanged through the final run's verification and cleanup.
@@ -236,7 +238,7 @@ the owner must independently reconcile/drain owned jobs and locks, then
 journal-stop/read back the shared schedule and rule. Do this before leaving the
 setup unattended or at the operating-window expiry; the rule does not stop
 itself. Point-in-time drain checks do not prove Fabric event queues are empty
-or exclude external writers. Leave the capacity running at its final size.
+or exclude external writers. Leave the capacity running at F32.
 The owner uses the original schedule setup config and journal with Demo 1's
 `managed_refresh.py status` and `stop --yes`, and the retained rebound inputs
 and cycle-7 journal with Demo 3's `native_rule.py --mode disable --cycle 7`
@@ -296,7 +298,7 @@ The orchestrator never starts the measured producer unless `--deploy --run-data`
 
 The orchestrator compares configuration snapshots with the in-memory invocation configuration at phase boundaries, including after validation and monitor startup. An observed change blocks producer dispatch; if a monitor was submitted, it attempts to stop only its exact recorded job using the original configuration, with a fresh recovery snapshot if necessary. A change during producer execution makes its outcome unconfirmed. These checks do not authenticate the file or prevent a concurrent writer from changing it between checks; protect the deployment state directory from other writers.
 
-A nonempty stable `data.run_id`, bounded file count, batch size and sufficient positive maximum duration are required. The producer owns enforcing its runtime deadline, persisting progress and terminating its Fabric job; `run-data` may pass only after terminal completion and reconciliation for all selected destinations. For Demo 2, the orchestrator then waits separately for its monitor's terminal completion and per-batch and run-level verification; producer success or a running heartbeat alone is insufficient. If producer execution fails or times out, its remote outcome is uncertain; the Demo 2 monitor remains bounded rather than assuming the producer stopped. Inspect both remote jobs and their persisted outcomes. After a run, verify job/session completion and pause demo-owned schedules and rules, leaving the capacity running at its final size. The bounded one-file customer run has not yet been completed; it does not replace ten-file acceptance.
+A nonempty stable `data.run_id`, bounded file count, batch size and sufficient positive maximum duration are required. The producer owns enforcing its runtime deadline, persisting progress and terminating its Fabric job; `run-data` may pass only after terminal completion and reconciliation for all selected destinations. For Demo 2, the orchestrator then waits separately for its monitor's terminal completion and per-batch and run-level verification; producer success or a running heartbeat alone is insufficient. If producer execution fails or times out, its remote outcome is uncertain; the Demo 2 monitor remains bounded rather than assuming the producer stopped. Inspect both remote jobs and their persisted outcomes. After a run, verify job/session completion and pause demo-owned schedules and rules, leaving the capacity running at F32. The bounded one-file customer run has not yet been completed; it does not replace ten-file acceptance.
 
 The producer entry point also offers direct `producer-status` and `stop-producer` modes for a bound **no-sales preflight** parent-job journal, using the original effective configuration and `--selected-demos`. If the parent is terminal but its exact linked notebook child is still active, `stop-producer` checks the same job chain for up to 120 seconds without requesting cancellation. The producer owner observed that the child can still be running after the parent completes. Both modes report termination unconfirmed because delivery reconciliation remains unproven; neither is grounds to stop the monitor. These inspection modes are not exposed as top-level orchestrator recovery commands.
 

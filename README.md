@@ -139,7 +139,9 @@ or stopped setup does not repair itself when **Run** is pressed.
 
 The chosen policy allows one fixed 24-hour schedule, not an indefinitely
 renewable service. Each **Run** allocates a fresh identity and a fixed two-hour
-lifecycle; therefore its latest allocation is the schedule end minus two hours.
+lifecycle; its latest supported full-budget allocation is the schedule end
+minus two hours. Demo 1's narrower runtime check uses the default 115-minute
+verification deadline; that is not permission to abandon the two-hour budget.
 Click earlier to allow for Fabric queueing and notebook startup: click time is
 not allocation time. A five-minute schedule keeps generating refresh workload
 while enabled, including between presentations. Capacity remains running at F32.

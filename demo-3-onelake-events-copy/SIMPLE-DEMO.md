@@ -4,12 +4,15 @@ Open the existing combined Fabric pipeline and select **Run**. The producer
 uses `simple_demo3.py` to stop the fixed Activator and any active runs of its
 Copy pipeline, clear `Files/incoming/sales`, and recreate `dbo.factsales` and
 the sample dimensions in the configured Lakehouse. It enables the Activator
-before publishing sales. Each native `FileCreated` event passes `___subject`
+and automatically waits 180 seconds before publishing sales. This measured
+startup mitigation is not a service-readiness guarantee.
+Each native `FileCreated` event passes `___subject`
 to a single Copy activity, which reads that exact CSV and appends to the
 Delta fact table. There is no guard notebook, audit store or replay step.
 
-On normal completion the helper waits for the final numbered batch to appear
-in the fact table, then disables the trigger and lets active Copy jobs finish.
+On normal completion the helper checks that every expected numbered batch is
+present in the fact table, then disables the trigger and lets active Copy jobs
+finish. A missing batch raises an error after the normal finite completion wait.
 Failure cleanup disables the trigger and cancels active Copy jobs. Both leave
 the results in place. Inspect `dbo.factsales` and join `dbo.DimCustomer`,
 `dbo.DimProduct` and `dbo.DimDate` on `CustomerID`, `ProductID` and `Date`;
@@ -38,7 +41,7 @@ reset and start over.
    jobs, and write the target's landing folder, fact and dimensions. Reuse
    the configured OAuth2 connection; no new resource or root setting is needed.
 
-The final-batch check is not a reconciliation of every file. Stopping the
+The end-of-run batch presence check does not reconcile individual rows or files. Stopping the
 Reflex and draining listed jobs does not prove that the service discarded
 every queued event. Keep the existing capacity running at F32. These helpers
 are implemented locally; live publication and two consecutive presenter Runs

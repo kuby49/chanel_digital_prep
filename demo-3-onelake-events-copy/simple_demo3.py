@@ -6,7 +6,7 @@ import json
 import time
 from datetime import date
 from urllib.error import HTTPError
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import UUID
 
@@ -193,9 +193,13 @@ def _jobs(context):
         seen.add(path)
         _, _, page = _request(context, "GET", path)
         yield from page["value"]
-        path = page.get("continuationUri")
-        if not path and page.get("continuationToken"):
-            raise RuntimeError("Demo 3 pipeline history returned no continuation URI")
+        token = page.get("continuationToken")
+        if token is None and not page.get("continuationUri"):
+            return
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("Demo 3 pipeline history returned no valid continuation token")
+        # Regional continuation hosts are not authorized token destinations.
+        path = jobs_path + "?" + urlencode({"jobType": "Pipeline", "continuationToken": token})
 
 
 def _drain(context, *, cancel):
@@ -266,29 +270,33 @@ def reset(context):
 def start(context):
     """Enable the existing native trigger before the producer publishes sales."""
     _trigger(context, True)
+    # The first two files preceded observed activation after the last enable.
+    time.sleep(180)
 
 
 def stop(context, *, failed=False):
     """Retain the results; on failure cancel active Copy rather than waiting for data."""
     if not failed:
-        _wait_for_final_batch(context)
+        _wait_for_batches(context)
     _trigger(context, False)
     _drain(context, cancel=failed)
 
 
-def _wait_for_final_batch(context):
+def _wait_for_batches(context):
     from simple_data import batch_id
 
     config = context["config"]
     root = _lakehouse_root(_settings(config))
-    final_batch = batch_id(config["data"]["file_count"])
+    expected = {batch_id(number) for number in range(1, config["data"]["file_count"] + 1)}
     spark = context["spark"]
     deadline = time.monotonic() + _WAIT_SECONDS
     while True:
         fact = spark.read.format("delta").load(f"{root}/Tables/dbo/factsales")
-        if fact.where(fact["BatchID"] == final_batch).limit(1).take(1):
+        present = {row["BatchID"] for row in fact.select("BatchID").distinct().collect()}
+        missing = expected - present
+        if not missing:
             return
-        _wait(deadline, f"Demo 3 Copy has not delivered final batch {final_batch}; see pipeline run history")
+        _wait(deadline, f"Demo 3 Copy is missing batches {', '.join(sorted(missing))}; see pipeline run history")
 
 
 def copy_pipeline(config, existing):

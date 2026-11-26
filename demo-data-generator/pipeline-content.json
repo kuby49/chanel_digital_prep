@@ -5,7 +5,15 @@
         "name": "RunProducer",
         "type": "TridentNotebook",
         "policy": {"timeout": "0.02:00:00", "retry": 0},
-        "typeProperties": {"notebookId": "<producer-notebook-id>"}
+        "typeProperties": {
+          "notebookId": "<producer-notebook-id>",
+          "parameters": {
+            "pipeline_run_id": {
+              "value": {"value": "@pipeline().RunId", "type": "Expression"},
+              "type": "string"
+            }
+          }
+        }
       }
     ]
   }

@@ -25,8 +25,10 @@ window, publish a profile, start a monitor, edit JSON or use a local launcher.
 ## Environment and existing targets
 
 Use the signed-in MCAP identity where the relevant operation supports it.
-Keep `fabricadbmirror` running at **F32**; do not resize, restart or suspend it.
-Do not change unrelated workloads, resources or permissions.
+Keep `fabricadbmirror` at **F32** while completing the live acceptance. After
+successful acceptance and stopping demo activity, suspend the capacity as
+requested. The retained results are available again when it is resumed. Do not
+change unrelated workloads, resources or permissions.
 
 `demo-settings.json` contains the fixed settings shared by the wrapper and
 demo helpers. These bindings come from the existing presenter setup; inclusion
@@ -103,13 +105,18 @@ for this execution, not presenter admission windows. Allow the last generated
 file to receive its native refresh before stopping the schedule. Leave the
 resulting tables available. Report a real API limitation if schedule automation
 is unavailable; do not silently substitute another ingestion mechanism.
+After the final refresh, synchronize the SQL endpoint metadata for the two
+materialized outputs without recreating SQL tables.
 
 ## Demo 2: Eventhouse and OneLake availability
 
 Reset `SyntheticFactSales` in the existing KQL database. Keep or recreate its
-schema and `SalesCsvV1` mapping and configure OneLake availability with the
-five-minute target. Restore the Lakehouse dimensions and retain or repair the
-`EventhouseFactSales` shortcut using the actual OneLake location.
+schema and `SalesCsvV1` mapping. Use native database-level OneLake availability
+for every KQL database used by the demo and retain it after reset. The existing
+database is enabled; Fabric documents enabling this database setting in its UI.
+Configure the sales table's OneLake availability with the five-minute target.
+Restore the Lakehouse dimensions and retain or repair the `EventhouseFactSales`
+shortcut using the actual OneLake location; do not add a separate sync path.
 
 Submit the generated CSV files through the supported Kusto ingestion SDK.
 Show the facts in KQL and through the Lakehouse shortcut joined to the
@@ -129,13 +136,17 @@ active Copy work before clearing its data. Do not scan unrelated workspaces.
 Use OneLake `FileCreated` events for completed `sales_*.csv` files in
 `/Files/incoming/sales/`. The existing Activator starts the existing pipeline,
 whose ingestion path is a **single Copy activity** loading the event's file
-into `dbo.factsales`. Bind the file location from the actual event. Do not
-replace event-triggered Copy with scheduled polling or notebook ingestion.
+into `dbo.factsales` using **Append**, not Upsert. Bind the file location from
+the actual event. Do not add deduplication or replay recovery, or replace
+event-triggered Copy with scheduled polling or notebook ingestion.
 
-Enable the native event trigger before producing sales, then let the final
-Copy finish and disable the trigger automatically. Retain the copied facts and
-dimension joins for inspection. No guard notebook, audit store, staging-access
-probe, event observer or replay/rebind subsystem is required.
+Enable the native event trigger before producing sales and allow three minutes
+for it to settle; this is not a guaranteed readiness bound. Then let Copy finish
+and disable the trigger automatically. Retain the copied facts and dimension
+joins for inspection. No guard notebook, audit store, staging-access probe,
+event observer or replay/rebind subsystem is required.
+After Copy completes, synchronize the fact table's SQL endpoint metadata without
+recreating the SQL table.
 
 ## Minimal helper interface for parallel implementation
 
@@ -213,9 +224,11 @@ additional requirement of this specification.
 
 Validate the actual presenter experience: Run from a clean or interrupted
 state, see new data through each specified mechanism and dimension join, see
-the native schedule/trigger stop, inspect the retained results, then Run again
-and see reset rather than accumulation. Do not claim a live outcome from local
-tests or from a successful parent status alone.
+the native schedule/trigger stop, inspect the retained results and database-level
+OneLake availability, then Run again and see reset rather than accumulation.
+After acceptance, suspend the capacity without deleting the retained results.
+Do not claim a live outcome from local tests or from a successful parent status
+alone.
 
 Do not add superfluous unit tests, negative-data suites, schema-drift handling,
 record-loss/duplication recovery or detailed processing measurements. Keep only

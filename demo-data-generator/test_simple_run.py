@@ -21,6 +21,79 @@ SETTINGS = json.loads((ROOT.parent / "demo-settings.json").read_text(encoding="u
 
 
 class SimpleRunTests(unittest.TestCase):
+    def test_interrupted_producer_is_stopped_without_stopping_current_activity(self):
+        current = "11111111-1111-4111-8111-111111111111"
+        previous = "22222222-2222-4222-8222-222222222222"
+        pipeline_run = "33333333-3333-4333-8333-333333333333"
+        active = [{"id": job, "jobType": "PipelineRunNotebook", "status": "InProgress",
+                   "startTimeUtc": f"2026-11-25T22:5{index}:00Z"}
+                  for index, job in enumerate((previous, current))]
+        stopped = [{**active[0], "status": "Cancelled"}, active[1]]
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url))
+            if url.endswith("/queryactivityruns"):
+                body = {"value": [{"activityRunId": current, "activityName": "RunProducer",
+                                    "activityType": "TridentNotebook"}]}
+            elif url.endswith("/cancel"):
+                body = None
+            else:
+                body = {"value": active if sum("/cancel" in item[1] for item in calls) == 0 else stopped}
+            response = SimpleNamespace(content=b"{}" if body is not None else b"",
+                                       json=lambda: body, raise_for_status=lambda: None)
+            return response
+
+        with patch("simple_run.requests.request", side_effect=request), patch("simple_run.time.sleep"):
+            simple_run.stop_previous_producer({"config": SETTINGS, "get_token": lambda _: "token"}, pipeline_run)
+        cancelled = [url for method, url in calls if url.endswith("/cancel")]
+        self.assertEqual(len(cancelled), 1)
+        self.assertIn(previous, cancelled[0])
+
+    def test_interrupted_producer_never_cancels_a_newer_activity(self):
+        current = "11111111-1111-4111-8111-111111111111"
+        newer = "22222222-2222-4222-8222-222222222222"
+        pipeline_run = "33333333-3333-4333-8333-333333333333"
+        jobs = [{"id": job, "jobType": "PipelineRunNotebook", "status": "InProgress",
+                 "startTimeUtc": f"2026-11-25T22:5{index}:00Z"}
+                for index, job in enumerate((current, newer))]
+
+        def request(method, url, **kwargs):
+            self.assertFalse(url.endswith("/cancel"))
+            body = ({"value": [{"activityRunId": current, "activityName": "RunProducer",
+                                "activityType": "TridentNotebook"}]}
+                    if url.endswith("/queryactivityruns") else {"value": jobs})
+            return SimpleNamespace(content=b"{}", json=lambda: body, raise_for_status=lambda: None)
+
+        with patch("simple_run.requests.request", side_effect=request):
+            simple_run.stop_previous_producer({"config": SETTINGS, "get_token": lambda _: "token"}, pipeline_run)
+            jobs[1]["startTimeUtc"] = None
+            with self.assertRaisesRegex(RuntimeError, "Cannot determine the order"):
+                simple_run.stop_previous_producer({"config": SETTINGS, "get_token": lambda _: "token"}, pipeline_run)
+
+    def test_interrupted_producer_uses_canonical_job_history_pagination(self):
+        current = "11111111-1111-4111-8111-111111111111"
+        pipeline_run = "33333333-3333-4333-8333-333333333333"
+        urls = []
+
+        def request(method, url, **kwargs):
+            urls.append(url)
+            if url.endswith("/queryactivityruns"):
+                body = {"value": [{"activityRunId": current, "activityName": "RunProducer",
+                                    "activityType": "TridentNotebook"}]}
+            elif "continuationToken=" in url:
+                body = {"value": [{"id": current, "jobType": "PipelineRunNotebook",
+                                    "status": "InProgress", "startTimeUtc": "2026-11-25T22:51:00Z"}]}
+            else:
+                body = {"value": [], "continuationToken": "a+b/=",
+                        "continuationUri": "https://wabi.example.invalid/v1/ignored"}
+            return SimpleNamespace(content=b"{}", json=lambda: body, raise_for_status=lambda: None)
+
+        with patch("simple_run.requests.request", side_effect=request):
+            simple_run.stop_previous_producer({"config": SETTINGS, "get_token": lambda _: "token"}, pipeline_run)
+        self.assertTrue(urls[-1].startswith("https://api.fabric.microsoft.com/v1/"))
+        self.assertIn("continuationToken=a%2Bb%2F%3D", urls[-1])
+
     def test_dimensions_match_existing_demo_dimensions(self):
         data = SETTINGS["data"]
         original = generator.RunConfig(
@@ -43,9 +116,11 @@ class SimpleRunTests(unittest.TestCase):
         modules[1][1].submit_batch = lambda context, payload: submitted.append(payload)
         settings = {**SETTINGS, "data": {**SETTINGS["data"], "file_count": 2, "rows_per_file": 2}}
         sent = []
-        simple_run.run({"config": settings}, modules,
-                       send=lambda context, demo, filename, content: sent.append((demo, filename, content)),
-                       sleep=lambda seconds: events.append(("sleep", seconds)))
+        with patch("simple_run.refresh_sql_metadata") as refresh:
+            simple_run.run({"config": settings}, modules,
+                           send=lambda context, demo, filename, content: sent.append((demo, filename, content)),
+                           sleep=lambda seconds: events.append(("sleep", seconds)))
+        self.assertEqual([call.args[1] for call in refresh.call_args_list], ["demo-1", "demo-3"])
         self.assertEqual(events[:3], [(name, "stop", True) for name, _ in modules])
         self.assertEqual(events[3:6], [(name, "reset") for name, _ in modules])
         self.assertEqual(events[6:9], [(name, "start") for name, _ in modules])
@@ -59,6 +134,50 @@ class SimpleRunTests(unittest.TestCase):
         rows = list(csv.DictReader(io.StringIO(submitted[0].decode())))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["BatchID"], "batch_0001")
+
+    def test_sql_refresh_waits_for_operation_and_checks_each_table(self):
+        endpoint = "44444444-4444-4444-8444-444444444444"
+        operation = "55555555-5555-4555-8555-555555555555"
+        responses = [
+            SimpleNamespace(status_code=200, json=lambda: {
+                "properties": {"sqlEndpointProperties": {"id": endpoint}}}),
+            SimpleNamespace(status_code=202, headers={"x-ms-operation-id": operation}),
+            SimpleNamespace(status_code=200, json=lambda: {"status": "Succeeded"}),
+            SimpleNamespace(status_code=200, json=lambda: {"value": [
+                {"tableName": "bronze.sales_files", "status": "Success"},
+                {"tableName": "silver.sales_joined", "status": "Success"},
+            ]}),
+        ]
+        for response in responses:
+            response.raise_for_status = lambda: None
+        with patch("simple_run.requests.request", side_effect=responses) as request:
+            simple_run.refresh_sql_metadata(
+                {"config": SETTINGS, "get_token": lambda _: "token"}, "demo-1",
+                [("bronze", "sales_files"), ("silver", "sales_joined")])
+        body = request.call_args_list[1].kwargs["json"]
+        self.assertFalse(body["recreateTables"])
+        self.assertEqual(body["tables"], [
+            {"schema": "bronze", "tableNames": ["sales_files"]},
+            {"schema": "silver", "tableNames": ["sales_joined"]},
+        ])
+        self.assertTrue(request.call_args_list[-1].args[1].endswith(f"/{operation}/result"))
+
+    def test_sql_refresh_surfaces_unsuccessful_table(self):
+        endpoint = "44444444-4444-4444-8444-444444444444"
+        responses = [
+            SimpleNamespace(status_code=200, json=lambda: {
+                "properties": {"sqlEndpointProperties": {"id": endpoint}}}),
+            SimpleNamespace(status_code=200, json=lambda: {"value": [
+                {"tableName": "dbo.factsales", "status": "Failure"},
+            ]}),
+        ]
+        for response in responses:
+            response.raise_for_status = lambda: None
+        with patch("simple_run.requests.request", side_effect=responses):
+            with self.assertRaisesRegex(RuntimeError, "factsales: Failure"):
+                simple_run.refresh_sql_metadata(
+                    {"config": SETTINGS, "get_token": lambda _: "token"}, "demo-3",
+                    [("dbo", "factsales")])
 
     def test_failure_stops_all_without_publishing(self):
         events = []
@@ -107,7 +226,8 @@ class SimpleRunTests(unittest.TestCase):
                 pipeline = fabric_assets.pipeline_definition(settings["workspace_id"], settings["producer_notebook_id"])
                 pipeline = json.loads(base64.b64decode(pipeline["parts"][0]["payload"]))
                 self.assertNotIn("parameters", pipeline["properties"])
-                self.assertNotIn("parameters", pipeline["properties"]["activities"][0]["typeProperties"])
+                internal = pipeline["properties"]["activities"][0]["typeProperties"]["parameters"]
+                self.assertEqual(internal["pipeline_run_id"]["value"]["value"], "@pipeline().RunId")
 
     def test_publisher_builds_both_before_update_and_polls_accepted_operation(self):
         events = []

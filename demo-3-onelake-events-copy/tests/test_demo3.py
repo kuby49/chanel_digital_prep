@@ -101,11 +101,11 @@ class EventTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             activator.build_definition(*ids, {**self.event, "source": "/other-lakehouse"}, run_id="run")
 
-    def test_run_filter_is_bound_to_the_approved_run(self):
+    def test_fixed_source_remains_bound_to_its_run(self):
         ids = [str(uuid.uuid4()) for _ in range(4)]
         sample = {**self.event, "source": f"/tenants/{ids[0]}/workspaces/{ids[1]}/items/{ids[2]}"}
-        entities = activator.build_definition(*ids, sample, run_id="new_run-2026")
-        source = next(entity for entity in entities if entity["type"] == "realTimeHubSource-v1")
+        graph = activator.build_definition(*ids, sample, run_id="new_run-2026")
+        source = next(item for item in graph if item["type"] == "realTimeHubSource-v1")
         self.assertEqual(source["payload"]["filterSettings"]["filters"][0]["values"],
                          ["/Files/incoming/sales/sales_new_run-2026_"])
         for invalid in ("", "../run", "x/y", "x" * 65, None):
@@ -146,6 +146,11 @@ class EntrypointTests(unittest.TestCase):
                 self.assertFalse(payload["ready"])
                 self.assertEqual(payload["status"], "pass" if mode == "dry-run" else "blocked")
                 self.assertEqual(proc.returncode, 0 if mode == "dry-run" else 1)
+                if mode == "deploy":
+                    diagnostics = " ".join(payload["diagnostics"])
+                    self.assertIn("no-missed-notification assumption is unmeasured", diagnostics)
+                    self.assertIn("missed-notification recovery is not a prerequisite", diagnostics)
+                    self.assertIn("safe stopping", diagnostics)
 
     def test_cleanup_requires_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +166,22 @@ class EntrypointTests(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["status"], "fail")
+
+
+class GuardSparkTests(unittest.TestCase):
+    def test_onelake_endpoint_normalizes_https_and_rejects_other_hosts(self):
+        producer_path = str(ROOT.parent / "demo-data-generator")
+        sys.path.insert(0, producer_path)
+        self.addCleanup(sys.path.remove, producer_path)
+        self.addCleanup(sys.modules.pop, "generator", None)
+        import guard_spark
+
+        self.assertEqual(guard_spark.onelake_endpoint(
+            "https://onelake.dfs.fabric.microsoft.com/"), "onelake.dfs.fabric.microsoft.com")
+        self.assertEqual(guard_spark.onelake_endpoint("onelake.dfs.fabric.microsoft.com"),
+                         "onelake.dfs.fabric.microsoft.com")
+        with self.assertRaises(RuntimeError):
+            guard_spark.onelake_endpoint("https://other.invalid/")
 
 
 class TargetCandidateTests(unittest.TestCase):
@@ -457,6 +478,7 @@ class AuditTests(unittest.TestCase):
         self.audit.copy_succeeded(token, self.evidence["batch_id"], attempt, self.copy_result)
         with self.assertRaises(audit.AuditError):
             self.audit.complete(token, self.evidence["batch_id"], {**self.proof, "row_difference_count": 1})
+
         self.audit.complete(token, self.evidence["batch_id"], self.proof)
         self.audit.release(token, self.evidence["batch_id"])
 
@@ -475,6 +497,11 @@ class AuditTests(unittest.TestCase):
         self.audit.copy_intent(next_token, "run_0002")
         with self.assertRaises(audit.AuditError):
             self.audit.release(next_token, "run_0001")
+
+    def test_batch_keys_must_start_at_one(self):
+        token = self.audit.acquire(self.job, self.evidence["batch_id"])
+        with self.assertRaises(audit.AuditError):
+            self.audit.begin(token, {**self.evidence, "first_sales_line_id": 11, "last_sales_line_id": 12})
 
     def test_uncertain_or_inflight_copy_keeps_lock_and_blocks_replay(self):
         token = self.audit.acquire(self.job, self.evidence["batch_id"])
@@ -513,12 +540,6 @@ class AuditTests(unittest.TestCase):
                 token, self.evidence["batch_id"], attempt, {**self.copy_result, "files_read": 2})
         with self.assertRaises(audit.AuditError):
             self.audit.release(token, self.evidence["batch_id"])
-
-    def test_batch_ids_must_start_at_one(self):
-        token = self.audit.acquire(self.job, self.evidence["batch_id"])
-        with self.assertRaises(audit.AuditError):
-            self.audit.begin(token, {**self.evidence, "first_sales_line_id": 11,
-                                     "last_sales_line_id": 12})
 
     def test_tampered_audit_record_cannot_start_copy(self):
         token = self.audit.acquire(self.job, self.evidence["batch_id"])
@@ -576,12 +597,6 @@ class ReconciliationTests(unittest.TestCase):
         sys.modules[producer_spec.name] = producer
         self.addCleanup(sys.modules.pop, producer_spec.name, None)
         producer_spec.loader.exec_module(producer)
-        with mock.patch.dict(sys.modules, {"generator": producer}):
-            import guard_spark
-            self.assertEqual(guard_spark.onelake_endpoint(
-                "https://onelake.dfs.fabric.microsoft.com/"), "onelake.dfs.fabric.microsoft.com")
-            with self.assertRaises(RuntimeError):
-                guard_spark.onelake_endpoint("https://other.invalid/")
         config = producer.RunConfig("integration", date_count=4, products=3, customers=5,
                                     file_count=1, rows_per_file=12)
         shared = {"contract_version": 1, "data": {
@@ -622,6 +637,9 @@ class ReconciliationTests(unittest.TestCase):
             def validate(document=manifest, source=source_bytes, path=subject, **kwargs):
                 return batch_gate.validate_batch(
                     producer, config, json.dumps(document).encode("utf-8"), path, source, **kwargs)
+
+            with self.assertRaisesRegex(ValueError, "fingerprint"):
+                validate(document={**manifest, "generator_sha256": "0" * 64}, event_id="event-1")
 
             import hashlib
             from types import SimpleNamespace
@@ -735,7 +753,6 @@ class ReconciliationTests(unittest.TestCase):
                 validate()
             for path, value in (
                 (("config", "seed"), 999),
-                (("generator_sha256",), "0" * 64),
                 (("batches", "1", "row_count"), True),
                 (("batches", "1", "amount_by_date"), {"2024-01-01": 0}),
                 (("batches", "1", "deliveries", "demo-3", "status"), "pending"),

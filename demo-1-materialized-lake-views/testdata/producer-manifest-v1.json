@@ -1,0 +1,49 @@
+{
+  "batches": {
+    "1": {
+      "amount_by_customer_region": {
+        "Americas": 101097,
+        "Europe": 345740
+      },
+      "amount_by_date": {
+        "2024-01-01": 101097,
+        "2024-01-02": 345740
+      },
+      "amount_by_product_category": {
+        "Beauty": 101097,
+        "Fashion": 345740
+      },
+      "batch_class": "measured",
+      "batch_id": "demo1-fixture_0001",
+      "batch_number": 1,
+      "deliveries": {
+        "demo-1": {
+          "status": "pending",
+          "timestamp_utc": null
+        }
+      },
+      "filename": "sales_demo1-fixture_0001.csv",
+      "generated_at_utc": "2026-11-23T21:42:51.002710+00:00",
+      "row_count": 4,
+      "sales_amount_minor_units": 446837,
+      "sha256": "2fb5ddb355bbb60140977cb1360bba4e273436328c7213717ed8e768329eab95"
+    }
+  },
+  "config": {
+    "batch_class": "measured",
+    "customers": 2,
+    "date_count": 2,
+    "file_count": 1,
+    "interval_seconds": 60,
+    "products": 2,
+    "rows_per_file": 4,
+    "run_id": "demo1-fixture",
+    "seed": 42,
+    "start_date": "2024-01-01"
+  },
+  "contract_version": 1,
+  "destinations": [
+    "demo-1"
+  ],
+  "run_id": "demo1-fixture"
+}

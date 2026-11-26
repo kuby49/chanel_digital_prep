@@ -269,8 +269,10 @@ def main(argv=None):
             )
         else:
             result["diagnostics"].append(
-                "Blocked: production exact-file Copy, serialized writes, recovery, event binding and "
-                "query-surface readiness are not implemented or verified; no Fabric changes made."
+                "Blocked: production exact-file Copy, serialized writes, monitoring, event binding, data correctness, "
+                "duplicate-retry safety, safe stopping and query-surface readiness are not implemented or verified. "
+                "The no-missed-notification assumption is unmeasured; missed-notification recovery is not a "
+                "prerequisite, but any visible failed run must be reported. No Fabric changes made."
             )
     except CandidateBlocked as exc:
         result["diagnostics"].append(str(exc))

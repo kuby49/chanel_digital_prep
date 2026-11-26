@@ -43,7 +43,8 @@ reset and start over.
 
 The end-of-run batch presence check does not reconcile individual rows or files. Stopping the
 Reflex and draining listed jobs does not prove that the service discarded
-every queued event. Keep the existing capacity running at F32. These helpers
-are implemented locally; live publication and two consecutive presenter Runs
-remain integration work. The older `README.md` documents the legacy flow, not
-prerequisites for this one.
+every queued event. The default capacity size is F16. A manual
+combined-pipeline Run completed at that size; independent destination
+verification and two consecutive presenter Runs remain unverified. These
+helpers are published to the existing demo; the older `README.md` documents
+the legacy flow, not prerequisites for this one.

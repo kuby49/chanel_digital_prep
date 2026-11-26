@@ -141,9 +141,10 @@ Demo 1's accepted scheduled MLV refresh cadence is five minutes; the
 60-second file cadence does not imply 60-second table visibility.
 
 The prepared all-demo profile completed bounded native runs on F32, including
-the 2026-11-25 presenter-profile run described in the
-[presenter walkthrough](../README.md#presenter-walkthrough). A full run after
-the F16 resize has not been tested. Demo 1's read-only hook
+the 2026-11-25 presenter-profile run from the earlier workflow. The simplified
+combined pipeline and producer notebook completed a manual Run on F16 on
+2026-11-26; downstream results were not independently verified. Demo 1's
+read-only hook
 requires an approved one-time bounded control-plane schedule receipt;
 notebook-resident MLV schedule mutations are not bundled. The shared setup
 schedule intentionally remains enabled between runs, and its remaining

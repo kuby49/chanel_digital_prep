@@ -15,7 +15,9 @@ and starts again. No results are deleted by `stop`.
 The signed-in identity needs KQL Table Admin for reset, KQL ingestion and read
 permissions, and read/write access to the configured Lakehouse and shortcut.
 The notebook environment needs `azure-kusto-data`. Settings come from `demo-2`
-and `data` in the shared `demo-settings.json`. Capacity stays F32.
+and `data` in the shared `demo-settings.json`. The default capacity size is F16.
+A manual combined-pipeline Run completed at that size; independent destination
+verification remains pending.
 
 Reset turns OneLake availability off, clears the KQL table, then turns it back on
 with the configured five-minute target. It never deletes managed Delta files.

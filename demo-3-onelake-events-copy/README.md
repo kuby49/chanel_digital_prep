@@ -118,8 +118,10 @@ owned target and staging readbacks, connection and caller role, target jobs,
 schedules and lock. They require the configured target and staging capacities
 to be active F32 immediately before writes. The capacity must remain F32
 indefinitely; these controllers never resize or suspend it and cannot prevent
-another actor changing it. The item and publication workflows have only been
-tested locally, not against the replacement's live items.
+another actor changing it. This requirement applies to this separate isolated
+replacement workflow, which is blocked at the simplified demo's F16 default.
+The item and publication workflows have only been tested locally, not against
+the replacement's live items.
 
 Publishing even the **disabled** Reflex remains blocked. `isolated_access.assess`
 can inspect a controlled job's linkage but cannot prove the executed definition,

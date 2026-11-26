@@ -1,6 +1,6 @@
 {
   "tenant_id": "4526cee1-4399-4e4b-9134-46fabd583527",
-  "capacity": {"name": "fabricadbmirror", "size": "F32"},
+  "capacity": {"name": "fabricadbmirror", "size": "F16"},
   "data": {
     "seed": 42,
     "start_date": "2026-01-01",

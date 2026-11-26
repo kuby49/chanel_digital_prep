@@ -25,14 +25,18 @@ window, publish a profile, start a monitor, edit JSON or use a local launcher.
 ## Environment and existing targets
 
 Use the signed-in MCAP identity where the relevant operation supports it.
-Keep `fabricadbmirror` at **F32** while completing the live acceptance. After
-successful acceptance and stopping demo activity, suspend the capacity as
-requested. The retained results are available again when it is resumed. Do not
-change unrelated workloads, resources or permissions.
+The default size for `fabricadbmirror` is **F16**. Earlier live runs used F32.
+A manual combined-pipeline and producer-notebook Run completed on F16 on
+2026-11-26; independent downstream result verification remains pending. After
+the Run, the capacity was suspended as requested. The retained results are
+available again when it is resumed. Do not change unrelated workloads,
+resources or permissions.
 
-`demo-settings.json` contains the fixed settings shared by the wrapper and
-demo helpers. These bindings come from the existing presenter setup; inclusion
-here does not claim that a new implementation has been deployed or run.
+`demo-settings.json` contains the fixed settings bundled with the wrapper and
+demo helpers on publication. The bundled capacity size is descriptive and
+does not control or validate the live capacity. These bindings come from the
+existing presenter setup; inclusion here does not by itself prove a deployment
+or successful downstream data delivery.
 
 | Component | Workspace ID | Existing item IDs |
 |---|---|---|

@@ -2,7 +2,10 @@
 
 The [specification](SPECIFICATION.md) describes the three demos and their
 shared reset-and-run lifecycle. The simplified implementation has been
-published to the existing Fabric items; complete live acceptance is pending.
+published to the existing Fabric items. A manual presenter Run completed on
+F16; independent end-to-end result verification remains pending.
+For the data flows and their closest Databricks counterparts, open the
+[six-slide interactive architecture briefing](architecture/ingestion-scenarios.html).
 
 ## Run the demos
 
@@ -25,5 +28,10 @@ database. If it is manually disabled, enable it again in the database details
 UI; the reset does not configure that database-level switch. The five-minute
 table mirroring target is not a visibility guarantee.
 
-The demo capacity is F32 during acceptance. After acceptance it is to be
-suspended; retained results are accessible again after the capacity is resumed.
+The default demo capacity size is F16. Earlier live runs used F32. On
+2026-11-26, a manual Run of the combined pipeline and its producer notebook
+both completed on F16; that status alone does not independently verify every
+destination's results. The capacity was suspended after the run. Retained
+results are accessible again after it is resumed. The published notebook's
+bundled capacity metadata may lag the settings file; it does not control or
+validate the live capacity size.

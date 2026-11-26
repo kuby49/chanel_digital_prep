@@ -1,5 +1,21 @@
 # Shared data producer
 
+**Reset-and-run implementation:** `simple_run.py` runs the three
+`simple_demo*.py` helpers, publishes the same CSV bytes to each demo and stops
+their native activity. The generated wrapper has no presenter parameters.
+After the demo helpers are integrated, `python demo-data-generator\publish_simple.py`
+publishes the fixed notebook and pipeline definitions; it does not start a run.
+This publication and the simplified Run have not yet been verified in Fabric.
+The older recovery and manifest procedures below are legacy.
+
+The pipeline explicitly serializes `runtime_evidence_json`, `run_config_json`
+and `selected_demos_json` with Fabric's `string(...)` expression before passing
+them to the notebook. The UI can supply `{}` and `[]` as objects and arrays
+even when the pipeline parameters are declared strings; direct forwarding
+then fails notebook-service parameter conversion before any notebook starts.
+Already serialized API values remain strings. Notebook JSON parsing and
+runtime admission checks are unchanged.
+
 The producer defines **CSV contract v1**: UTF-8, comma-delimited, a header,
 minimal RFC 4180 quoting, LF line endings, no nulls, ISO dates and UTC
 timestamps ending in `Z`. Amounts are integer USD cents and
@@ -125,9 +141,10 @@ Demo 1's accepted scheduled MLV refresh cadence is five minutes; the
 60-second file cadence does not imply 60-second table visibility.
 
 The prepared all-demo profile completed bounded native runs on F32, including
-the 2026-11-25 presenter-profile run described in the
-[presenter walkthrough](../README.md#presenter-walkthrough). A full run after
-the F16 resize has not been tested. Demo 1's read-only hook
+the 2026-11-25 presenter-profile run from the earlier workflow. The simplified
+combined pipeline and producer notebook completed a manual Run on F16 on
+2026-11-26; downstream results were not independently verified. Demo 1's
+read-only hook
 requires an approved one-time bounded control-plane schedule receipt;
 notebook-resident MLV schedule mutations are not bundled. The shared setup
 schedule intentionally remains enabled between runs, and its remaining
@@ -424,6 +441,16 @@ pinned `environment.yml`, and refuses to adopt unknown resources or retry an
 ambiguous creation. The Eventhouse adapter requires `azure-kusto-data==6.0.4`,
 `azure-kusto-ingest==6.0.4`, and `azure-storage-queue==12.13.0`; environment
 validation and runtime preflight enforce all three exact versions.
+For an independent deployment that must not consult the checked-in legacy
+MCAP manifest, explicitly use `--mode deploy --fresh-owned-state`. This opt-in
+requires an absolute empty state directory and no configured producer resource
+IDs or descriptions (including Environment aliases). It creates a new ownership
+journal using the normal deployment lifecycle; name collision, principal,
+resource and definition checks remain unchanged. It neither adopts nor edits
+the legacy manifest. Once the journal exists, resume without the flag; repeating
+the opt-in against any nonempty directory is blocked. This does not authorize
+cloud deployment, data execution, or readiness. Direct `StateStore.write()`
+is not an absent-state initialization command: it can replace existing state.
 A fresh Environment's successful empty initial version is
 published only after its staged pins and compute baseline are verified; an
 ambiguous publish remains journaled and is never automatically retried.

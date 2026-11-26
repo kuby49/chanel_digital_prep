@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three paths from CSV to Delta | Chanel Fabric demo</title>
+<script>
+  (() => {
+    const param = new URLSearchParams(window.location.search).get("scoutTheme");
+    const theme =
+      param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+  })();
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --cp-bg: #f7f4ef;
+  --cp-bg-elevated: #fcfbf8;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #f5f5f5;
+  --cp-border: #dedede;
+  --cp-border-strong: #919191;
+  --cp-text: #242424;
+  --cp-text-muted: #5c5c5c;
+  --cp-text-soft: #6f6f6f;
+  --cp-accent: #b11f4b;
+  --cp-accent-hover: #9a1a41;
+  --cp-accent-soft: rgba(177, 31, 75, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-danger: #dc2626;
+  --cp-warning: #f59e0b;
+  --cp-link: #0078d4;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(177, 31, 75, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #3d3b3a;
+  --cp-bg-elevated: #343231;
+  --cp-surface: #292929;
+  --cp-surface-soft: #2e2e2e;
+  --cp-border: #474747;
+  --cp-border-strong: #5f5f5f;
+  --cp-text: #dedede;
+  --cp-text-muted: #919191;
+  --cp-text-soft: #b0b0b0;
+  --cp-accent: #fd8ea1;
+  --cp-accent-hover: #fb7b91;
+  --cp-accent-soft: rgba(253, 142, 161, 0.14);
+  --cp-accent-fg: #1a1a1a;
+  --cp-success: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-link: #4da6ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  --cp-overlay: rgba(41, 41, 41, 0.88);
+  --cp-panel: rgba(41, 41, 41, 0.72);
+  --cp-panel-strong: rgba(41, 41, 41, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.04);
+  --cp-highlight: rgba(253, 142, 161, 0.12);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  background: var(--cp-bg);
+  color: var(--cp-text);
+  font: 1rem/1.5 "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+button, a { -webkit-tap-highlight-color: var(--cp-accent-soft); }
+button {
+  font: inherit;
+  color: inherit;
+  border: 1px solid var(--cp-border-strong);
+  background: var(--cp-surface);
+  border-radius: .625rem;
+  cursor: pointer;
+  padding: .5rem .85rem;
+}
+button:hover { border-color: var(--cp-accent); }
+:focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 3px; }
+a { color: var(--cp-link); }
+code, kbd { font-family: Consolas, "Courier New", Courier, monospace; overflow-wrap: anywhere; }
+.shell { max-width: 76rem; margin: auto; padding: 1.25rem clamp(.75rem, 3vw, 2rem); }
+.masthead, .controls, .flow-tools {
+  display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap;
+}
+.masthead { margin-bottom: 1rem; }
+.brand { font-weight: 750; letter-spacing: -.025em; font-size: 1.25rem; }
+.caption, .hint, .meta { color: var(--cp-text-soft); font-size: .875rem; }
+.tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .5rem; margin-bottom: 1rem; }
+.pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .25rem; }
+.pair > span { grid-column: 1 / -1; color: var(--cp-text-soft); font-size: .8125rem; font-weight: 650; }
+.pair button { padding: .375rem .25rem; font-size: .875rem; }
+button[aria-current="page"], .next { color: var(--cp-accent-fg); background: var(--cp-accent); border-color: var(--cp-accent); }
+.next:hover:not([aria-disabled="true"]) { background: var(--cp-accent-hover); }
+button[aria-disabled="true"] { color: var(--cp-text-soft); background: var(--cp-surface-soft); cursor: default; }
+.track { height: 4px; background: var(--cp-border); margin-bottom: .75rem; border-radius: .625rem; }
+.track span { display: block; height: 100%; background: var(--cp-accent); border-radius: inherit; transition: width 240ms ease; }
+.slide {
+  background: var(--cp-bg-elevated); border: 1px solid var(--cp-border); border-radius: 16px;
+  padding: clamp(1rem, 3.6vw, 2.5rem); margin-bottom: .75rem;
+}
+.enhanced .slide:not([hidden]) { animation: reveal 340ms ease both; }
+@keyframes reveal { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.eyebrow, .tag, .ordinal { font-weight: 750; font-size: .75rem; letter-spacing: .12em; text-transform: uppercase; color: var(--cp-accent); }
+h1, h2, h3, p { margin: 0; }
+.slide h1 { font-size: clamp(1.75rem, 5vw, 3.5rem); line-height: 1.06; letter-spacing: -.045em; margin: .5rem 0 .75rem; }
+.lede { color: var(--cp-text-soft); max-width: 64ch; margin-bottom: 1.375rem; }
+.flow { margin: .75rem 0 1rem; }
+.nodes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.5rem; padding: 0; list-style: none; margin: .75rem 0; }
+.nodes li { position: relative; min-width: 0; }
+.nodes li:not(:last-child)::after {
+  content: ""; position: absolute; inset: 50% -1.125rem auto auto; width: .75rem; height: .75rem;
+  border: solid var(--cp-border-strong); border-width: 2px 2px 0 0; transform: translateY(-50%) rotate(45deg);
+  border-radius: 1px; pointer-events: none;
+}
+.nodes li.active:not(:last-child)::after { border-color: var(--cp-accent); animation: signal 650ms ease both; }
+@keyframes signal {
+  from { transform: translate(-4px, -50%) rotate(45deg); opacity: .35; }
+  to { transform: translate(0, -50%) rotate(45deg); opacity: 1; }
+}
+.node {
+  width: 100%; height: 100%; min-height: 7rem; display: flex; flex-direction: column; justify-content: center;
+  align-items: flex-start; gap: .25rem; text-align: left; padding: .75rem; border-color: var(--cp-border); overflow-wrap: anywhere;
+}
+.node strong { line-height: 1.2; }
+.node[aria-pressed="true"] { background: var(--cp-accent-soft); border-color: var(--cp-accent); box-shadow: inset 0 0 0 1px var(--cp-accent); }
+.step-note { border-inline-start: 3px solid var(--cp-accent); padding: .625rem .875rem; background: var(--cp-surface-soft); min-height: 4rem; }
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin-bottom: 1rem; }
+.card { padding: 1rem; border: 1px solid var(--cp-border); border-radius: 16px; background: var(--cp-surface); }
+.card h2 { font-size: 1.125rem; margin-bottom: .375rem; }
+.card ul { margin: 0; padding-inline-start: 1.125rem; }
+.card li + li { margin-top: .5rem; }
+.compare { background: var(--cp-accent-soft); border: 1px solid var(--cp-border); border-radius: .625rem; padding: .75rem 1rem; }
+.compare strong { display: block; color: var(--cp-accent); margin-bottom: .125rem; }
+.refs { margin-top: .75rem; font-size: .875rem; }
+.refs summary { width: fit-content; cursor: pointer; color: var(--cp-text-soft); }
+.refs p { margin-top: .5rem; }
+.controls > div { display: flex; gap: .5rem; }
+.counter { font-weight: 700; font-variant-numeric: tabular-nums; }
+@media (max-width: 43rem) {
+  .nodes { grid-template-columns: 1fr; gap: 1.125rem; }
+  .node { min-height: 0; }
+  .nodes li:not(:last-child)::after { inset: auto auto -.8125rem 1.25rem; width: .5rem; height: .5rem; transform: rotate(135deg); animation: none; }
+  .cards { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media print {
+  body, .slide { background: var(--cp-surface); }
+  .shell { max-width: none; padding: 0; }
+  nav, .track, .controls, .flow-tools, .refs, .step-note { display: none !important; }
+  .slide, .slide[hidden] { display: block !important; break-inside: avoid; break-after: page; animation: none !important; }
+  .slide:last-child { break-after: auto; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="masthead">
+    <p class="brand">Three paths from CSV to Delta</p>
+    <p class="meta">Chanel Fabric demo &middot; Architecture briefing</p>
+  </header>
+  <nav class="tabs" aria-label="Slides by scenario" hidden>
+    <div class="pair"><span>Eventhouse &middot; Demo 2</span><button type="button" data-slide="0" aria-label="Slide 1: Eventhouse data flow">01 Flow</button><button type="button" data-slide="1" aria-label="Slide 2: Eventhouse mechanics">02 Detail</button></div>
+    <div class="pair"><span>Lake Views &middot; Demo 1</span><button type="button" data-slide="2" aria-label="Slide 3: Lake Views data flow">03 Flow</button><button type="button" data-slide="3" aria-label="Slide 4: Lake Views mechanics">04 Detail</button></div>
+    <div class="pair"><span>Activator &middot; Demo 3</span><button type="button" data-slide="4" aria-label="Slide 5: Activator data flow">05 Flow</button><button type="button" data-slide="5" aria-label="Slide 6: Activator mechanics">06 Detail</button></div>
+  </nav>
+  <div class="track" aria-hidden="true" hidden><span></span></div>
+  <main>
+    <section class="slide" aria-labelledby="eventhouse-flow">
+      <p class="eyebrow">01 / 06 &middot; Demo 2 &middot; Data flow</p>
+      <h1 id="eventhouse-flow" tabindex="-1">Ingest in Kusto. Read in OneLake.</h1>
+      <p class="lede">The shared producer emits immutable sales CSV batches. This path writes to Eventhouse first, then exposes the KQL data in a format that Lakehouse engines can read.</p>
+      <figure class="flow">
+        <figcaption class="flow-tools" hidden><span class="hint">Select a stage or play the illustrative flow.</span><button type="button" class="play">Play flow</button></figcaption>
+        <ol class="nodes" aria-label="Eventhouse data flow">
+          <li><button type="button" class="node" data-note="The run stages an immutable CSV batch. The source cadence is one minute; neither KQL nor OneLake visibility is promised on that clock."><span class="ordinal">01 &middot; Source</span><strong>Sales CSV</strong><span class="caption">One immutable batch</span></button></li>
+          <li><button type="button" class="node" data-note="The demo submits a small payload through Kusto inline ingestion. The typed Eventhouse sales table is where KQL queries and batch-level checks run."><span class="ordinal">02 &middot; Ingest</span><strong>KQL sales table</strong><span class="caption">Eventhouse &middot; inline ingest</span></button></li>
+          <li><button type="button" class="node" data-note="With database availability enabled and the table mirroring policy applied, Fabric asynchronously materializes a managed, read-only Delta representation in OneLake."><span class="ordinal">03 &middot; Expose</span><strong>OneLake Delta</strong><span class="caption">Managed mirroring</span></button></li>
+          <li><button type="button" class="node" data-note="A Lakehouse table shortcut points to the managed Delta data. Query the facts with Date, Product and Customer dimensions; the shortcut does not reload the facts."><span class="ordinal">04 &middot; Read</span><strong>Lakehouse shortcut</strong><span class="caption">Read facts + join dimensions</span></button></li>
+        </ol>
+        <p class="step-note" aria-live="polite" hidden></p>
+      </figure>
+      <aside class="compare"><strong>Closest Databricks pattern</strong>Auto Loader into a Unity Catalog Delta table, read by downstream SQL or Spark. Similar destination for file ingestion, but no KQL store or KQL-to-OneLake mirroring step.</aside>
+    </section>
+
+    <section class="slide" aria-labelledby="eventhouse-detail">
+      <p class="eyebrow">02 / 06 &middot; Demo 2 &middot; Technical detail</p>
+      <h1 id="eventhouse-detail" tabindex="-1">Ingestion and mirroring have separate clocks.</h1>
+      <p class="lede">Use KQL to check committed batches first. Verify the Lakehouse shortcut separately; a successful KQL read does not prove Delta visibility.</p>
+      <div class="cards">
+        <section class="card"><h2>Write and verify in KQL</h2><ul>
+          <li>The presenter path uses inline Kusto ingestion for small demo batches. This is not a production recommendation; use supported queued ingestion for sustained loads. The repository includes a queued CSV adapter with explicit header and schema mapping.</li>
+          <li>Reconcile per-batch row counts, distinct <code>(BatchID, SalesLineID)</code> keys and exact integer minor-unit totals. Check replay rather than assuming exactly-once ingestion.</li>
+        </ul></section>
+        <section class="card"><h2>Enable and verify OneLake</h2><ul>
+          <li>Enable OneLake availability on the KQL database separately; verify the table policy. Reset does not automatically re-enable a manually disabled database toggle.</li>
+          <li>The configured five-minute mirroring target is not an SLA. The read-only Delta output follows database retention, is not the original CSV and needs no extra Lakehouse Copy activity.</li>
+        </ul></section>
+      </div>
+      <aside class="compare"><strong>Databricks: direct Delta write</strong>Auto Loader tracks file discovery with a checkpoint and writes to Delta; downstream engines read that table. There is no separate Eventhouse mirroring policy, KQL surface or OneLake toggle to match.</aside>
+      <details class="refs"><summary>Specification, implementation and product references</summary><p><a href="../SPECIFICATION.md">Specification, &sect;7</a> &middot; <a href="../demo-2-eventhouse/README.md">Demo 2 guide</a> &middot; <a href="../demo-2-eventhouse/ingestion.py">Queued adapter</a> &middot; <a href="https://learn.microsoft.com/en-us/kusto/management/data-ingestion/ingest-inline?view=microsoft-fabric">Inline ingest</a> &middot; <a href="https://learn.microsoft.com/en-us/fabric/real-time-intelligence/event-house-onelake-availability">OneLake availability</a> &middot; <a href="https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a>. Inline ingestion and reset behavior reflect current presenter guidance.</p></details>
+    </section>
+
+    <section class="slide" aria-labelledby="mlv-flow">
+      <p class="eyebrow">03 / 06 &middot; Demo 1 &middot; Data flow</p>
+      <h1 id="mlv-flow" tabindex="-1">Refresh the lineage, not every file.</h1>
+      <p class="lede">Fabric Materialized Lake Views read the landing folder directly and materialize both bronze and silver. No Copy activity or ingestion notebook sits in the data path.</p>
+      <figure class="flow">
+        <figcaption class="flow-tools" hidden><span class="hint">Select a stage or play the illustrative flow.</span><button type="button" class="play">Play flow</button></figcaption>
+        <ol class="nodes" aria-label="Materialized Lake Views data flow">
+          <li><button type="button" class="node" data-note="The producer lands immutable sales CSVs. A header-only bootstrap establishes the file-backed definition in this environment and is excluded from measured sales."><span class="ordinal">01 &middot; Land</span><strong>OneLake Files</strong><span class="caption">Sales CSV landing folder</span></button></li>
+          <li><button type="button" class="node" data-note="The bronze MLV reads the folder using OneLake_Files with fixed CSV parsing and APPEND_ONLY file mode. It keeps BatchID and __filepath__ for reconciliation."><span class="ordinal">02 &middot; Parse</span><strong>Bronze MLV</strong><span class="caption"><code>bronze.sales_files</code></span></button></li>
+          <li><button type="button" class="node" data-note="Silver casts and validates the facts, derives exact decimals from integer minor units and joins Date, Product and Customer. Reconcile rejected or invalid rows explicitly."><span class="ordinal">03 &middot; Enrich</span><strong>Silver MLV</strong><span class="caption"><code>silver.sales_joined</code></span></button></li>
+          <li><button type="button" class="node" data-note="Query the materialized Delta outputs in the Lakehouse. The SQL analytics endpoint can lag separately; a preview alone is not proof of reconciliation."><span class="ordinal">04 &middot; Query</span><strong>Lakehouse Delta</strong><span class="caption">Refresh-aware verification</span></button></li>
+        </ol>
+        <p class="step-note" aria-live="polite" hidden></p>
+      </figure>
+      <aside class="compare"><strong>Closest Databricks pattern</strong>A Lakeflow Spark Declarative Pipelines streaming table for bronze, then a materialized view for silver. Comparable layering, not the same file-backed MLV primitive.</aside>
+    </section>
+
+    <section class="slide" aria-labelledby="mlv-detail">
+      <p class="eyebrow">04 / 06 &middot; Demo 1 &middot; Technical detail</p>
+      <h1 id="mlv-detail" tabindex="-1">Refresh order matters more than arrival order.</h1>
+      <p class="lede">The producer lands files every minute in the bounded demo. The five-minute Fabric-managed schedule refreshes bronze before silver; it need not run for every arrival.</p>
+      <div class="cards">
+        <section class="card"><h2>File contract and lineage</h2><ul>
+          <li><code>USING OneLake_Files</code> uses explicit CSV schema and parsing. Keep source identity and separate the bootstrap from measured sales.</li>
+          <li>Read actual refresh mode and timing in history. <code>APPEND_ONLY</code> describes the configured bronze file refresh mode; it is not evidence that a specific bronze or silver refresh executed incrementally.</li>
+        </ul></section>
+        <section class="card"><h2>Validate the silver result</h2><ul>
+          <li>Reconcile bronze rows, recorded rejections and silver facts. Casting or failed dimension joins must not silently lose valid sales.</li>
+          <li>Check grouped totals, unique <code>(BatchID, SalesLineID)</code> keys and expected row counts after another refresh. That check does not establish deduplication for the same rows copied under a new filename.</li>
+        </ul></section>
+      </div>
+      <aside class="compare"><strong>Databricks: streaming table plus materialized view</strong>Use Auto Loader (for example, <code>STREAM read_files</code>) for incremental file discovery into bronze. Define silver as a materialized query with joins. Databricks can use incremental or full refresh depending on the query and compute; inspect its own refresh evidence.</aside>
+      <details class="refs"><summary>Specification, implementation and product references</summary><p><a href="../SPECIFICATION.md">Specification, &sect;6</a> &middot; <a href="../demo-1-materialized-lake-views/README.md">Demo 1 guide</a> &middot; <a href="../demo-1-materialized-lake-views/definition_plan.py">View definitions</a> &middot; <a href="https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/sql/mv-st/materialized">Databricks materialized views</a></p></details>
+    </section>
+
+    <section class="slide" aria-labelledby="copy-flow">
+      <p class="eyebrow">05 / 06 &middot; Demo 3 &middot; Data flow</p>
+      <h1 id="copy-flow" tabindex="-1">Trigger Copy for the file that arrived.</h1>
+      <p class="lede">The file-created notification carries identity, not sales rows. Activator starts a Data Factory pipeline; Copy reads the specific CSV identified by the event.</p>
+      <figure class="flow">
+        <figcaption class="flow-tools" hidden><span class="hint">Select a stage or play the illustrative flow.</span><button type="button" class="play">Play flow</button></figcaption>
+        <ol class="nodes" aria-label="Activator and Copy data flow">
+          <li><button type="button" class="node" data-note="The producer lands one completed sales CSV in the subscribed OneLake location. Activator uses a FileCreated notification for the sales folder, not a timed scan."><span class="ordinal">01 &middot; Land</span><strong>OneLake Files</strong><span class="caption">Completed sales CSV</span></button></li>
+          <li><button type="button" class="node" data-note="The Activator rule filters the sales path and passes the event subject and ID to the pipeline. Exclude unrelated paths and the destination from the rule."><span class="ordinal">02 &middot; Signal</span><strong>Activator rule</strong><span class="caption"><code>FileCreated</code> &middot; subject + ID</span></button></li>
+          <li><button type="button" class="node" data-note="Prepare checks admission and the exact filename. Data Factory Copy reads that CSV with explicit mappings, not the whole folder. The current presenter path appends."><span class="ordinal">03 &middot; Transfer</span><strong>Data Factory Copy</strong><span class="caption">One CSV &middot; append</span></button></li>
+          <li><button type="button" class="node" data-note="The target is the typed Delta table dbo.factsales. Correlate the event and pipeline run, verify rows and totals, and retain the audit outcome."><span class="ordinal">04 &middot; Verify</span><strong>Lakehouse fact table</strong><span class="caption"><code>dbo.factsales</code> + audit</span></button></li>
+        </ol>
+        <p class="step-note" aria-live="polite" hidden></p>
+      </figure>
+      <aside class="compare"><strong>Closest Databricks pattern</strong>A Lakeflow Jobs file-arrival trigger starts a job that uses checkpointed Auto Loader to process newly discovered files. A job run may cover multiple files; it is not an exact-file event binding.</aside>
+    </section>
+
+    <section class="slide" aria-labelledby="copy-detail">
+      <p class="eyebrow">06 / 06 &middot; Demo 3 &middot; Technical detail</p>
+      <h1 id="copy-detail" tabindex="-1">Append needs a replay guard.</h1>
+      <p class="lede">Separate event delivery, file readiness, Copy completion and target visibility. A delivered event is not evidence that the rows were written.</p>
+      <div class="cards">
+        <section class="card"><h2>Bind one event to one file</h2><ul>
+          <li>Pass the subject and event ID to the pipeline. Check readiness and resolve the exact filename; Copy maps the CSV columns into the typed Delta target.</li>
+          <li>Verify the target batch with row counts, unique <code>(BatchID, SalesLineID)</code> keys and exact totals. Correlate the event, path, batch and pipeline run in the audit.</li>
+        </ul></section>
+        <section class="card"><h2>Do not blindly retry</h2><ul>
+          <li>Current Copy behavior is <strong>append, not upsert</strong>. Serialize writes and reconcile destination state before replaying an uncertain append; a write may succeed before the audit does.</li>
+          <li>The demo assumes notifications are not missed. That assumption is not proof of delivery or exactly-once processing. Verify duplicate/retry outcomes in the destination.</li>
+        </ul></section>
+      </div>
+      <aside class="compare"><strong>Databricks: arrival-triggered job plus checkpoint</strong>A file-arrival trigger watches a location. Auto Loader with <code>AvailableNow</code> can process all pending files in a job run. Preserve its checkpoint; separately handle business-key duplicates. Neither replaces Fabric's per-event subject binding or guarded Copy.</aside>
+      <details class="refs"><summary>Specification, implementation and product references</summary><p><a href="../SPECIFICATION.md">Specification, &sect;8</a> &middot; <a href="../demo-3-onelake-events-copy/README.md">Demo 3 guide</a> &middot; <a href="../demo-3-onelake-events-copy/guarded_pipeline.py">Guarded definition builder</a> &middot; <a href="https://docs.databricks.com/gcp/en/jobs/file-arrival-triggers">File-arrival triggers</a>. The checked-in builder documents the exact-file guard and validates an Upsert template for a separate path; the current presenter path described here uses append.</p></details>
+    </section>
+  </main>
+  <footer class="controls" hidden>
+    <p class="counter" role="status" aria-atomic="true"></p>
+    <p class="hint"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> change slide &middot; <kbd>Home</kbd> / <kbd>End</kbd> jump</p>
+    <div><button type="button" class="previous">Previous</button><button type="button" class="next">Next</button></div>
+  </footer>
+</div>
+<script>
+  (() => {
+    const slides = [...document.querySelectorAll(".slide")];
+    const tabs = [...document.querySelectorAll("[data-slide]")];
+    const progress = document.querySelector(".track span");
+    const counter = document.querySelector(".counter");
+    const next = document.querySelector(".next");
+    const previous = document.querySelector(".previous");
+    const mobile = window.matchMedia("(max-width: 43rem)");
+    let active = -1;
+    let stopFlow;
+
+    for (const flow of document.querySelectorAll(".flow")) {
+      const buttons = [...flow.querySelectorAll(".node")];
+      const note = flow.querySelector(".step-note");
+      const play = flow.querySelector(".play");
+      let timeout;
+      function stop() {
+        window.clearTimeout(timeout);
+        play.textContent = "Play flow";
+        if (stopFlow === stop) stopFlow = undefined;
+      }
+      function select(index) {
+        buttons.forEach((button, i) => {
+          button.setAttribute("aria-pressed", i === index);
+          button.parentElement.classList.toggle("active", i === index);
+        });
+        note.textContent = buttons[index].dataset.note;
+      }
+      buttons.forEach((button, i) => button.addEventListener("click", () => { stop(); select(i); }));
+      play.addEventListener("click", () => {
+        if (stopFlow === stop) { stop(); return; }
+        stopFlow?.();
+        stopFlow = stop;
+        play.textContent = "Stop flow";
+        function advance(i) {
+          select(i);
+          if (i < buttons.length - 1) timeout = window.setTimeout(() => advance(i + 1), 2000);
+          else stop();
+        }
+        advance(0);
+      });
+      select(0);
+      note.hidden = false;
+      flow.querySelector(".flow-tools").hidden = false;
+    }
+
+    function show(index, writeHash = false, focusHeading = false) {
+      if (index < 0 || index >= slides.length || index === active) return;
+      stopFlow?.();
+      active = index;
+      slides.forEach((slide, i) => { slide.hidden = i !== index; });
+      tabs.forEach((tab, i) => {
+        if (i === index) tab.setAttribute("aria-current", "page");
+        else tab.removeAttribute("aria-current");
+      });
+      previous.setAttribute("aria-disabled", index === 0);
+      next.setAttribute("aria-disabled", index === slides.length - 1);
+      progress.style.width = `${100 * (index + 1) / slides.length}%`;
+      counter.textContent = `Slide ${index + 1} of ${slides.length}`;
+      if (writeHash) window.location.hash = `slide-${index + 1}`;
+      const heading = slides[index].querySelector("h1");
+      if (focusHeading) heading.focus({ preventScroll: true });
+      if (mobile.matches || focusHeading) window.scrollTo(0, 0);
+    }
+
+    function readHash() {
+      const match = /^#slide-([1-6])$/.exec(window.location.hash);
+      show(match ? Number(match[1]) - 1 : 0);
+    }
+    tabs.forEach((tab) => tab.addEventListener("click", () => show(Number(tab.dataset.slide), true)));
+    next.addEventListener("click", () => show(active + 1, true, mobile.matches));
+    previous.addEventListener("click", () => show(active - 1, true, mobile.matches));
+    window.addEventListener("hashchange", readHash);
+    window.addEventListener("keydown", (event) => {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const targets = { ArrowLeft: active - 1, ArrowRight: active + 1, Home: 0, End: slides.length - 1 };
+      if (!Object.hasOwn(targets, event.key)) return;
+      event.preventDefault();
+      show(targets[event.key], true, true);
+    });
+    document.documentElement.classList.add("enhanced");
+    readHash();
+    for (const selector of [".tabs", ".track", ".controls"]) document.querySelector(selector).hidden = false;
+  })();
+</script>
+</body>
+</html>

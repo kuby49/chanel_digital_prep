@@ -65,6 +65,93 @@ marker. The Lakehouse and its readback must name the owned workspace. A confirme
 workflow only after independently establishing creation and readback; it must
 not be fabricated from the preflight observations.
 
+### Isolated replacement candidate
+
+`isolated_candidate.build_candidate(spec, producer_dir, copy_activity, source_sample,
+producer_config_path=..., producer_prefix=..., producer_state_dir=...)`
+builds definitions in memory only, with `ready: false`. It does not create
+cloud resources, publish, authorize or establish live readiness. Supply canonical IDs for `tenant_id`,
+`owner_id`, `workspace_id`, `lakehouse_id`, `notebook_id`, `pipeline_id`,
+`reflex_id`, `connection_id`, `producer_workspace_id`, and
+`producer_lakehouse_id`, plus `prefix`, `lakehouse_name` and `native_policy`.
+It resolves producer staging candidates using the frozen producer's
+`resolve-candidate-ids` helper and its separate ownership journal. The helper
+does not check live ownership or access. The old staging Lakehouse, original
+target items and owner marker, inconsistent Copy endpoints, and an event from
+another source are rejected. The existing generic OAuth2 connection can be a
+candidate; its live type, path and identity, connection sharing and target
+access must be independently checked. No Copy runtime success is implied.
+The supplied Copy template must satisfy the exact-file, mappings and Upsert
+requirements of `guarded_pipeline.build_pipeline`. The rule is disabled.
+Returned hashes identify the generated definitions and producer files; they do
+not attest to their ownership, validity or observed deployment. Generated
+Activator entity IDs vary between builds, so retain the reviewed candidate.
+An invented test event is useful only for local tests, not source validation.
+
+`isolated_setup.prepare(config, prefix, state_dir, api, producer_dir)` freshly
+reads the owned target shell through `ownership.provision(..., create=False)`
+and builds an unexecuted setup notebook for it. It rejects the original
+Lakehouse and marker and checks the runtime workspace and default Lakehouse
+before setup code executes. It does not publish or run the notebook, and
+neither the ownership read nor notebook creation proves setup or readiness.
+`isolated_preflight.original_parent(api)` freshly checks both exact incident
+jobs and their activity link; missing, active or ambiguous evidence blocks it.
+Even terminal jobs do not prove all writers drained. `isolated_preflight.connection`
+checks generic OAuth2 connection metadata and the caller's connection role;
+it explicitly leaves runtime identity and target access unverified.
+
+A separate Lakehouse isolates its Delta data and cooperative lock; it is a
+fresh demonstration, **not recovery of the original run**. Shared capacity is
+not compute isolation. The existing original-target publishers must not be
+pointed at the new IDs. `isolated_items.create_item` can create individually
+approved, owned setup notebook, guard notebook and pipeline shells, followed
+by a Reflex shell only after the operator confirms a real new-target event was
+observed. It records an intent before each create; `isolated_items.reconcile`
+only reads back a pending create and never resubmits it. The event sample hash
+binds the candidate to that operator-supplied observation; it is not itself
+proof that the event occurred.
+
+With all four owned shells and a reviewed candidate, `isolated_publish.Publisher`
+can publish the setup notebook, guard notebook and pipeline definitions one at
+a time with `approved=True`, journal each intent and acceptance, and compare
+complete readbacks. `reconcile()` only polls or reads back; an unrecorded
+acceptance remains blocked and is never resubmitted. These operations remain
+unready and require an exclusive operator: the platform update is not
+conditional on the preceding readback. They check fresh parent job linkage,
+owned target and staging readbacks, connection and caller role, target jobs,
+schedules and lock. They require the configured target and staging capacities
+to be active F32 immediately before writes. The capacity must remain F32
+indefinitely; these controllers never resize or suspend it and cannot prevent
+another actor changing it. This requirement applies to this separate isolated
+replacement workflow, which is blocked at the simplified demo's F16 default.
+The item and publication workflows have only been tested locally, not against
+the replacement's live items.
+
+Publishing even the **disabled** Reflex remains blocked. `isolated_access.assess`
+can inspect a controlled job's linkage but cannot prove the executed definition,
+runtime token principal or target read/write from current evidence. A separate
+approved F32 job must read a dedicated new-staging probe, write and read a
+non-admitting object in the new target, and provide authoritative, independently
+verifiable job-linked definition, identity and results. Establish connection
+credential identity and actual Copy behavior separately. No proof writer,
+rule enablement or live readiness is implied. Before any future deployment,
+coordinate the sequence and authorization, in order:
+
+1. Reconcile the original parent and any possible writers; preserve the old
+   lock and incident evidence. Obtain explicit coordinated authorization.
+2. Establish independent ownership and live readback of new resources and
+   access. Verify a schema-enabled Lakehouse, fact protocol, dimensions and
+   Lakehouse connection. Shell provisioning alone is not readiness.
+3. Capture a real representative `FileCreated` event from the new target.
+   Review a candidate and a purpose-built journaled publisher/controller;
+   the existing native publishers and preflights are bound to original IDs.
+4. Publish only under separate authorization and read back the notebook,
+   pipeline and complete disabled rule against the reviewed definitions.
+   Independently verify permissions, job inventory, locks and writer exclusion.
+5. Bind the shared producer and fresh run to the new target with its own
+   evidence and journal. Require separate coordinated approval before enabling
+   admission or launching; verify actual delivery afterward.
+
 The shared producer's v1 CSV has the header
 `SalesLineID,BatchID,SaleTimestamp,CustomerID,ProductID,Date,Quantity,UnitPriceMinorUnits,SalesAmountMinorUnits`.
 Consume the same immutable bytes and manifest as the other demos; do not generate

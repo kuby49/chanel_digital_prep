@@ -1,5 +1,9 @@
 # Demo 3: OneLake events and Copy
 
+For the simplified reset-and-run flow, see [SIMPLE-DEMO.md](SIMPLE-DEMO.md).
+The isolated replacement candidate and publication helpers are experimental
+and have not been verified against live replacement items.
+
 **Status: the prepared bounded native demo was verified; general deployment remains blocked.**
 The 2026-11-25 presenter-profile run had ten completed event-origin Copy jobs
 matching the manifest. An independent Delta snapshot comparison matched all

@@ -133,11 +133,19 @@ h1, h2, h3, p { margin: 0; }
 .node strong { line-height: 1.2; }
 .node[aria-pressed="true"] { background: var(--cp-accent-soft); border-color: var(--cp-accent); box-shadow: inset 0 0 0 1px var(--cp-accent); }
 .step-note { border-inline-start: 3px solid var(--cp-accent); padding: .625rem .875rem; background: var(--cp-surface-soft); min-height: 4rem; }
-.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin-bottom: 1rem; }
-.card { padding: 1rem; border: 1px solid var(--cp-border); border-radius: 16px; background: var(--cp-surface); }
-.card h2 { font-size: 1.125rem; margin-bottom: .375rem; }
-.card ul { margin: 0; padding-inline-start: 1.125rem; }
-.card li + li { margin-top: .5rem; }
+.comparison-slide { padding: clamp(1rem, 2.6vw, 1.75rem); }
+.comparison-slide h1 { font-size: clamp(1.75rem, 4vw, 2.875rem); margin: .375rem 0 .5rem; }
+.comparison-slide .lede { max-width: 80ch; margin-bottom: .75rem; }
+.comparison-table { width: 100%; border-collapse: separate; border-spacing: 0; margin-bottom: .625rem; table-layout: fixed; }
+.comparison-table th, .comparison-table td { text-align: left; vertical-align: top; padding: .5rem .75rem; border-bottom: 1px solid var(--cp-border); overflow-wrap: anywhere; }
+.comparison-table thead th { background: var(--cp-accent-soft); color: var(--cp-accent); font-size: .8125rem; text-transform: uppercase; letter-spacing: .06em; }
+.comparison-table thead th:first-child { width: 18%; border-radius: .625rem 0 0 0; }
+.comparison-table thead th:nth-child(2) { width: 41%; }
+.comparison-table thead th:last-child { border-radius: 0 .625rem 0 0; }
+.comparison-table tbody th { background: var(--cp-surface); font-size: .9375rem; }
+.comparison-table tbody td { background: var(--cp-surface); font-size: .9375rem; }
+.comparison-table .match { color: var(--cp-text-soft); font-size: .875rem; }
+.comparison-table strong { display: block; margin-bottom: .25rem; }
 .compare { background: var(--cp-accent-soft); border: 1px solid var(--cp-border); border-radius: .625rem; padding: .75rem 1rem; }
 .compare strong { display: block; color: var(--cp-accent); margin-bottom: .125rem; }
 .refs { margin-top: .75rem; font-size: .875rem; }
@@ -149,7 +157,12 @@ h1, h2, h3, p { margin: 0; }
   .nodes { grid-template-columns: 1fr; gap: 1.125rem; }
   .node { min-height: 0; }
   .nodes li:not(:last-child)::after { inset: auto auto -.8125rem 1.25rem; width: .5rem; height: .5rem; transform: rotate(135deg); animation: none; }
-  .cards { grid-template-columns: 1fr; }
+  .comparison-table, .comparison-table tbody, .comparison-table tr, .comparison-table th, .comparison-table td { display: block; }
+  .comparison-table thead { display: none; }
+  .comparison-table tr { margin-bottom: .75rem; border: 1px solid var(--cp-border); border-radius: .625rem; overflow: hidden; }
+  .comparison-table tbody th { background: var(--cp-accent-soft); color: var(--cp-accent); }
+  .comparison-table td::before { content: attr(data-label); display: block; color: var(--cp-text-soft); font-size: .75rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; margin-bottom: .25rem; }
+  .comparison-table tbody td:last-child { border-bottom: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -183,32 +196,31 @@ h1, h2, h3, p { margin: 0; }
       <figure class="flow">
         <figcaption class="flow-tools" hidden><span class="hint">Select a stage or play the illustrative flow.</span><button type="button" class="play">Play flow</button></figcaption>
         <ol class="nodes" aria-label="Eventhouse data flow">
-          <li><button type="button" class="node" data-note="The run stages an immutable CSV batch. The source cadence is one minute; neither KQL nor OneLake visibility is promised on that clock."><span class="ordinal">01 &middot; Source</span><strong>Sales CSV</strong><span class="caption">One immutable batch</span></button></li>
-          <li><button type="button" class="node" data-note="The demo submits a small payload through Kusto inline ingestion. The typed Eventhouse sales table is where KQL queries and batch-level checks run."><span class="ordinal">02 &middot; Ingest</span><strong>KQL sales table</strong><span class="caption">Eventhouse &middot; inline ingest</span></button></li>
+          <li><button type="button" class="node" data-note="The producer generates a sequence of sales CSV batches at one-minute intervals and supplies the same data to all three demos."><span class="ordinal">01 &middot; Source</span><strong>Sales CSV</strong><span class="caption">One immutable batch</span></button></li>
+          <li><button type="button" class="node" data-note="The producer submits CSV data using Kusto inline ingestion and the configured CSV mapping. The Eventhouse sales table supports KQL queries."><span class="ordinal">02 &middot; Ingest</span><strong>KQL sales table</strong><span class="caption">Eventhouse &middot; inline ingest</span></button></li>
           <li><button type="button" class="node" data-note="With database availability enabled and the table mirroring policy applied, Fabric asynchronously materializes a managed, read-only Delta representation in OneLake."><span class="ordinal">03 &middot; Expose</span><strong>OneLake Delta</strong><span class="caption">Managed mirroring</span></button></li>
           <li><button type="button" class="node" data-note="A Lakehouse table shortcut points to the managed Delta data. Query the facts with Date, Product and Customer dimensions; the shortcut does not reload the facts."><span class="ordinal">04 &middot; Read</span><strong>Lakehouse shortcut</strong><span class="caption">Read facts + join dimensions</span></button></li>
         </ol>
         <p class="step-note" aria-live="polite" hidden></p>
       </figure>
-      <aside class="compare"><strong>Closest Databricks pattern</strong>Auto Loader into a Unity Catalog Delta table, read by downstream SQL or Spark. Similar destination for file ingestion, but no KQL store or KQL-to-OneLake mirroring step.</aside>
+      <aside class="compare"><strong>Closest Databricks pattern</strong>Auto Loader into a Unity Catalog Delta table, read by SQL or Spark. Both platforms support file-to-Delta analytics; Fabric also exposes native KQL and a managed OneLake representation.</aside>
     </section>
 
-    <section class="slide" aria-labelledby="eventhouse-detail">
-      <p class="eyebrow">02 / 06 &middot; Demo 2 &middot; Technical detail</p>
-      <h1 id="eventhouse-detail" tabindex="-1">Ingestion and mirroring have separate clocks.</h1>
-      <p class="lede">Use KQL to check committed batches first. Verify the Lakehouse shortcut separately; a successful KQL read does not prove Delta visibility.</p>
-      <div class="cards">
-        <section class="card"><h2>Write and verify in KQL</h2><ul>
-          <li>The presenter path uses inline Kusto ingestion for small demo batches. This is not a production recommendation; use supported queued ingestion for sustained loads. The repository includes a queued CSV adapter with explicit header and schema mapping.</li>
-          <li>Reconcile per-batch row counts, distinct <code>(BatchID, SalesLineID)</code> keys and exact integer minor-unit totals. Check replay rather than assuming exactly-once ingestion.</li>
-        </ul></section>
-        <section class="card"><h2>Enable and verify OneLake</h2><ul>
-          <li>Enable OneLake availability on the KQL database separately; verify the table policy. Reset does not automatically re-enable a manually disabled database toggle.</li>
-          <li>The configured five-minute mirroring target is not an SLA. The read-only Delta output follows database retention, is not the original CSV and needs no extra Lakehouse Copy activity.</li>
-        </ul></section>
-      </div>
-      <aside class="compare"><strong>Databricks: direct Delta write</strong>Auto Loader tracks file discovery with a checkpoint and writes to Delta; downstream engines read that table. There is no separate Eventhouse mirroring policy, KQL surface or OneLake toggle to match.</aside>
-      <details class="refs"><summary>Specification, implementation and product references</summary><p><a href="../SPECIFICATION.md">Specification, &sect;7</a> &middot; <a href="../demo-2-eventhouse/README.md">Demo 2 guide</a> &middot; <a href="../demo-2-eventhouse/ingestion.py">Queued adapter</a> &middot; <a href="https://learn.microsoft.com/en-us/kusto/management/data-ingestion/ingest-inline?view=microsoft-fabric">Inline ingest</a> &middot; <a href="https://learn.microsoft.com/en-us/fabric/real-time-intelligence/event-house-onelake-availability">OneLake availability</a> &middot; <a href="https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a>. Inline ingestion and reset behavior reflect current presenter guidance.</p></details>
+    <section class="slide comparison-slide" aria-labelledby="eventhouse-detail">
+      <p class="eyebrow">02 / 06 &middot; Demo 2 &middot; Component comparison</p>
+      <h1 id="eventhouse-detail" tabindex="-1">Eventhouse &amp; OneLake vs. Databricks</h1>
+      <p class="lede">Both platforms turn sales data into queryable Delta. Fabric also brings native Eventhouse KQL and OneLake access together.</p>
+      <table class="comparison-table">
+        <thead><tr><th scope="col">Role</th><th scope="col">Our Fabric demo</th><th scope="col">Closest Databricks match</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Ingest</th><td data-label="Our Fabric demo"><strong>Kusto inline ingest</strong>The producer submits CSV data using the Eventhouse mapping.</td><td data-label="Closest Databricks match"><strong>Auto Loader or COPY INTO</strong><span class="match">Both load file data into Delta tables.</span></td></tr>
+          <tr><th scope="row">Query store</th><td data-label="Our Fabric demo"><strong>Eventhouse KQL table</strong>Explore the ingested sales data with KQL.</td><td data-label="Closest Databricks match"><strong>Delta table + Databricks SQL</strong><span class="match">Both support analytics with their native query languages.</span></td></tr>
+          <tr><th scope="row">Expose as Delta</th><td data-label="Our Fabric demo"><strong>OneLake availability</strong>Provides a managed, read-only Delta representation of KQL data.</td><td data-label="Closest Databricks match"><strong>Direct Delta write</strong><span class="match">Both make data queryable as Delta across analytics engines.</span></td></tr>
+          <tr><th scope="row">Reference data</th><td data-label="Our Fabric demo"><strong>Lakehouse shortcut</strong>References the exposed Delta data without a second user-managed copy.</td><td data-label="Closest Databricks match"><strong>Unity Catalog external table</strong><span class="match">Both can reference existing data without copying it, using platform-specific access controls.</span></td></tr>
+        </tbody>
+      </table>
+      <aside class="compare"><strong>Fabric capability</strong>OneLake availability brings Eventhouse analytics and a shared Delta representation together for Lakehouse, notebooks and other Fabric engines.</aside>
+      <details class="refs"><summary>Specification and product references</summary><p><a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/SPECIFICATION.md#demo-2-eventhouse-and-onelake-availability">Demo 2 specification</a> &middot; <a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/demo-2-eventhouse/simple_demo2.py">Demo 2 implementation</a> &middot; <a href="https://learn.microsoft.com/en-us/kusto/management/data-ingestion/ingest-inline?view=microsoft-fabric">Kusto inline ingest</a> &middot; <a href="https://learn.microsoft.com/en-us/fabric/real-time-intelligence/event-house-onelake-availability">OneLake availability</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/tables/external">External tables</a></p></details>
     </section>
 
     <section class="slide" aria-labelledby="mlv-flow">
@@ -219,31 +231,30 @@ h1, h2, h3, p { margin: 0; }
         <figcaption class="flow-tools" hidden><span class="hint">Select a stage or play the illustrative flow.</span><button type="button" class="play">Play flow</button></figcaption>
         <ol class="nodes" aria-label="Materialized Lake Views data flow">
           <li><button type="button" class="node" data-note="The producer lands immutable sales CSVs. A header-only bootstrap establishes the file-backed definition in this environment and is excluded from measured sales."><span class="ordinal">01 &middot; Land</span><strong>OneLake Files</strong><span class="caption">Sales CSV landing folder</span></button></li>
-          <li><button type="button" class="node" data-note="The bronze MLV reads the folder using OneLake_Files with fixed CSV parsing and APPEND_ONLY file mode. It keeps BatchID and __filepath__ for reconciliation."><span class="ordinal">02 &middot; Parse</span><strong>Bronze MLV</strong><span class="caption"><code>bronze.sales_files</code></span></button></li>
-          <li><button type="button" class="node" data-note="Silver casts and validates the facts, derives exact decimals from integer minor units and joins Date, Product and Customer. Reconcile rejected or invalid rows explicitly."><span class="ordinal">03 &middot; Enrich</span><strong>Silver MLV</strong><span class="caption"><code>silver.sales_joined</code></span></button></li>
-          <li><button type="button" class="node" data-note="Query the materialized Delta outputs in the Lakehouse. The SQL analytics endpoint can lag separately; a preview alone is not proof of reconciliation."><span class="ordinal">04 &middot; Query</span><strong>Lakehouse Delta</strong><span class="caption">Refresh-aware verification</span></button></li>
+          <li><button type="button" class="node" data-note="The bronze MLV reads the folder using OneLake_Files with fixed CSV parsing and APPEND_ONLY file mode. It keeps BatchID and __filepath__ for traceability."><span class="ordinal">02 &middot; Parse</span><strong>Bronze MLV</strong><span class="caption"><code>bronze.sales_files</code></span></button></li>
+          <li><button type="button" class="node" data-note="Silver casts the facts, derives exact decimals from integer minor units and joins Date, Product and Customer."><span class="ordinal">03 &middot; Enrich</span><strong>Silver MLV</strong><span class="caption"><code>silver.sales_joined</code></span></button></li>
+          <li><button type="button" class="node" data-note="Query the materialized Delta outputs through the Lakehouse and its SQL analytics endpoint."><span class="ordinal">04 &middot; Query</span><strong>Lakehouse Delta</strong><span class="caption">Queryable materialized output</span></button></li>
         </ol>
         <p class="step-note" aria-live="polite" hidden></p>
       </figure>
-      <aside class="compare"><strong>Closest Databricks pattern</strong>A Lakeflow Spark Declarative Pipelines streaming table for bronze, then a materialized view for silver. Comparable layering, not the same file-backed MLV primitive.</aside>
+      <aside class="compare"><strong>Closest Databricks pattern</strong>A Lakeflow Spark Declarative Pipelines streaming table for bronze, then a materialized view for silver. Both platforms support declarative bronze and silver layers backed by Delta.</aside>
     </section>
 
-    <section class="slide" aria-labelledby="mlv-detail">
-      <p class="eyebrow">04 / 06 &middot; Demo 1 &middot; Technical detail</p>
-      <h1 id="mlv-detail" tabindex="-1">Refresh order matters more than arrival order.</h1>
-      <p class="lede">The producer lands files every minute in the bounded demo. The five-minute Fabric-managed schedule refreshes bronze before silver; it need not run for every arrival.</p>
-      <div class="cards">
-        <section class="card"><h2>File contract and lineage</h2><ul>
-          <li><code>USING OneLake_Files</code> uses explicit CSV schema and parsing. Keep source identity and separate the bootstrap from measured sales.</li>
-          <li>Read actual refresh mode and timing in history. <code>APPEND_ONLY</code> describes the configured bronze file refresh mode; it is not evidence that a specific bronze or silver refresh executed incrementally.</li>
-        </ul></section>
-        <section class="card"><h2>Validate the silver result</h2><ul>
-          <li>Reconcile bronze rows, recorded rejections and silver facts. Casting or failed dimension joins must not silently lose valid sales.</li>
-          <li>Check grouped totals, unique <code>(BatchID, SalesLineID)</code> keys and expected row counts after another refresh. That check does not establish deduplication for the same rows copied under a new filename.</li>
-        </ul></section>
-      </div>
-      <aside class="compare"><strong>Databricks: streaming table plus materialized view</strong>Use Auto Loader (for example, <code>STREAM read_files</code>) for incremental file discovery into bronze. Define silver as a materialized query with joins. Databricks can use incremental or full refresh depending on the query and compute; inspect its own refresh evidence.</aside>
-      <details class="refs"><summary>Specification, implementation and product references</summary><p><a href="../SPECIFICATION.md">Specification, &sect;6</a> &middot; <a href="../demo-1-materialized-lake-views/README.md">Demo 1 guide</a> &middot; <a href="../demo-1-materialized-lake-views/definition_plan.py">View definitions</a> &middot; <a href="https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/sql/mv-st/materialized">Databricks materialized views</a></p></details>
+    <section class="slide comparison-slide" aria-labelledby="mlv-detail">
+      <p class="eyebrow">04 / 06 &middot; Demo 1 &middot; Component comparison</p>
+      <h1 id="mlv-detail" tabindex="-1">Materialized Lake Views vs. Lakeflow pipelines</h1>
+      <p class="lede">Both platforms support declarative ingestion, transformation and managed output for downstream analytics.</p>
+      <table class="comparison-table">
+        <thead><tr><th scope="col">Role</th><th scope="col">Our Fabric demo</th><th scope="col">Closest Databricks match</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Declarative lineage</th><td data-label="Our Fabric demo"><strong>Materialized Lake Views</strong>Bronze and silver views have managed dependency-aware refresh.</td><td data-label="Closest Databricks match"><strong>Lakeflow pipelines</strong><span class="match">Both orchestrate dependencies between defined data transformations.</span></td></tr>
+          <tr><th scope="row">Land files</th><td data-label="Our Fabric demo"><strong>Bronze file-backed MLV</strong><code>OneLake_Files</code> reads CSV directly into managed Delta.</td><td data-label="Closest Databricks match"><strong>Auto Loader + streaming table</strong><span class="match">Both ingest newly arrived files into Delta using native file processing.</span></td></tr>
+          <tr><th scope="row">Transform &amp; join</th><td data-label="Our Fabric demo"><strong>Silver MLV</strong>Casts sales facts and joins the dimensions.</td><td data-label="Closest Databricks match"><strong>Pipeline materialized view</strong><span class="match">Both persist transformed query results for downstream analytics.</span></td></tr>
+          <tr><th scope="row">Run &amp; refresh</th><td data-label="Our Fabric demo"><strong>Managed lineage schedule</strong>The demo uses a five-minute schedule.</td><td data-label="Closest Databricks match"><strong>Lakeflow pipeline update</strong><span class="match">Both process dataset dependencies in order as part of managed updates.</span></td></tr>
+        </tbody>
+      </table>
+      <aside class="compare"><strong>Fabric capability</strong>Materialized Lake Views declaratively ingest files, transform and join data, and refresh the resulting Lakehouse tables on a managed schedule.</aside>
+      <details class="refs"><summary>Specification and product references</summary><p><a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/SPECIFICATION.md#demo-1-file-backed-materialized-lake-views">Demo 1 specification</a> &middot; <a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/demo-1-materialized-lake-views/simple_demo1.py">Demo 1 implementation</a> &middot; <a href="https://learn.microsoft.com/en-us/fabric/data-engineering/materialized-lake-views/overview-materialized-lake-view">Fabric MLV overview</a> &middot; <a href="https://learn.microsoft.com/en-us/fabric/data-engineering/materialized-lake-views/schedule-lineage-run">Fabric lineage refresh</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/ldp/concepts/">Lakeflow pipeline concepts</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a></p></details>
     </section>
 
     <section class="slide" aria-labelledby="copy-flow">
@@ -253,32 +264,31 @@ h1, h2, h3, p { margin: 0; }
       <figure class="flow">
         <figcaption class="flow-tools" hidden><span class="hint">Select a stage or play the illustrative flow.</span><button type="button" class="play">Play flow</button></figcaption>
         <ol class="nodes" aria-label="Activator and Copy data flow">
-          <li><button type="button" class="node" data-note="The producer lands one completed sales CSV in the subscribed OneLake location. Activator uses a FileCreated notification for the sales folder, not a timed scan."><span class="ordinal">01 &middot; Land</span><strong>OneLake Files</strong><span class="caption">Completed sales CSV</span></button></li>
-          <li><button type="button" class="node" data-note="The Activator rule filters the sales path and passes the event subject and ID to the pipeline. Exclude unrelated paths and the destination from the rule."><span class="ordinal">02 &middot; Signal</span><strong>Activator rule</strong><span class="caption"><code>FileCreated</code> &middot; subject + ID</span></button></li>
-          <li><button type="button" class="node" data-note="Prepare checks admission and the exact filename. Data Factory Copy reads that CSV with explicit mappings, not the whole folder. The current presenter path appends."><span class="ordinal">03 &middot; Transfer</span><strong>Data Factory Copy</strong><span class="caption">One CSV &middot; append</span></button></li>
-          <li><button type="button" class="node" data-note="The target is the typed Delta table dbo.factsales. Correlate the event and pipeline run, verify rows and totals, and retain the audit outcome."><span class="ordinal">04 &middot; Verify</span><strong>Lakehouse fact table</strong><span class="caption"><code>dbo.factsales</code> + audit</span></button></li>
+          <li><button type="button" class="node" data-note="The producer lands one completed sales CSV in the subscribed OneLake location. Activator responds to a FileCreated notification for the sales folder."><span class="ordinal">01 &middot; Land</span><strong>OneLake Files</strong><span class="caption">Completed sales CSV</span></button></li>
+          <li><button type="button" class="node" data-note="The Activator rule filters the sales path and passes the event subject to the pipeline as sourceSubject."><span class="ordinal">02 &middot; Signal</span><strong>Activator rule</strong><span class="caption"><code>FileCreated</code> &middot; subject</span></button></li>
+          <li><button type="button" class="node" data-note="The native Copy activity uses the event subject to select the exact CSV and append its rows to the Lakehouse Delta table."><span class="ordinal">03 &middot; Transfer</span><strong>Data Factory Copy</strong><span class="caption">One CSV &middot; append</span></button></li>
+          <li><button type="button" class="node" data-note="The run waits for the expected batch IDs before stopping the trigger. Inspect dbo.factsales and join it with the dimensions."><span class="ordinal">04 &middot; Query</span><strong>Lakehouse fact table</strong><span class="caption"><code>dbo.factsales</code> + dimensions</span></button></li>
         </ol>
         <p class="step-note" aria-live="polite" hidden></p>
       </figure>
-      <aside class="compare"><strong>Closest Databricks pattern</strong>A Lakeflow Jobs file-arrival trigger starts a job that uses checkpointed Auto Loader to process newly discovered files. A job run may cover multiple files; it is not an exact-file event binding.</aside>
+      <aside class="compare"><strong>Closest Databricks pattern</strong>A Lakeflow Jobs file-arrival trigger starts Auto Loader to process new files. Both platforms react to file arrivals and produce a queryable Delta table.</aside>
     </section>
 
-    <section class="slide" aria-labelledby="copy-detail">
-      <p class="eyebrow">06 / 06 &middot; Demo 3 &middot; Technical detail</p>
-      <h1 id="copy-detail" tabindex="-1">Append needs a replay guard.</h1>
-      <p class="lede">Separate event delivery, file readiness, Copy completion and target visibility. A delivered event is not evidence that the rows were written.</p>
-      <div class="cards">
-        <section class="card"><h2>Bind one event to one file</h2><ul>
-          <li>Pass the subject and event ID to the pipeline. Check readiness and resolve the exact filename; Copy maps the CSV columns into the typed Delta target.</li>
-          <li>Verify the target batch with row counts, unique <code>(BatchID, SalesLineID)</code> keys and exact totals. Correlate the event, path, batch and pipeline run in the audit.</li>
-        </ul></section>
-        <section class="card"><h2>Do not blindly retry</h2><ul>
-          <li>Current Copy behavior is <strong>append, not upsert</strong>. Serialize writes and reconcile destination state before replaying an uncertain append; a write may succeed before the audit does.</li>
-          <li>The demo assumes notifications are not missed. That assumption is not proof of delivery or exactly-once processing. Verify duplicate/retry outcomes in the destination.</li>
-        </ul></section>
-      </div>
-      <aside class="compare"><strong>Databricks: arrival-triggered job plus checkpoint</strong>A file-arrival trigger watches a location. Auto Loader with <code>AvailableNow</code> can process all pending files in a job run. Preserve its checkpoint; separately handle business-key duplicates. Neither replaces Fabric's per-event subject binding or guarded Copy.</aside>
-      <details class="refs"><summary>Specification, implementation and product references</summary><p><a href="../SPECIFICATION.md">Specification, &sect;8</a> &middot; <a href="../demo-3-onelake-events-copy/README.md">Demo 3 guide</a> &middot; <a href="../demo-3-onelake-events-copy/guarded_pipeline.py">Guarded definition builder</a> &middot; <a href="https://docs.databricks.com/gcp/en/jobs/file-arrival-triggers">File-arrival triggers</a>. The checked-in builder documents the exact-file guard and validates an Upsert template for a separate path; the current presenter path described here uses append.</p></details>
+    <section class="slide comparison-slide" aria-labelledby="copy-detail">
+      <p class="eyebrow">06 / 06 &middot; Demo 3 &middot; Component comparison</p>
+      <h1 id="copy-detail" tabindex="-1">Activator &amp; Copy vs. Databricks</h1>
+      <p class="lede">Both platforms support file-arrival-driven workflows and load Delta tables through native components.</p>
+      <table class="comparison-table">
+        <thead><tr><th scope="col">Role</th><th scope="col">Our Fabric demo</th><th scope="col">Closest Databricks match</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Detect &amp; start</th><td data-label="Our Fabric demo"><strong>OneLake event + Activator</strong><code>FileCreated</code> invokes the pipeline with the event subject.</td><td data-label="Closest Databricks match"><strong>Lakeflow Jobs file-arrival trigger</strong><span class="match">Both start processing when files arrive in a monitored location.</span></td></tr>
+          <tr><th scope="row">Load</th><td data-label="Our Fabric demo"><strong>Data Factory Copy</strong>Reads the event-associated CSV and appends its rows to a Lakehouse Delta table.</td><td data-label="Closest Databricks match"><strong>COPY INTO or Auto Loader</strong><span class="match">Both provide native ways to load CSV files into Delta.</span></td></tr>
+          <tr><th scope="row">Run lifecycle</th><td data-label="Our Fabric demo"><strong>Reset-and-run helper</strong>Resets the target and dimensions, enables the trigger, waits for expected batches and stops the trigger.</td><td data-label="Closest Databricks match"><strong>Lakeflow Jobs</strong><span class="match">Jobs can orchestrate setup tasks and separately trigger processing on file arrival.</span></td></tr>
+          <tr><th scope="row">Destination</th><td data-label="Our Fabric demo"><strong>Lakehouse Delta fact table</strong>Join facts with the Date, Product and Customer dimensions.</td><td data-label="Closest Databricks match"><strong>Unity Catalog Delta table</strong><span class="match">Both provide a queryable Delta target for SQL and analytics.</span></td></tr>
+        </tbody>
+      </table>
+      <aside class="compare"><strong>Fabric capability</strong>OneLake events, Activator, Data Factory Copy and a Delta Lakehouse work together to deliver event-driven file ingestion.</aside>
+      <details class="refs"><summary>Specification and product references</summary><p><a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/SPECIFICATION.md#demo-3-onelake-events-and-a-single-copy-activity">Demo 3 specification</a> &middot; <a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/demo-3-onelake-events-copy/SIMPLE-DEMO.md">Demo 3 guide</a> &middot; <a href="https://github.com/kuby49/chanel_digital_prep/blob/6d59e09fbd4c38416badfcd39d0c8e1bb780c48d/demo-3-onelake-events-copy/simple_demo3.py">Demo 3 implementation</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/jobs/file-arrival-triggers">File-arrival triggers</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/sql/language-manual/delta-copy-into">COPY INTO</a> &middot; <a href="https://learn.microsoft.com/en-us/azure/databricks/ingestion/cloud-object-storage/auto-loader/">Auto Loader</a></p></details>
     </section>
   </main>
   <footer class="controls" hidden>

@@ -780,6 +780,79 @@ class ContractTests(unittest.TestCase):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_fresh_owned_state_bypasses_legacy_and_persists_before_creation(self):
+        document = config()
+        document["shared"]["workspace_name"] = "independent-producer"
+        plan = deploy.parse_config(document, "sample")
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "new-state"
+            store = deploy.StateStore(state_dir)
+            def create(client, actual_store, state, actual_plan, kind, *args):
+                self.assertEqual(kind, "workspace")
+                saved = actual_store.read()
+                deploy.validate_state(saved, plan)
+                self.assertEqual(saved["resources"], {})
+                self.assertIsNone(saved["pending"])
+                self.assertNotIn("legacy", saved)
+                raise deploy.Blocked("creation deliberately held")
+            with (mock.patch.object(deploy, "load_owned_state",
+                                    side_effect=AssertionError("legacy fallback must not be consulted")),
+                  mock.patch.object(deploy, "_check_assets"),
+                  mock.patch.object(deploy, "azure_cli_token", return_value="dummy"),
+                  mock.patch.object(deploy, "FabricClient"),
+                  mock.patch.object(deploy, "_create_resource", side_effect=create),
+                  self.assertRaisesRegex(deploy.Blocked, "deliberately held")):
+                deploy.perform("deploy", document, "sample", state_dir, fresh_owned_state=True)
+            self.assertTrue(store.path.is_file())
+            original = store.path.read_bytes()
+            with (mock.patch.object(deploy, "azure_cli_token") as token,
+                  self.assertRaisesRegex(deploy.Blocked, "empty state directory")):
+                deploy.perform("deploy", document, "sample", state_dir, fresh_owned_state=True)
+            token.assert_not_called()
+            self.assertEqual(store.path.read_bytes(), original)
+
+    def test_fresh_owned_state_refuses_any_existing_entry_before_authentication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name, content in (("unrelated.json", "{}"), (deploy.STATE_NAME, "null"),
+                                  (deploy.DEFINITION_UPDATE_NAME, "{}")):
+                with self.subTest(name=name):
+                    entry = Path(directory) / name
+                    entry.write_text(content, encoding="utf-8")
+                    with (mock.patch.object(deploy, "azure_cli_token") as token,
+                          self.assertRaisesRegex(deploy.Blocked, "empty state directory")):
+                        deploy.perform("deploy", config(), "sample", directory, fresh_owned_state=True)
+                    token.assert_not_called()
+                    self.assertEqual(entry.read_text(encoding="utf-8"), content)
+                    entry.unlink()
+
+    def test_fresh_owned_state_requires_deploy_and_no_resource_bindings(self):
+        fields = [*deploy.ID_FIELDS.values(), *deploy.DESCRIPTION_FIELDS.values(),
+                  "environment_id", "environment_item_id", "environment_description", "environment_item_description"]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(deploy, "azure_cli_token") as token:
+            for field in fields:
+                document = config()
+                document["shared"][field] = WORKSPACE if field.endswith("_id") else "old ownership"
+                with self.subTest(field=field), self.assertRaisesRegex(deploy.ContractError, "no configured"):
+                    deploy.perform("deploy", document, "sample", directory, fresh_owned_state=True)
+            for mode in ("dry-run", "validate-only", "update-definition", "run-data", "cleanup"):
+                with self.subTest(mode=mode), self.assertRaisesRegex(deploy.ContractError, "requires --mode deploy"):
+                    deploy.perform(mode, config(), "sample", directory, fresh_owned_state=True)
+            token.assert_not_called()
+
+    def test_default_deploy_still_consults_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (mock.patch.object(deploy, "load_owned_state", side_effect=deploy.Blocked("legacy mismatch")) as load,
+                  mock.patch.object(deploy, "azure_cli_token") as token,
+                  self.assertRaisesRegex(deploy.Blocked, "legacy mismatch")):
+                deploy.perform("deploy", config(), "sample", directory)
+            load.assert_called_once()
+            token.assert_not_called()
+
+    def test_fresh_owned_state_cli_rejects_other_modes(self):
+        code, result = ContractTests().invoke("dry-run", config(), ("--fresh-owned-state",))
+        self.assertEqual((code, result["status"]), (1, "fail"))
+        self.assertIn("requires --mode deploy", result["diagnostics"][0])
+
     def test_candidate_cli_publishes_per_invocation_sidecar_without_overwriting(self):
         document = config()
         state = owned_state(deploy.parse_config(document, "sample"))

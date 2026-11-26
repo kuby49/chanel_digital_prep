@@ -4,9 +4,12 @@ import json
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from itertools import permutations
+from types import SimpleNamespace
+from urllib.error import HTTPError
 
 from monitor_controller import (
-    Controller, FabricClient, MonitorError, RetryLater, settings, verify_delivery_evidence,
+    FABRIC, Controller, FabricClient, MonitorError, RetryLater, settings, verify_delivery_evidence,
 )
 from monitor_notebook_builder import build_monitor_notebook
 
@@ -178,10 +181,10 @@ class FakeClient:
     def start_job(self, mode, value, timeout, poll):
         job_id = str(uuid.UUID(int=100 + len(self.started)))
         self.started.append((mode, copy.deepcopy(value), timeout, job_id))
-        return job_id, 1
+        return job_id, 1, "fallback"
 
     def job(self, job_id):
-        return self.results.get(job_id, {"status": "InProgress"}), 1
+        return self.results.get(job_id, {"status": "InProgress"}), 1, "fallback"
 
     def cancel_job(self, job_id):
         self.cancelled.append(job_id)
@@ -234,6 +237,20 @@ class MonitorControllerTests(unittest.TestCase):
                 workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
                 reused_synthetic_target={**target, "workspace_id": PRODUCER_WORKSPACE},
             )
+
+    def test_measured_monitor_definition_is_independent_of_target_key_order(self):
+        target = {"workspace_id": WORKSPACE, "item_id": DATABASE, "fact": "SyntheticFactSales"}
+        expected = build_monitor_notebook(
+            workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
+            reused_synthetic_target=target,
+        )
+        for keys in permutations(target):
+            with self.subTest(keys=keys):
+                actual = build_monitor_notebook(
+                    workspace_id=WORKSPACE, lakehouse_id=LAKEHOUSE, lakehouse_name="SalesLakehouse",
+                    reused_synthetic_target={key: target[key] for key in keys},
+                )
+                self.assertEqual(actual, expected)
 
     def test_synthetic_monitor_reconciles_bootstrap_without_accepting_measured_data(self):
         run = "demo2synthetic_123456abcdef"
@@ -468,6 +485,49 @@ class MonitorControllerTests(unittest.TestCase):
         self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
         self.assertEqual(self.client.started[0][2], 20)
 
+    def test_canonical_manifest_does_not_admit_batch_ten_before_batch_two(self):
+        cfg = settings(parameters(count=10, concurrency=1), lakehouse_id=LAKEHOUSE)
+        client = FakeClient(cfg)
+        controller = Controller(cfg, client, clock=self.clock, sleep=self.clock.advance)
+        entries = [batch(number, NOW + timedelta(seconds=number - 1))
+                   for number in range(1, 11)]
+        client.manifest = json.loads(json.dumps(manifest(*entries), sort_keys=True))
+        self.clock.advance(9)
+        controller._begin()
+        controller._tick()
+        self.assertEqual(client.started[0][1]["batch_number"], 1)
+        self.clock.advance(1)
+        verified_delivery(client.manifest["batches"]["1"], self.clock())
+        client.results[client.started[0][3]] = {
+            "status": "Completed",
+            "properties": {"exitValue": json.dumps({
+                "mode": "verify_batch", "status": "verified",
+                "batch": {key: entries[0][key]
+                          for key in ("batch_id", "row_count", "sales_amount_minor_units")},
+            })},
+        }
+        controller._tick()
+        self.assertEqual([entry[1]["batch_number"] for entry in client.started], [1, 2])
+        self.assertEqual(client.started[1][2], 21)
+        for entry in entries:
+            self.assertEqual(controller.state["batches"][entry["batch_id"]]["deadline_utc"],
+                             stamp(NOW + timedelta(seconds=entry["batch_number"] - 1 + 30)))
+
+    def test_admission_uses_deadline_before_batch_number_and_breaks_ties_numerically(self):
+        for accepted, expected in (
+            (NOW - timedelta(seconds=1), 10),
+            (NOW, 2),
+        ):
+            with self.subTest(accepted=accepted):
+                cfg = settings(parameters(count=10, concurrency=1), lakehouse_id=LAKEHOUSE)
+                client = FakeClient(cfg)
+                controller = Controller(cfg, client, clock=self.clock, sleep=self.clock.advance)
+                client.manifest = manifest(batch(10, accepted), batch(2), count=10)
+                controller._begin()
+                controller._tick()
+                self.assertEqual(client.started[0][1]["batch_number"], expected)
+                self.assertEqual(client.started[0][2], 29 if expected == 10 else 30)
+
     def test_concurrency_queue_does_not_extend_delivery_deadlines(self):
         self.params = parameters(count=2, concurrency=1)
         self.cfg = settings(self.params, lakehouse_id=LAKEHOUSE)
@@ -481,6 +541,214 @@ class MonitorControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(MonitorError, "exceeded its verification deadline"):
             self.controller._tick()
         self.assertEqual(len(self.client.started), 1)
+
+    def test_verifier_submission_and_poll_evidence_is_durable_without_extending_deadline(self):
+        entry = batch(1)
+        self.client.manifest = manifest(entry)
+        self.controller._begin()
+        self.controller._tick()
+        record = self.controller.state["batches"][entry["batch_id"]]
+        self.assertEqual(record["verification_submit_started_at_utc"], stamp(NOW))
+        self.assertEqual(record["verification_job_accepted_at_utc"], stamp(NOW))
+        self.assertEqual(record["verification_initial_retry_after_source"], "fallback")
+        self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
+        self.assertTrue(any(
+            snapshot["batches"].get(entry["batch_id"], {}).get("verification_submit_started_at_utc") == stamp(NOW)
+            and snapshot["batches"][entry["batch_id"]]["status"] == "submitting"
+            for snapshot in self.client.snapshots
+        ))
+
+        self.clock.advance(1)
+        self.client.job = lambda _: ({"status": "InProgress"}, 5, "header")
+        self.controller._tick()
+        polls = record["verification_poll_observations"]
+        self.assertEqual(polls, [{
+            "started_at_utc": stamp(self.clock()),
+            "finished_at_utc": stamp(self.clock()),
+            "status": "InProgress",
+            "retry_after_seconds": 5,
+            "retry_after_source": "header",
+        }])
+        self.assertEqual(record["next_poll_utc"], stamp(NOW + timedelta(seconds=6)))
+        self.assertEqual(self.client.snapshots[-1]["batches"][entry["batch_id"]]
+                         ["verification_poll_observations"], polls)
+        self.clock.advance(1)
+        self.controller._tick()
+        self.assertEqual(len(polls), 1)
+        self.clock.advance(4)
+        verified_delivery(entry, self.clock())
+        self.client.job = lambda _: ({
+            "status": "Completed",
+            "properties": {"exitValue": json.dumps({
+                "mode": "verify_batch", "status": "verified",
+                "batch": {key: entry[key]
+                          for key in ("batch_id", "row_count", "sales_amount_minor_units")},
+            })},
+        }, 10, "fallback")
+        self.controller._tick()
+        self.assertEqual([poll["status"] for poll in polls], ["InProgress", "Completed"])
+        self.assertEqual(record["verified_at_utc"], stamp(self.clock()))
+        self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
+
+    def test_slow_job_admission_records_elapsed_time_without_resetting_batch_deadline(self):
+        entry = batch(1)
+        self.client.manifest = manifest(entry)
+        start = self.client.start_job
+
+        def delayed(*args):
+            self.clock.advance(4)
+            return start(*args)
+
+        self.client.start_job = delayed
+        self.controller._begin()
+        self.controller._tick()
+        record = self.controller.state["batches"][entry["batch_id"]]
+        self.assertEqual(record["verification_submit_started_at_utc"], stamp(NOW))
+        self.assertEqual(record["verification_job_accepted_at_utc"], stamp(NOW + timedelta(seconds=4)))
+        self.assertEqual(record["next_poll_utc"], stamp(NOW + timedelta(seconds=5)))
+        self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
+
+    def test_throttled_poll_records_service_delay_and_keeps_job_owned(self):
+        entry = batch(1)
+        self.client.manifest = manifest(entry)
+        self.controller._begin()
+        self.controller._tick()
+        job_id = self.controller.state["batches"][entry["batch_id"]]["job_id"]
+        self.clock.advance(1)
+
+        def throttled(_):
+            raise RetryLater(3)
+
+        self.client.job = throttled
+        self.controller._tick()
+        record = self.controller.state["batches"][entry["batch_id"]]
+        self.assertEqual(record["status"], "running")
+        self.assertEqual(record["job_id"], job_id)
+        self.assertEqual(record["next_poll_utc"], stamp(NOW + timedelta(seconds=4)))
+        self.assertEqual(record["verification_poll_observations"][-1]["status"], "Throttled")
+        self.assertEqual(record["verification_poll_observations"][-1]["retry_after_source"], "throttle_fallback")
+        self.assertEqual(record["verification_poll_observations"][-1]["retry_after_seconds"], 3)
+        self.clock.advance(3)
+
+        def throttled_with_header(_):
+            raise RetryLater(5, "header")
+
+        self.client.job = throttled_with_header
+        self.controller._tick()
+        self.assertEqual(record["verification_poll_observations"][-1]["retry_after_source"],
+                         "throttle_header")
+        self.assertEqual(record["next_poll_utc"], stamp(NOW + timedelta(seconds=9)))
+
+    def test_slow_poll_respects_retry_after_from_response_without_extending_deadline(self):
+        for throttled in (False, True):
+            with self.subTest(throttled=throttled):
+                clock = Clock()
+                cfg = settings(parameters(), lakehouse_id=LAKEHOUSE)
+                client = FakeClient(cfg)
+                controller = Controller(cfg, client, clock=clock, sleep=clock.advance)
+                entry = batch(1)
+                client.manifest = manifest(entry)
+                controller._begin()
+                controller._tick()
+                clock.advance(1)
+                calls = []
+
+                def slow_job(_):
+                    calls.append(clock())
+                    clock.advance(4)
+                    if throttled:
+                        raise RetryLater(5, "header")
+                    return {"status": "InProgress"}, 5, "header"
+
+                client.job = slow_job
+                controller._tick()
+                record = controller.state["batches"][entry["batch_id"]]
+                self.assertEqual(record["verification_poll_observations"][-1]["finished_at_utc"],
+                                 stamp(NOW + timedelta(seconds=5)))
+                self.assertEqual(record["next_poll_utc"], stamp(NOW + timedelta(seconds=10)))
+                self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
+                clock.advance(4)
+                controller._tick()
+                self.assertEqual(len(calls), 1)
+                clock.advance(1)
+                controller._tick()
+                self.assertEqual(len(calls), 2)
+
+    def test_slow_poll_cannot_complete_after_immutable_deadline(self):
+        entry = batch(1)
+        self.client.manifest = manifest(entry)
+        self.controller._begin()
+        self.controller._tick()
+        self.clock.advance(29)
+
+        def late(_):
+            self.clock.advance(2)
+            return {"status": "InProgress"}, 5, "header"
+
+        self.client.job = late
+        with self.assertRaisesRegex(MonitorError, "exceeded its verification deadline"):
+            self.controller._tick()
+        record = self.controller.state["batches"][entry["batch_id"]]
+        self.assertEqual(record["deadline_utc"], stamp(NOW + timedelta(seconds=30)))
+        self.assertEqual(record["status"], "running")
+
+    def test_poll_observations_preserve_first_and_latest_with_explicit_omission_count(self):
+        record = {}
+        for _ in range(70):
+            self.controller._observe_poll(record, self.clock(), "InProgress", 1, "header")
+            self.clock.advance(1)
+        observations = record["verification_poll_observations"]
+        self.assertEqual(len(observations), 64)
+        self.assertEqual(record["verification_polls_omitted"], 6)
+        self.assertEqual(observations[15]["started_at_utc"], stamp(NOW + timedelta(seconds=15)))
+        self.assertEqual(observations[16]["started_at_utc"], stamp(NOW + timedelta(seconds=22)))
+        self.assertEqual(observations[-1]["started_at_utc"], stamp(NOW + timedelta(seconds=69)))
+
+    def test_response_retry_after_source_is_distinct_from_fallback(self):
+        client = FabricClient(None, self.cfg)
+        self.assertEqual(client._retry_after({"Retry-After": "7"}), (7, "header"))
+        self.assertEqual(client._retry_after({}), (self.cfg["poll"], "fallback"))
+        self.assertEqual(client._retry_after({"Retry-After": "invalid"}),
+                         (self.cfg["poll"], "fallback"))
+
+    def test_job_submission_and_readback_preserve_service_retry_hint(self):
+        client = FabricClient(None, self.cfg)
+        job_id = str(uuid.UUID(int=201))
+
+        def request(method, url, **_kwargs):
+            if method == "POST":
+                return 202, {
+                    "Location": f"{FABRIC}/v1/workspaces/{WORKSPACE}/items/{NOTEBOOK}/jobs/instances/{job_id}",
+                    "Retry-After": "7",
+                }, b""
+            return 200, {"Retry-After": "9"}, json.dumps({
+                "id": job_id, "itemId": NOTEBOOK, "status": "InProgress",
+            }).encode()
+
+        client._request = request
+        self.assertEqual(client.start_job("verify_batch", batch(1), 30, 1),
+                         (job_id, 7, "header"))
+        result, delay, source = client.job(job_id)
+        self.assertEqual((result["status"], delay, source), ("InProgress", 9, "header"))
+
+    def test_http_throttling_keeps_header_source_and_retry_delay(self):
+        client = FabricClient(
+            SimpleNamespace(credentials=SimpleNamespace(getToken=lambda _: "test-token")), self.cfg,
+        )
+        url = f"{FABRIC}/v1/workspaces/{WORKSPACE}/items/{NOTEBOOK}/jobs/instances/{uuid.UUID(int=201)}"
+        for headers, expected in (({"Retry-After": "7"}, (7, "header")),
+                                  ({}, (self.cfg["poll"], "fallback"))):
+            with self.subTest(headers=headers):
+                error = HTTPError(url, 429, "Too Many Requests", headers, None)
+                self.addCleanup(error.close)
+
+                def reject(_request, timeout):
+                    raise error
+
+                client.opener = SimpleNamespace(open=reject)
+                with self.assertRaises(RetryLater) as result:
+                    client._request("GET", url, audience="pbi")
+                self.assertEqual((result.exception.seconds, result.exception.source), expected)
 
     def test_restart_rejects_verified_batch_without_deadline_evidence(self):
         entry = batch(1)
@@ -679,7 +947,7 @@ class MonitorControllerTests(unittest.TestCase):
             }).encode("utf-8")
 
         client._request = request
-        result, _ = client.job(job_id)
+        result, _, _ = client.job(job_id)
         self.assertIn(f"/notebooks/{NOTEBOOK}/jobs/execute/instances/{job_id}?beta=true", observed[0])
         self.assertIn("exitValue", result["properties"])
 

@@ -2202,8 +2202,16 @@ def _recover_pipeline(mode, config, plan, state_dir, selected_demos):
 
 
 def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, candidate_path=None,
-            definition_kind=None, expected_definition_sha256=None):
+            definition_kind=None, expected_definition_sha256=None, fresh_owned_state=False):
     plan = parse_config(config, prefix)
+    if fresh_owned_state:
+        if mode != "deploy":
+            raise ContractError("--fresh-owned-state requires --mode deploy.")
+        if not Path(state_dir).is_absolute():
+            raise ContractError("--fresh-owned-state requires an absolute state-dir.")
+        if (any(value is not None for value in plan["ids"].values())
+                or any(value is not None for value in plan["descriptions"].values())):
+            raise ContractError("--fresh-owned-state requires no configured producer IDs or descriptions.")
     if mode == "update-definition":
         if (not yes or definition_kind not in ("notebook", "pipeline")
                 or not re.fullmatch(r"[a-f0-9]{64}", expected_definition_sha256 or "") or selected_demos is not None):
@@ -2281,7 +2289,12 @@ def perform(mode, config, prefix, state_dir, selected_demos=None, yes=False, *, 
     if mode != "deploy":
         raise ContractError("Unsupported mode.")
     with store.lock():
-        state = load_owned_state(store, plan)
+        if fresh_owned_state:
+            if any(path != store.lock_path for path in store.directory.iterdir()):
+                raise Blocked("--fresh-owned-state requires an empty state directory; nothing was adopted or overwritten.")
+            state = None
+        else:
+            state = load_owned_state(store, plan)
         spec = _check_assets(plan)
         client = FabricClient(azure_cli_token(plan["tenant_id"], plan["identity_id"]))
         if state is None:
@@ -2402,6 +2415,7 @@ def main(argv=None):
     parser.add_argument("--definition-kind", choices=("notebook", "pipeline"))
     parser.add_argument("--expected-definition-sha256")
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--fresh-owned-state", action="store_true")
     raw_args = list(sys.argv[1:] if argv is None else argv)
     try:
         args = parser.parse_args(raw_args)
@@ -2426,7 +2440,8 @@ def main(argv=None):
             raise ContractError("Config is unreadable or is not valid JSON.") from None
         diagnostics = perform(args.mode, config, args.prefix, args.state_dir, args.selected_demos, args.yes,
                               candidate_path=candidate_path, definition_kind=args.definition_kind,
-                              expected_definition_sha256=args.expected_definition_sha256)
+                              expected_definition_sha256=args.expected_definition_sha256,
+                              fresh_owned_state=args.fresh_owned_state)
         passed = args.mode in ("dry-run", "resolve-candidate-ids", "run-data", "update-definition", "validate-only")
         result = _envelope(args.mode, "pass" if passed else "blocked", diagnostics)
     except ContractError as exc:

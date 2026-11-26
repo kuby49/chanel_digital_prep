@@ -20,7 +20,7 @@ def build_monitor_notebook(*, workspace_id, lakehouse_id, lakehouse_name, reused
                 or target["workspace_id"] != workspace_id or target["fact"] != "SyntheticFactSales"
                 or _uuid(target["item_id"], "target item_id") != target["item_id"]):
             raise ValueError("Measured reuse must pin the exact synthetic target")
-        reused_synthetic_target = dict(target)
+        reused_synthetic_target = {key: target[key] for key in ("workspace_id", "item_id", "fact")}
     sources = {
         name: base64.b64encode((_HERE / f"{name}.py").read_bytes()).decode("ascii")
         for name in ("eventhouse_core", "lakehouse_validation", "monitor_controller")
